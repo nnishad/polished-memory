@@ -757,6 +757,25 @@ LEARNING_STATEMENTS: tuple[str, ...] = (
 )
 
 
+SOURCE_GAP_STATEMENTS: tuple[str, ...] = (
+    """
+    -- What a source could not give us, kept per connector generation. A gap that
+    -- is only logged is a gap nobody can close: this row is what the next run
+    -- checks itself against, and what a later arrival resolves.
+    CREATE TABLE source_gaps(
+        source TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        ref TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        cleared_at TEXT,
+        PRIMARY KEY(source, generation, ref)
+    )""",
+    "CREATE INDEX source_gaps_open ON source_gaps(source, generation, cleared_at)",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -776,6 +795,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0009_prospective", PROSPECTIVE_STATEMENTS),
     Migration("0010_proactivity", PROACTIVITY_STATEMENTS),
     Migration("0011_learning", LEARNING_STATEMENTS),
+    Migration("0012_source_gaps", SOURCE_GAP_STATEMENTS),
 )
 
 

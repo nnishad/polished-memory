@@ -5,7 +5,8 @@ import sqlite3
 
 import pytest
 
-from hermes_memory.sources.sync import DOWNSTREAM_STAGES, StaleFence, SyncController
+from hermes_memory.sources.sync import (DOWNSTREAM_STAGES, STAGES, StaleFence,
+                                   SyncController)
 from hermes_memory.storage.evidence import EvidenceError
 
 from conftest import envelope
@@ -195,20 +196,32 @@ def test_hide_and_supersede_are_replayable_changes(sync, store):
 
 # -- pause semantics ---------------------------------------------------------
 
-def test_pausing_a_source_leaves_capture_running(sync):
+def test_pausing_a_source_stops_it_end_to_end(sync):
     stages = sync.pause(SOURCE, actor="owner", reason="too much compute",
                         policy_version="v1")
-    assert stages == list(DOWNSTREAM_STAGES)
-    assert sync.paused_stages(SOURCE) == list(DOWNSTREAM_STAGES)
+
+    assert stages == list(STAGES)
+    assert sync.paused_stages(SOURCE) == list(STAGES)
+
+
+def test_resuming_a_paused_source_takes_ingestion_back_too(sync):
+    sync.pause(SOURCE, actor="owner", reason="too much compute", policy_version="v1")
+
+    sync.resume(SOURCE, actor="owner", reason="reviewed", policy_version="v1")
+
+    assert sync.paused_stages(SOURCE) == []
 
 
 def test_stopping_ingestion_is_a_separate_explicit_act(sync):
-    sync.pause(SOURCE, actor="owner", reason="too much compute", policy_version="v1")
     sync.pause_capture(SOURCE, actor="owner", reason="account revoked", policy_version="v1")
-    assert "capture" in sync.paused_stages(SOURCE)
-    sync.resume(SOURCE, actor="owner", reason="reviewed", policy_version="v1")
-    assert "capture" in sync.paused_stages(SOURCE), "resume must not silently restart ingestion"
-    sync.resume(SOURCE, actor="owner", reason="cleared", policy_version="v1", stages=("capture",))
+
+    assert sync.paused_stages(SOURCE) == ["capture"]
+    # Working up what is already here and deciding whether to speak are separate
+    # answers from fetching more, and a revoked account stops only the first.
+    sync.resume(SOURCE, actor="owner", reason="reviewed", policy_version="v1",
+                stages=DOWNSTREAM_STAGES)
+    assert sync.paused_stages(SOURCE) == ["capture"]
+    sync.resume(SOURCE, actor="owner", reason="restored", policy_version="v1")
     assert sync.paused_stages(SOURCE) == []
 
 
@@ -283,3 +296,49 @@ def test_the_store_survives_a_reopen_with_the_journal_intact(tmp_path):
         assert controller.state(SOURCE)["cursor"] == "tok-2"
         assert len(controller.changes(consumer="projection")) == 1
         assert isinstance(reopened.db.execute("SELECT 1 FROM connectors").fetchone(), sqlite3.Row)
+
+
+def test_a_page_must_be_a_sequence_of_envelopes_not_a_lone_string(sync):
+    """A bare string is a sequence of characters, and every one of them would fail."""
+    fence = fenced(sync)
+    with pytest.raises(EvidenceError, match="sequence of envelopes"):
+        sync.publish(fence, "page-1", "not a page")
+
+
+def test_a_new_revision_of_the_same_thing_is_not_the_page_already_committed(sync, store):
+    """The page digest carries the revision, or a re-stamped record is a silent loss.
+
+    A record fingerprint covers the bytes, not which revision of the source's item
+    they are, so identical text under a new revision is a different record — and a
+    page that says two different things under one name is a contradiction.
+    """
+    fence = fenced(sync)
+    sync.publish(fence, "page-1", [envelope(source_id="msg-1", revision="1")])
+
+    with pytest.raises(EvidenceError, match="different content"):
+        sync.publish(fence, "page-1", [envelope(source_id="msg-1", revision="2")])
+
+    landed = sync.publish(fence, "page-2", [envelope(source_id="msg-1", revision="2")])
+    assert landed["duplicate"] is False and landed["new"] == 1
+    assert int(store.db.execute(
+        "SELECT count(*) FROM records WHERE source_id='msg-1'").fetchone()[0]) == 2
+
+
+def test_a_renewal_of_a_lease_someone_else_now_holds_is_refused(sync):
+    holder = fenced(sync)
+    sync.clock.advance(120)
+    rival = sync.acquire(SOURCE, holder="worker-b")
+
+    with pytest.raises(StaleFence, match="another holder"):
+        sync.renew(holder)
+
+    assert sync.state(SOURCE)["lease"] == rival.lease
+
+
+def test_a_pause_only_accepts_stages_that_exist(sync):
+    with pytest.raises(EvidenceError, match="stages must come from"):
+        sync.pause(SOURCE, actor="owner", reason="invented stage", policy_version="v1",
+                   stages=("projection",))
+    with pytest.raises(EvidenceError, match="stages must come from"):
+        sync.pause(SOURCE, actor="owner", reason="nothing named", policy_version="v1",
+                   stages=())

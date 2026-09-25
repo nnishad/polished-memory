@@ -8,15 +8,22 @@ from typing import Any, Callable, Sequence
 
 from ..ids import digest, now
 from ..storage.evidence import EvidenceError, prepare_envelope
+from .base import Skipped
 
-__all__ = ["Fence", "StaleFence", "SyncController", "STAGES", "DOWNSTREAM_STAGES"]
+__all__ = ["Fence", "StaleFence", "SyncController", "STAGES", "DOWNSTREAM_STAGES",
+           "COVERAGE_STATES"]
 
-# Pause naming is explicit: a normal pause leaves capture running and stops the
-# stages that would spend compute or speak to anyone. Stopping ingestion too has
-# to be asked for by name, because an operator who says "pause this source"
-# almost never means "lose what arrives while it is paused".
+# An operator who pauses a source means that source: ingestion, the compute that
+# forms it downstream, and anything that could speak on its behalf. Stopping only
+# the ingestion half — keeping what we have, working on it, saying nothing — is a
+# different instruction and has its own name, so neither has to be guessed at.
 DOWNSTREAM_STAGES = ("formation", "proactivity")
 STAGES = ("capture",) + DOWNSTREAM_STAGES
+
+# "current" is the only state that says we have everything the source would give.
+# Every other value means some answer would be about a partial world.
+COVERAGE_STATES = frozenset({"unknown", "current", "partial", "stale", "unreachable",
+                            "revoked"})
 
 
 class StaleFence(EvidenceError):
@@ -190,12 +197,16 @@ class SyncController:
         return Fence(source, row["generation"], epoch, token, holder, clock=self.clock)
 
     def renew(self, fence: Fence, *, ttl: float = 60.0) -> Fence:
+        """Extend a lease, or refuse to. The fence is checked inside the write
+        transaction, so a holder whose lease has passed to someone else is told so
+        rather than left reading and believing it had written back into authority.
+        """
         self.db.execute("BEGIN IMMEDIATE")
         try:
             fence.validate(self.db)
             self.db.execute(
-                "UPDATE connectors SET lease_until=? WHERE source=? AND lease=?",
-                (self.clock() + ttl, fence.source, fence.lease),
+                "UPDATE connectors SET lease_until=?, updated_at=? WHERE source=? AND lease=?",
+                (self.clock() + ttl, now(), fence.source, fence.lease),
             )
             self.db.execute("COMMIT")
         except BaseException:
@@ -221,20 +232,28 @@ class SyncController:
     # -- page commit ---------------------------------------------------------
 
     def publish(self, fence: Fence, page_token: str, envelopes: Sequence[dict[str, Any]],
-                *, next_cursor: str | None = None) -> dict[str, Any]:
+                *, next_cursor: str | None = None,
+                skipped: Sequence[Any] = ()) -> dict[str, Any]:
         """Commit one page and advance the cursor as a single transaction.
 
         Idempotent per (source, generation, page_token). A page that is replayed
         after a crash is recognised by fingerprint before any write, so retries
         cannot duplicate evidence; a *different* page under the same token is a
         source-level contradiction and is refused.
+
+        What the source could not give us on this page is recorded here rather than
+        logged, in the same transaction: a gap that is not durable is a gap nobody
+        will ever close, and one that arrives later has to be able to prove it did.
         """
         _check_name(fence.source)
-        if not isinstance(envelopes, Sequence) or isinstance(envelopes, (str, bytes)):
-            raise EvidenceError("envelopes must be a sequence")
+        if isinstance(envelopes, (str, bytes)) or not isinstance(envelopes, Sequence):
+            raise EvidenceError("a page carries a sequence of envelopes")
         if len(envelopes) > 1000:
             raise EvidenceError("a page may carry at most 1000 records")
+        if len(skipped) > 1000:
+            raise EvidenceError("a page may report at most 1000 gaps")
         token = _check_token(page_token)
+        gaps = [(_ref_of(item), _reason_of(item)) for item in skipped]
         # Validated before the write lock: a malformed page should fail cheap,
         # and nothing partially prepared may reach the store.
         prepared = [prepare_envelope(envelope) for envelope in envelopes]
@@ -258,40 +277,96 @@ class SyncController:
                     raise EvidenceError(
                         f"page {token!r} was already committed with different content"
                     )
-                ids, duplicate, written = [], True, seen["record_count"]
+                ids, duplicate, written = [], True, 0
             else:
-                ids = [self.store.write_prepared(self.db, item,
-                                                 generation=fence.generation)[0]
-                       for item in prepared]
+                rows = [self.store.write_prepared(self.db, item,
+                                                  generation=fence.generation)
+                        for item in prepared]
+                ids = [row[0] for row in rows]
+                written = sum(1 for row in rows if not row[1])
                 self.db.execute(
                     "INSERT INTO source_pages(source, generation, page_token, record_count, "
                     "fingerprint, committed_at) VALUES(?,?,?,?,?,?)",
                     (fence.source, fence.generation, token, len(prepared), fingerprint, now()),
                 )
-                if next_cursor is not None:
-                    self.db.execute(
-                        "UPDATE connectors SET cursor=?, coverage_state='current', "
-                        "last_success_at=?, updated_at=? WHERE source=?",
-                        (str(next_cursor)[:2000], now(), now(), fence.source),
-                    )
-                duplicate, written = False, len(prepared)
+                duplicate = False
+            # Reaching the end of a source is what 'current' means; a page with a
+            # cursor behind it is a backfill in progress, whatever the caller hoped.
+            self.db.execute(
+                "UPDATE connectors SET coverage_state=?, last_success_at=?, updated_at=? "
+                "WHERE source=?",
+                ("current" if next_cursor is None else "partial", now(), now(), fence.source))
+            if not duplicate and next_cursor is not None:
+                # Only a page that actually landed moves the position: replaying one
+                # that was already committed must not walk past the source's head.
+                self.db.execute("UPDATE connectors SET cursor=? WHERE source=?",
+                                (str(next_cursor)[:2000], fence.source))
+            for ref, reason in gaps:
+                self.db.execute(
+                    "INSERT INTO source_gaps(source, generation, ref, reason, first_seen_at, "
+                    "last_seen_at, cleared_at) VALUES(?,?,?,?,?,?,NULL) "
+                    "ON CONFLICT(source, generation, ref) DO UPDATE SET reason=excluded.reason, "
+                    "last_seen_at=excluded.last_seen_at, cleared_at=NULL",
+                    (fence.source, fence.generation, ref, reason, now(), now()))
+            self._clear_gaps(fence, [item.source_id for item in prepared])
             # A replayed page writes nothing, but it still has to close the
             # transaction it opened: leaving it idle would hold the write lock
             # and make every later commit fail with 'within a transaction'.
             self.db.execute("COMMIT")
-            return {"duplicate": duplicate, "records": written, "ids": ids,
+            return {"duplicate": duplicate, "records": len(prepared), "new": written,
+                    "ids": ids, "gaps": len(gaps),
+                    "coverage_state": "current" if next_cursor is None else "partial",
                     "cursor": self._cursor(fence.source)}
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
 
+    def _clear_gaps(self, fence: Fence, source_ids: Sequence[str]) -> int:
+        """Close a gap the source has since handed over.
+
+        Matched by source id rather than by position, because the point of a gap is
+        "this thing is missing", and the thing arriving later is the only evidence
+        that would ever close it.
+        """
+        if not source_ids:
+            return 0
+        placeholders = ",".join("?" * len(source_ids))
+        return int(self.db.execute(
+            "UPDATE source_gaps SET cleared_at=? WHERE source=? AND generation=? AND "
+            f"cleared_at IS NULL AND ref IN ({placeholders})",
+            [now(), fence.source, fence.generation, *source_ids]).rowcount or 0)
+
     def _cursor(self, source: str) -> str | None:
         row = self.db.execute("SELECT cursor FROM connectors WHERE source=?", (source,)).fetchone()
         return row["cursor"] if row else None
 
+    def restart(self, fence: Fence, *, reason: str) -> None:
+        """Drop the stored position so the next pass reads from the beginning.
+
+        A cursor the source will not accept is not a lease problem: the position
+        simply no longer describes the stream. Nothing is deleted. Evidence already
+        committed stays, and re-reading what the source will give again is idempotent
+        per record, so a restart costs quota and cannot invent duplicates.
+        """
+        _check_reason(reason)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            fence.validate(self.db)
+            self.db.execute(
+                "UPDATE connectors SET cursor=NULL, cursor_kind='opaque', coverage_state="
+                "'partial', updated_at=? WHERE source=?",
+                (now(), fence.source),
+            )
+            self.store._audit("connector_restart", fence.source,
+                              {"reason": reason, "generation": fence.generation})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
     def mark_gap(self, fence: Fence, *, coverage_state: str, reason: str) -> None:
         """Record that coverage is partial. A gap must stay visible, not silent."""
-        if coverage_state not in {"unknown", "current", "partial", "stale", "unreachable", "revoked"}:
+        if coverage_state not in COVERAGE_STATES:
             raise EvidenceError(f"unknown coverage state {coverage_state!r}")
         _check_reason(reason)
         self.db.execute("BEGIN IMMEDIATE")
@@ -353,6 +428,31 @@ class SyncController:
             self.db.execute("ROLLBACK")
             raise
 
+    def gaps(self, source: str, *, generation: int | None = None,
+             include_cleared: bool = False, limit: int = 200) -> list[dict[str, Any]]:
+        """What this connector knows it did not get.
+
+        Open gaps are the honest version of a coverage claim: the source said there
+        was something there and could not hand it over. The default is the *current*
+        generation, because a reconfigured connector is a different question than a
+        flaky one: what the old credentials could not reach is history, not debt.
+        """
+        _check_name(source)
+        if not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise EvidenceError("the gap list is between 1 and 1000 rows")
+        where = ["source=?", "generation=?", "cleared_at IS NULL"]
+        arguments: list[Any] = [
+            source, int(generation if generation is not None
+                        else self.state(source)["generation"])]
+        if include_cleared:
+            where.pop()
+        rows = self.db.execute(
+            f"SELECT generation, ref, reason, first_seen_at, last_seen_at, cleared_at "
+            f"FROM source_gaps WHERE {' AND '.join(where)} "
+            f"ORDER BY last_seen_at, ref LIMIT ?",
+            [*arguments, limit]).fetchall()
+        return [dict(row) for row in rows]
+
     def journal_tail(self, seq: int) -> dict[str, Any]:
         row = self.db.execute(
             "SELECT source, record_id, change, epoch, committed_at FROM change_journal "
@@ -363,13 +463,13 @@ class SyncController:
     # -- pause semantics -----------------------------------------------------
 
     def pause(self, source: str, *, actor: str, reason: str, policy_version: str,
-              stages: Sequence[str] = DOWNSTREAM_STAGES) -> list[str]:
-        """Pause processing stages for one source. Capture keeps running by default."""
+              stages: Sequence[str] = STAGES) -> list[str]:
+        """Pause a source end to end. A narrower stop is named for what it stops."""
         return self._set_stages(source, "paused", actor=actor, reason=reason,
                                 policy_version=policy_version, stages=stages)
 
     def resume(self, source: str, *, actor: str, reason: str, policy_version: str,
-               stages: Sequence[str] = DOWNSTREAM_STAGES) -> list[str]:
+               stages: Sequence[str] = STAGES) -> list[str]:
         return self._set_stages(source, "active", actor=actor, reason=reason,
                                 policy_version=policy_version, stages=stages)
 
@@ -418,3 +518,17 @@ def _check_token(value: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 500:
         raise EvidenceError("page_token must be nonempty text of at most 500 characters")
     return value
+
+
+def _ref_of(item: Any) -> str:
+    ref = item.ref if isinstance(item, Skipped) else item[0]
+    if not isinstance(ref, str) or not ref.strip():
+        raise EvidenceError("a reported gap needs the source's own reference to it")
+    return ref[:500]
+
+
+def _reason_of(item: Any) -> str:
+    reason = item.reason if isinstance(item, Skipped) else item[1]
+    if not isinstance(reason, str) or not reason.strip():
+        raise EvidenceError("a reported gap needs a reason; 'nothing' is not one")
+    return reason[:1000]

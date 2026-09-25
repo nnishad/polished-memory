@@ -94,12 +94,16 @@ def test_a_source_that_reached_the_tail_is_live_again(store, policy, evidence):
     sync.register("gmail", policy_version="private-api")
     subject = Eligibility(store, policy=policy, sync=sync)
     fence = sync.acquire("gmail", holder="c1")
-    # Advancing the cursor is what "caught up" means: a page with no next cursor is
-    # the end of the sweep, not a live connector.
+    # One page with a cursor behind it is a sweep in progress; the source has to
+    # say it reached its end before an absence can be read as an absence.
     sync.publish(fence, "page-1", [envelope(source_id="invoice-2",
                                             text="A second overdue invoice.")],
                  next_cursor="cursor-2")
+    assert sync.state("gmail")["coverage_state"] == "partial"
+    sync.publish(fence, "page-2", [envelope(source_id="invoice-3",
+                                            text="The last of them.")], next_cursor=None)
     sync.release(fence)
+    assert sync.state("gmail")["coverage_state"] == "current"
     assert subject.for_change(source="gmail", record_id=evidence, at=MORNING).eligible
 
 

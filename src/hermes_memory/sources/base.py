@@ -9,7 +9,17 @@ from typing import Any, Mapping
 from ..ids import timestamp
 from ..storage.evidence import EvidenceError
 
-__all__ = ["Capabilities", "Page", "Skipped", "SourceAdapter", "normalize_time"]
+__all__ = ["Capabilities", "CursorExpired", "Page", "Skipped", "SourceAdapter",
+         "normalize_time"]
+
+
+class CursorExpired(EvidenceError):
+    """The source no longer accepts the position we stored for it.
+
+    Raised by an adapter rather than caught: the difference between "unreachable" and
+    "start over" matters, because a wedged cursor fails the same way forever while a
+    restarted one fails once and then re-reads what it can.
+    """
 
 
 @dataclass(frozen=True)
@@ -44,11 +54,19 @@ class Page:
     ``next_cursor`` None means the end. Gaps are reported through *skipped*
     rather than a 'complete' flag, because a page can be finished and still
     have incomplete coverage, and the two must not be conflated.
+
+    ``page_token`` is how the source names this read. It decides what a replay
+    is: a source whose position is stable across reads (an export, a file list)
+    names the same page twice and the commit is a no-op, while a live source
+    whose position is re-read as things arrive leaves it blank and the runtime
+    names the read itself, so a poll that finds new mail is new work rather than
+    a contradiction.
     """
 
     envelopes: tuple[dict[str, Any], ...] = ()
     next_cursor: str | None = None
     skipped: tuple[Skipped, ...] = ()
+    page_token: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "envelopes", tuple(self.envelopes))

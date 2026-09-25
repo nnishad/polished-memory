@@ -25,6 +25,7 @@ from hermes_memory.prospective.due_events import CLAIMED, DueEventLog
 from hermes_memory.prospective.goals import GoalStore
 from hermes_memory.storage.evidence import EvidenceError, EvidenceStore, journal
 from hermes_memory.storage.lineage import Lineage
+from hermes_memory.storage.migrations import MIGRATIONS
 
 OWNER = "owner-principal"
 AGENT = "hermes-agent"
@@ -179,7 +180,7 @@ def test_a_snapshot_verifies_itself(store, snapshots):
     assert checked["ok"] is True
     assert checked["problems"] == []
     assert checked["records"] == 1
-    assert checked["schema"] == 11
+    assert checked["schema"] == len(MIGRATIONS)
 
 
 def test_a_snapshot_is_a_whole_store_that_another_database_can_adopt(tmp_path, store,
@@ -289,7 +290,7 @@ def test_an_older_schema_is_flagged_and_still_restorable(store, snapshots, recov
 
     recovery.restore(made.id, actor=OWNER)
     assert int(store.db.execute(
-        "SELECT count(*) FROM schema_migrations").fetchone()[0]) == 11
+        "SELECT count(*) FROM schema_migrations").fetchone()[0]) == len(MIGRATIONS)
     assert store.db.execute(
         "SELECT 1 FROM sqlite_master WHERE name='lessons'").fetchone() is not None
 
