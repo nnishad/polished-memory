@@ -5,8 +5,10 @@ import json
 
 import pytest
 
-from hermes_memory.sources.base import normalize_time
+from hermes_memory.sources.base import (REDACTED, Page, normalize_text,
+                      normalize_time, revocation)
 from hermes_memory.sources.files import FileSource
+from hermes_memory.storage.evidence import EvidenceError
 
 
 def tree(root, files: dict[str, str | bytes]):
@@ -226,3 +228,44 @@ def _pages(source):
         if page.next_cursor is None:
             return
         cursor = page.next_cursor
+
+
+# -- the shared normalization the adapters lean on --------------------------
+
+def test_a_source_that_never_reaches_its_end_is_stopped(tmp_path):
+    class NeverEnds(FileSource):
+        def read_page(self, cursor):
+            return Page(envelopes=(), next_cursor="always-ahead")
+
+    with pytest.raises(EvidenceError, match="did not finish within 3 pages"):
+        NeverEnds(tmp_path).read_all(max_pages=3)
+
+
+def test_an_adapter_that_cannot_name_itself_stamps_nothing(tmp_path):
+    with pytest.raises(EvidenceError, match="declare a source"):
+        FileSource(tmp_path, source="").envelope(source_id="x", text="y")
+
+
+def test_bytes_are_decoded_strictly_and_damaged_text_is_refused():
+    assert normalize_text(b"Caf\xc3\xa9") == "Café"
+    assert normalize_text(b"Caf\xe9") is None
+    assert normalize_text("Caf\ufffd") is None
+    assert normalize_text({"not": "text"}) is None
+    assert normalize_text("   ") is None
+
+
+@pytest.mark.parametrize("secret", [
+    "Bearer yhVn2sQ9kF7pLm3Zx8Rt4Wd6", "sk-proj-Ab9ZmQ2xKd7Lp4Rt8Vn1Yc3Eg6Jk0Mq",
+    "ghp_16A0nB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV", "xoxb-123456789012-abcdefGHIJKL",
+    "AKIA1F3BCDEGHIJKLM2N", "AIzaSyB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3w"])
+def test_every_credential_shape_the_suite_can_name_is_taken_out_of_text(secret):
+    assert secret not in normalize_text(f"the key is {secret}, keep it safe")
+    assert REDACTED in normalize_text(f"the key is {secret}, keep it safe")
+
+
+def test_a_source_saying_the_grant_is_gone_is_a_different_answer():
+    assert revocation("403 insufficient_scope for this account") == {
+        "coverage_state": "revoked"}
+    assert revocation("invalid_grant") == {"coverage_state": "revoked"}
+    assert revocation("connection reset by peer") == {}
+    assert revocation(None) == {}

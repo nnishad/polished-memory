@@ -129,6 +129,43 @@ def test_six_month_old_mail_arriving_today_is_still_old_news(store, policy):
     assert "older than the 14 days" in verdict.reason
 
 
+def test_an_undated_arrival_is_aged_by_when_its_source_said_it_landed(store, policy):
+    """A spool replayed after three weeks has no occurrence time; it has an arrival.
+
+    Without that fallback the record would be dated by the moment somebody noticed
+    it, which is exactly how a historical import ends up generating a live alert.
+    """
+    committed = store.commit(envelope(
+        source_id="spool-1", occurred_at=None, occurred_precision="unknown",
+        metadata={"spooled_at": "2026-03-01T09:00:00+00:00"},
+        text="A turn the host accepted in March."))
+    subject = Eligibility(store, policy=policy, max_age_days=14)
+    verdict = subject.for_change(source="hermes", record_id=str(committed["id"]), at=MORNING)
+    assert not verdict.eligible and verdict.stage == "freshness"
+    assert "2026-03-01" in verdict.reason
+
+
+def test_a_recent_arrival_undated_by_its_source_is_still_news(store, policy):
+    committed = store.commit(envelope(
+        source_id="spool-2", occurred_at=None, occurred_precision="unknown",
+        metadata={"spooled_at": "2026-09-14T09:00:00+00:00"}, text="Yesterday's session."))
+    subject = Eligibility(store, policy=policy, max_age_days=14)
+    verdict = subject.for_change(source="hermes", record_id=str(committed["id"]), at=MORNING)
+    assert verdict.eligible
+
+
+def test_evidence_with_no_date_anywhere_is_not_given_one_by_being_read(store, policy):
+    committed = store.commit(envelope(source_id="nodate-1", occurred_at=None,
+                                      occurred_precision="unknown",
+                                      text="Something the owner asked to keep."))
+    subject = Eligibility(store, policy=policy, max_age_days=14)
+    verdict = subject.for_change(source="hermes", record_id=str(committed["id"]),
+                                 at="2027-09-15T09:00:00+00:00")
+    # Aging it by the moment it was noticed would be inventing the one date the
+    # record does not carry, so nothing about it has aged.
+    assert verdict.eligible and verdict.stage != "freshness"
+
+
 def test_a_snoozed_goal_is_not_asked_about_while_it_is_put_off(store, stack):
     subject = Eligibility(store, policy=stack["policy"], goals=stack["goals"])
     goal_id = stack["goals"].propose(title="Renew", statement="Due Friday.",

@@ -9,8 +9,8 @@ from typing import Any, Mapping
 from ..ids import timestamp
 from ..storage.evidence import EvidenceError
 
-__all__ = ["Capabilities", "CursorExpired", "Page", "Skipped", "SourceAdapter",
-         "normalize_time"]
+__all__ = ["Capabilities", "CursorExpired", "Page", "REDACTED", "Skipped", "SourceAdapter",
+           "normalize_text", "normalize_time", "redact_secrets", "revocation"]
 
 
 class CursorExpired(EvidenceError):
@@ -143,6 +143,56 @@ def normalize_time(value: Any) -> tuple[str | None, str, str | None]:
 
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_REPLACEMENT = "\ufffd"
+REDACTED = "[redacted]"
+_SECRET_VALUE = re.compile(
+    r"(?:Bearer\s+[A-Za-z0-9._~+/=-]{12,}|sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,})")
+_REVOKED = re.compile(
+    r"(revok|invalid_grant|expired token|unauthorized|forbidden|insufficient_scope|"
+    r"no longer authorized|access denied)", re.IGNORECASE)
+
+
+def normalize_text(value: Any) -> str | None:
+    """Text an adapter may put in a record, or None when the source gave none.
+
+    Bytes are decoded strictly and text that already carries a replacement
+    character is refused rather than stored: damaged bytes kept in a record are
+    shown to a model later as if they had been understood. A value that is not
+    text at all is missing, not empty — the difference is what a reported gap is
+    for. Secret-shaped substrings are replaced here, in the one place every
+    adapter's text passes through, because every adapter reads from something
+    somebody else wrote.
+    """
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str) or _REPLACEMENT in value:
+        return None
+    return redact_secrets(value).strip() or None
+
+
+def redact_secrets(text: str) -> str:
+    """Take bearer tokens and API keys out of text that happens to contain one.
+
+    Someone pastes a credential into a conversation, a channel posts its own webhook
+    URL, and the archive becomes a searchable copy of it. What is left says a
+    credential was there, which is more use to an owner than either the secret or
+    silence.
+    """
+    return _SECRET_VALUE.sub(REDACTED, text)
+
+
+def revocation(reason: Any) -> dict[str, str]:
+    """``{'coverage_state': 'revoked'}`` when the source's own words say that.
+
+    A dead endpoint and a withdrawn grant look the same to a retry loop and are not
+    the same to an operator: one is fixed by waiting, the other by asking again. An
+    adapter that can tell them apart should say so in its check, and this is how.
+    """
+    return {"coverage_state": "revoked"} if _REVOKED.search(str(reason or "")) else {}
 
 
 def _precision_of(text: str) -> str:

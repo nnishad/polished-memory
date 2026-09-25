@@ -8,7 +8,9 @@ still wants to fire, what the owner's attention budget has left, and whether the
 model is permitted to look at all.
 
 Every refusal names the stage that refused it, because C14 has to answer "why was I
-not told?" from the record rather than from a re-run.
+not told?" from the record rather than from a re-run. And every age is taken from a
+date the record carries — an occurrence time, or failing that the moment its source
+said the thing arrived — rather than from the moment this call happened to look.
 """
 from __future__ import annotations
 
@@ -29,6 +31,9 @@ CONSUMER = "proactive"
 # matter what the connector's coverage says.
 DEFAULT_MAX_AGE_DAYS = 14
 COVERAGE_LIVE = "current"
+# Where an adapter records that its source said the payload arrived. Undated
+# evidence is aged by this instead of by the moment it happened to be noticed.
+ARRIVAL_FIELD = "spooled_at"
 
 
 @dataclass(frozen=True)
@@ -72,7 +77,7 @@ class Eligibility:
             return Verdict(False, "evidence",
                            "the record this change names is not in the store, so there is "
                            "nothing to describe")
-        stale = self._stale(evidence.occurred_at, moment)
+        stale = self._stale(evidence, moment)
         if not stale.eligible:
             return stale
         decision = self.policy.decide(topic=topic, urgency="freshness", at=moment,
@@ -163,16 +168,33 @@ class Eligibility:
                            "absence")
         return Verdict(True, "coverage", f"{source} is current")
 
-    def _stale(self, occurred_at: str | None, moment: str | None) -> Verdict:
-        if occurred_at is None or moment is None:
+    def _stale(self, evidence, moment: str | None) -> Verdict:
+        """Age a change by the latest moment anything about it claims to be true.
+
+        An undated arrival is the hole in 'this happened on ...': a capture spool
+        replayed after three weeks carries no occurrence time to age, and would be
+        read as news the moment it was noticed. When the source said the thing
+        arrived, that is the date a live-versus-backfill verdict rests on, and it is
+        in the record rather than in this call's clock.
+        """
+        when = evidence.occurred_at or _arrival_of(evidence.metadata)
+        if when is None or moment is None:
             return Verdict(True, "freshness", "the change carries no occurrence time to age")
-        then = _parse(occurred_at)
+        then = _parse(when)
         now = _parse(moment)
         if now - then > self.max_age:
             return Verdict(False, "freshness",
-                           f"this happened on {occurred_at[:10]}, which is older than the "
+                           f"this happened on {when[:10]}, which is older than the "
                            f"{self.max_age.days} days a late arrival can still be news for")
         return Verdict(True, "freshness", "the change is recent enough to be worth attention")
+
+
+def _arrival_of(metadata: Any) -> str | None:
+    """When the source says its own payload arrived, if it said so at all."""
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(ARRIVAL_FIELD)
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _parse(value: str) -> datetime:

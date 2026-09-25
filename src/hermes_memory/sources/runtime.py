@@ -20,7 +20,7 @@ from typing import Any, Callable
 from ..ids import digest
 from ..storage.evidence import EvidenceError
 from .base import CursorExpired, Page, SourceAdapter
-from .sync import StaleFence, SyncController
+from .sync import COVERAGE_STATES, StaleFence, SyncController
 
 __all__ = ["ConnectorRuntime", "Run", "COMPLETE", "PAUSED", "STALE", "UNREACHABLE",
            "EXHAUSTED", "CONTENDED", "STALLED", "CURSOR_EXPIRED"]
@@ -111,7 +111,7 @@ class ConnectorRuntime:
             reach = self._ask(adapter)
             if not (isinstance(reach, dict) and reach.get("ok")):
                 reason = _reason_of(reach)
-                self._mark(fence, "unreachable", reason)
+                self._mark(fence, _coverage_of(reach), reason)
                 return self._report(source, self.sync.state(source), pages=pages,
                                     stopped=UNREACHABLE, note=reason)
             while pages < limit:
@@ -185,13 +185,14 @@ class ConnectorRuntime:
     def _token(self, fence, page: Page) -> str:
         """Name the page by what it holds, so a replay is recognised and re-read cheap.
 
-        Keying on the *position* looks reasonable and wedges: a source that is asked
-        for the same cursor after something new arrived — the tail of a mailbox, the
-        file that was skipped last time — would be reported as having contradicted
-        itself, and the connector could never get past it. An adapter that can name
-        its own page (a history range, a page token from the API) is believed over
-        this, because then the source really does hold the identity, and a different
-        set of bytes under that name is a contradiction worth refusing.
+        Keying on the *position* alone looks reasonable and wedges: a source that is
+        asked for the same cursor after something new arrived — the tail of a
+        mailbox, the file that was skipped last time — would be reported as having
+        contradicted itself, and the connector could never get past it. An adapter
+        that can name its own page (a history range, a token from the API) is
+        believed over this, because then the source really does hold the identity,
+        and a different set of bytes under that one name is the contradiction worth
+        refusing.
         """
         if page.page_token:
             return str(page.page_token)[:500]
@@ -228,3 +229,14 @@ def _reason_of(reach: Any) -> str:
     if isinstance(reach, dict):
         return " ".join(str(reach.get("reason") or "the source reported no reason").split())[:500]
     return f"the source check returned {reach!r}"[:500]
+
+
+def _coverage_of(reach: Any) -> str:
+    """'unreachable' unless the source is able to say better than that.
+
+    A revoked grant and a dead network look identical to a retry loop and are not
+    identical to an operator: one waits for the other end to come back, the other
+    has to be authorised again. A source that can tell the two apart is asked to.
+    """
+    state = reach.get("coverage_state") if isinstance(reach, dict) else None
+    return state if state in COVERAGE_STATES and state != "current" else UNREACHABLE

@@ -239,7 +239,10 @@ class SyncController:
         Idempotent per (source, generation, page_token). A page that is replayed
         after a crash is recognised by fingerprint before any write, so retries
         cannot duplicate evidence; a *different* page under the same token is a
-        source-level contradiction and is refused.
+        source-level contradiction and is refused. The runtime derives a token from
+        page content when the source cannot name its own page, which is what keeps a
+        moving tail from being read as a contradiction — see
+        ``ConnectorRuntime._token``.
 
         What the source could not give us on this page is recorded here rather than
         logged, in the same transaction: a gap that is not durable is a gap nobody
@@ -268,7 +271,7 @@ class SyncController:
         try:
             fence.validate(self.db)
             seen = self.db.execute(
-                "SELECT fingerprint, record_count FROM source_pages "
+                "SELECT fingerprint FROM source_pages "
                 "WHERE source=? AND generation=? AND page_token=?",
                 (fence.source, fence.generation, token),
             ).fetchone()
