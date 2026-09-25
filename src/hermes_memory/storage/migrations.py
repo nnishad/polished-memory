@@ -325,6 +325,7 @@ PROCESSING_STATEMENTS: tuple[str, ...] = (
         tokens_used INTEGER NOT NULL DEFAULT 0,
         token_budget INTEGER NOT NULL,
         deadline REAL,
+        not_before REAL,
         lease TEXT,
         lease_until REAL,
         last_error TEXT,
