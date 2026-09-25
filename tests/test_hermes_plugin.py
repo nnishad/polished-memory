@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
 
 from plugin_loader import INTEGRATIONS, PLUGIN, load_plugin
 
@@ -168,6 +169,39 @@ def test_forget_request_does_not_erase(provider):
     payload = json.loads(provider.handle_tool_call("memory_forget_request", {"query": "invoice"}))
     assert payload["erased"] is False
     assert payload["preview_required"] is True
+
+
+def test_a_forget_request_previews_the_real_blast_radius(provider):
+    """The agent must see what the owner would be authorising, not a promise."""
+    recorded = json.loads(provider.handle_tool_call(
+        "memory_remember", {"content": "invoice 42 is paid from the joint account"}))
+    payload = json.loads(provider.handle_tool_call(
+        "memory_forget_request", {"query": "invoice 42"}))
+    assert payload["matched"] == 1
+    assert payload["intent_id"].startswith("erase_")
+    assert payload["confirmable_by"] is None, "no owner principal is configured in tests"
+    # The evidence is untouched: a preview is not a deletion.
+    recall = json.loads(provider.handle_tool_call("memory_recall", {"query": "invoice"}))
+    assert [item["id"] for item in recall["results"]] == [recorded["id"]]
+
+
+def test_an_agent_cannot_confirm_the_erasure_it_opened(provider):
+    """Without an owner principal configured, confirmation is unreachable at all."""
+    provider.handle_tool_call("memory_remember", {"content": "the garage code is 8841"})
+    payload = json.loads(provider.handle_tool_call(
+        "memory_forget_request", {"query": "garage"}))
+    from hermes_memory.lifecycle.erasure import ErasureManager
+
+    with EvidenceStore(provider._settings.db_path) as store:
+        # Unconfigured: nobody at all can confirm. Configured: only that principal.
+        for owner, actor in ((None, "hermes-agent"), ("jugaadu", "hermes-agent")):
+            manager = ErasureManager(store, owner_principal=owner)
+            with pytest.raises(EvidenceError, match="owner principal"):
+                manager.confirm(intent_id=payload["intent_id"],
+                                preview_digest=payload["preview_digest"], actor=actor)
+        assert store.live_and_visible(
+            json.loads(provider.handle_tool_call("memory_recall", {"query": "garage"}))
+            ["results"][0]["id"])
 
 
 def test_recall_reports_the_semantic_channel_honestly(provider):

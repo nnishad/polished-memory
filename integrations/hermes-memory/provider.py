@@ -213,13 +213,47 @@ class HermesMemoryProvider(_MemoryProvider):
                 "note": "A candidate is not an identity. Owner confirmation is required.",
             }
         if tool_name == "memory_forget_request":
+            return self._forget_request(args)
+        raise ValueError(f"unsupported tool {tool_name!r}")
+
+    def _forget_request(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Open a preview intent. The agent's own credential cannot close it.
+
+        Returning the real blast radius is the point: 'forget the invoice
+        stuff' has to show which records, which dependent summaries and which
+        backend copies the owner would be authorising.
+        """
+        from hermes_memory.lifecycle.erasure import ErasureManager
+
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        with self._open_store() as store:
+            matches = store.search(query, limit=20)
+            if not matches:
+                return {"ok": True, "erased": False, "matched": 0,
+                        "note": "no live evidence matched; nothing to preview"}
+            settings = self._settings
+            manager = ErasureManager(store, owner_principal=settings.owner_principal)
+            preview = manager.preview(
+                record_ids=[item.id for item in matches],
+                actor=f"agent:{self._session_id or 'unassigned'}",
+                actor_kind="agent",
+                reason=f"agent-requested forgetting for query: {query[:400]}",
+            )
             return {
                 "ok": True,
                 "erased": False,
                 "preview_required": True,
-                "note": "Forgetting needs an owner confirmation bound to the preview digest.",
+                "intent_id": preview["intent_id"],
+                "preview_digest": preview["preview_digest"],
+                "matched": len(matches),
+                "dependent_artifacts": len(preview["dependent_artifacts"]),
+                "derived_copies_to_clear": len(preview["obligations"]),
+                "confirmable_by": preview["confirmable_by"],
+                "note": ("Nothing has been deleted. The owner must confirm this exact digest; "
+                         "an agent cannot confirm its own forgetting request."),
             }
-        raise ValueError(f"unsupported tool {tool_name!r}")
 
     def _open_store(self):
         from hermes_memory.storage.evidence import EvidenceStore
