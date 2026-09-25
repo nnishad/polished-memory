@@ -1,0 +1,53 @@
+name: hermes-memory
+version: 0.1.0
+description: >-
+  Evidence-backed personal memory for Hermes, built on Hindsight: durable
+  canonical capture with provenance, lexical fallback when the derived backend
+  is offline, owner-confirmed identities, and no provider-initiated delivery.
+kind: exclusive
+requires_hermes: ">=0.21.4"
+
+# This plugin is deliberately dependency-light: the backend and Hindsight run
+# as separately installed, separately owned releases. Declaring no Python
+# dependencies here is what keeps `hermes plugins enable` from ever touching
+# the agent's own environment. When hermes_memory is genuinely absent the
+# provider reports unavailable with a reason instead of auto-installing.
+python_dependencies: []
+
+# Tools are supplied through the provider's get_tool_schemas(), not by
+# overriding built-ins. No allow-tool-override is requested or needed.
+provides_tools:
+  - memory_recall
+  - memory_remember
+  - memory_status
+  - memory_identity_candidate
+  - memory_forget_request
+
+# Hooks this plugin actually implements. Anything not listed here is not
+# claimed: notably there is no provider-initiated notification hook in Hermes,
+# so proactive output is left as a durable artifact for cron to collect.
+provides_hooks:
+  - sync_turn
+  - prefetch
+  - queue_prefetch
+  - on_pre_compress
+  - on_memory_write
+  - on_session_end
+  - on_session_switch
+  - backup_paths
+
+# Maps to plugins.entries.hermes-memory.settings. Distinct from the provider's
+# own get_config_schema(), which drives `hermes memory setup`.
+config_schema:
+  type: object
+  properties:
+    data_dir:
+      type: string
+      description: Canonical memory data directory.
+    hindsight_url:
+      type: string
+      description: Private Hindsight API endpoint (loopback or LAN literal only).
+    foreground_deadline_s:
+      type: number
+      description: Ceiling for a foreground context packet, in seconds.
+  additionalProperties: false

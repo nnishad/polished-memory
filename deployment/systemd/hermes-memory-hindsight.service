@@ -1,0 +1,39 @@
+[Unit]
+Description=Hindsight memory backend (API process, private loopback)
+Documentation=file:///home/jugaadu/Projects/hermes-memory/docs/operations.md
+# The gate starts first: an unreachable gate means the backend cannot dispatch
+# inference, and it must fail closed rather than fall back to a direct route.
+After=network-online.target hermes-memory.service
+Wants=hermes-memory.service
+
+[Service]
+Type=simple
+Environment=HERMES_MEMORY_RELEASE=/home/jugaadu/services/hermes-memory/current
+Environment=HERMES_MEMORY_HOME=/home/jugaadu/data/hermes-memory
+ExecStart=/home/jugaadu/services/hermes-memory/hindsight/current/bin/hindsight-api
+
+Restart=on-failure
+RestartSec=10
+# Cold start migrates the embedded database; keep generous.
+TimeoutStartSec=900
+TimeoutStopSec=150
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# One lifecycle owner for pg0: only this process initialises and migrates the
+# embedded database. The worker reads its resolved DSN and never starts a
+# second instance.
+ReadWritePaths=/home/jugaadu/data/hermes-memory/hindsight /home/jugaadu/data/hermes-memory/pg0
+EnvironmentFile=/home/jugaadu/data/hermes-memory/hindsight.env
+Environment=HF_HOME=/home/jugaadu/.cache/huggingface
+Environment=TOKENIZERS_PARALLELISM=false
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+MemoryHigh=8G
+MemoryMax=12G
+TasksMax=1024
+
+[Install]
+WantedBy=default.target

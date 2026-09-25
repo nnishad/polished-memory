@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-memory"
+version = "0.1.0"
+description = "Evidence-backed personal memory for Hermes, built on Hindsight"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+hermes-memory = "hermes_memory.cli:main"
+
+[project.optional-dependencies]
+# The Hindsight bridge and any model-backed path are deliberately optional so
+# that capture, lexical retrieval and the whole durability core install and run
+# without the derived backend present.
+hindsight = ["hindsight-client>=0.6.1"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
