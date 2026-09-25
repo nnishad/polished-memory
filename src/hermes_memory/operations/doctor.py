@@ -423,6 +423,22 @@ def _severity_for(state: str) -> str:
     return WARN if state == PAUSED else OK
 
 
+def unreachable_store_report(path: Any, reason: str) -> dict[str, Any]:
+    """The report for a store that cannot be opened at all.
+
+    It uses the same envelope as a full examination, so a reader never has to handle a
+    second shape, and it carries one failure with the action that follows from it.
+    """
+    finding = Finding("layout", FAIL, f"{path}: {reason}",
+                      "run `hermes-memory init` to create the canonical store")
+    return {
+        "checked_at": now(), "profile": "default", "severity": FAIL, "ok": False,
+        "exit_code": 1,
+        "probes": {"connectivity": False, "synthetic": False},
+        "findings": [finding.as_dict()], "actions": [str(finding.remedy)],
+    }
+
+
 def _world_readable(path: Any) -> bool:
     try:
         return bool(os.stat(path).st_mode & 0o077)

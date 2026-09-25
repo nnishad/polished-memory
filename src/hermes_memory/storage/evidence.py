@@ -15,7 +15,8 @@ from typing import Any, Iterable
 from ..ids import digest, now, record_id as make_record_id, timestamp
 from .migrations import apply_migrations, connect
 
-__all__ = ["EvidenceStore", "EvidenceError", "Evidence", "Prepared", "prepare_envelope", "journal"]
+__all__ = ["EvidenceStore", "ReadOnlyStore", "EvidenceError", "Evidence",
+           "Prepared", "prepare_envelope", "journal"]
 
 _MAXIMUM_TEXT = 4_000_000
 _KNOWN_OCCURRED_PRECISION = {"second", "minute", "hour", "day", "week", "month", "year", "unknown"}
@@ -507,3 +508,23 @@ def _bounded_limit(value: int, *, maximum: int = 200) -> int:
 
 def visible_ids(store: EvidenceStore, candidates: Iterable[str]) -> list[str]:
     return [candidate for candidate in candidates if store.live_and_visible(candidate)]
+
+
+class ReadOnlyStore(EvidenceStore):
+    """An evidence store that cannot change anything.
+
+    Every read is the read the writable store performs; a write is refused by SQLite
+    rather than by this class remembering which methods to hide. That distinction is
+    the whole reason the doctor and the status report can promise they are read-only
+    without each carrying its own list of safe queries.
+    """
+
+    def __init__(self, path: str | Path):
+        path = Path(path)
+        if not path.exists():
+            raise EvidenceError(f"no canonical store at {path}; there is nothing to read")
+        self.path = path
+        self.db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10,
+                                  isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+
