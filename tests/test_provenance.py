@@ -75,6 +75,17 @@ def test_an_artifact_cannot_over_claim_its_support(store, ledger):
         declare(ledger, citations)
 
 
+def test_a_manifest_cannot_be_written_outside_a_transaction_it_was_lent(store, ledger, two):
+    # Passing a connection is a promise to share its transaction: writing on a
+    # bare connection would commit the citations before the artifact that owns
+    # them exists, which is exactly the orphan this arrangement avoids.
+    with pytest.raises(EvidenceError, match="ambient transaction"):
+        ledger.declare("sum_orphan", kind="summary",
+                       citations=[{"record_id": two[0]}], db=store.db)
+
+    assert ledger.artifacts() == []
+
+
 # -- verdicts ------------------------------------------------------------------
 
 

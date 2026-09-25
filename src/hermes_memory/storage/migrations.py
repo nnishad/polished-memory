@@ -443,6 +443,48 @@ KNOWLEDGE_STATEMENTS: tuple[str, ...] = (
 )
 
 
+SUMMARY_STATEMENTS: tuple[str, ...] = (
+    """
+    -- A summary is a claim about a window of evidence, so it carries the window,
+    -- the revision, and who built it. It is stored beside the evidence and never
+    -- inside it: a summary that entered the record set would be cited by the
+    -- next summary and quietly become a source.
+    CREATE TABLE summaries(
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('thread', 'day', 'week', 'project', 'mental_model')),
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        account_id TEXT,
+        window_from TEXT,
+        window_to TEXT,
+        revision INTEGER NOT NULL DEFAULT 1,
+        supersedes TEXT REFERENCES summaries(id),
+        status TEXT NOT NULL CHECK(status IN ('published', 'withdrawn')),
+        processor_fingerprint TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        budget_tokens INTEGER NOT NULL,
+        refresh_after TEXT,
+        created_at TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        withdrawn_at TEXT
+    )""",
+    "CREATE INDEX summaries_scope ON summaries(scope, kind, status, published_at)",
+    """
+    -- One refresh attempt per scope per change set, so a burst of arrivals
+    -- coalesces instead of re-summarizing the same afternoon fifty times.
+    CREATE TABLE summary_refreshes(
+        scope TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        through_at TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'running', 'done', 'failed')),
+        detail TEXT,
+        PRIMARY KEY(scope, kind, through_at)
+    )""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -458,6 +500,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0005_processing", PROCESSING_STATEMENTS),
     Migration("0006_blobs", BLOB_STATEMENTS),
     Migration("0007_knowledge", KNOWLEDGE_STATEMENTS),
+    Migration("0008_summaries", SUMMARY_STATEMENTS),
 )
 
 

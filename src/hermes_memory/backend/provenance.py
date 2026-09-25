@@ -16,6 +16,7 @@ still authorized is handed back in its place.
 """
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -68,11 +69,14 @@ class ProvenanceLedger:
     # -- declaration ---------------------------------------------------------
 
     def declare(self, artifact_id: str, *, kind: str, citations: Sequence[dict],
-                full_coverage: bool = True) -> dict[str, Any]:
+                full_coverage: bool = True,
+                db: sqlite3.Connection | None = None) -> dict[str, Any]:
         """Replace what *artifact* says it was built from.
 
         Replacing rather than appending: a refresh that leaves the old manifest
-        in place would report provenance for a version nobody is reading.
+        in place would report provenance for a version nobody is reading. Pass
+        *db* to write inside a transaction the caller already holds, which is how
+        a summary and its citations become one atomic fact.
         """
         _text(artifact_id, "artifact_id", 100)
         _text(kind, "kind", 60)
@@ -81,22 +85,29 @@ class ProvenanceLedger:
             raise EvidenceError(
                 f"{len(rows)} citations exceed the {MAX_CITATIONS} per artifact ceiling; "
                 "narrow the scope instead of over-claiming support")
-        self.db.execute("BEGIN IMMEDIATE")
+        connection = db or self.db
+        if db is not None and not db.in_transaction:
+            raise EvidenceError("provenance writes require an ambient transaction")
+        owns_transaction = db is None
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("DELETE FROM derived_citations WHERE artifact_id=?",
-                            (artifact_id,))
+            connection.execute("DELETE FROM derived_citations WHERE artifact_id=?",
+                               (artifact_id,))
             coverage = "full" if full_coverage else "truncated"
             for record_id, quote, start, end in rows:
-                self.db.execute(
+                connection.execute(
                     "INSERT INTO derived_citations(artifact_id, kind, coverage, record_id, "
                     "quote, quote_start, quote_end, added_at) VALUES(?,?,?,?,?,?,?,?)",
                     (artifact_id, kind, coverage, record_id, quote, start, end, now()))
             self.store._audit("provenance_declare", artifact_id,
                               {"kind": kind, "citations": len(rows),
                                "full_coverage": full_coverage})
-            self.db.execute("COMMIT")
+            if owns_transaction:
+                connection.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            if owns_transaction:
+                connection.execute("ROLLBACK")
             raise
         return {"artifact": artifact_id, "citations": len(rows),
                 "coverage": "full" if full_coverage else "truncated"}
