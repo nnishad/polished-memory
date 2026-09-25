@@ -485,6 +485,110 @@ SUMMARY_STATEMENTS: tuple[str, ...] = (
 )
 
 
+PROSPECTIVE_STATEMENTS: tuple[str, ...] = (
+    """
+    -- A goal is durable intent with a version. Every change appends a history row
+    -- and re-publishes the due events, because an acknowledgment of revision 3
+    -- must never be able to satisfy revision 4.
+    CREATE TABLE goals(
+        id TEXT PRIMARY KEY,
+        owner_account TEXT REFERENCES identity_accounts(id),
+        title TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'active', 'completed',
+            'cancelled', 'expired')),
+        revision INTEGER NOT NULL DEFAULT 1,
+        timezone TEXT NOT NULL,
+        due_at TEXT,
+        due_precision TEXT NOT NULL DEFAULT 'none' CHECK(due_precision IN
+            ('none', 'minute', 'hour', 'day', 'week', 'month', 'year')),
+        created_by TEXT NOT NULL,
+        created_kind TEXT NOT NULL CHECK(created_kind IN ('owner', 'agent')),
+        confirmed_by TEXT,
+        source_record_id TEXT REFERENCES records(id),
+        snoozed_until TEXT,
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by TEXT
+    )""",
+    "CREATE INDEX goals_status_due ON goals(status, due_at, id)",
+    """
+    CREATE TABLE goal_history(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        goal_id TEXT NOT NULL REFERENCES goals(id),
+        revision INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        due_at TEXT,
+        due_precision TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        changed_by TEXT NOT NULL,
+        changed_at TEXT NOT NULL,
+        reason TEXT NOT NULL
+    )""",
+    # Every decision appends: a settled goal writes at its current revision too, so
+    # a (goal, revision) key would overwrite the change that made it worth settling.
+    "CREATE INDEX goal_history_goal ON goal_history(goal_id, revision, seq)",
+    """
+    -- The bounded predicate vocabulary. A condition is data, not code: nothing
+    -- here can express a rule the framework has not agreed to evaluate.
+    CREATE TABLE goal_predicates(
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL REFERENCES goals(id),
+        revision INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('due_at', 'new_message_from',
+            'source_item_update', 'measured_threshold', 'waiting_for')),
+        params TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'satisfied', 'failed', 'unknown')),
+        detail TEXT,
+        evidence_record_id TEXT REFERENCES records(id),
+        evaluated_at TEXT,
+        UNIQUE(goal_id, revision, kind, params)
+    )""",
+    """
+    CREATE TABLE due_events(
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL REFERENCES goals(id),
+        revision INTEGER NOT NULL,
+        fire_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        precision TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'handed_off',
+            'suppressed', 'cancelled', 'uncertain')),
+        claim_token TEXT,
+        claim_until REAL,
+        claimed_by TEXT,
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decision_kind TEXT,
+        policy_version TEXT
+    )""",
+    "CREATE UNIQUE INDEX due_event_once ON due_events(goal_id, revision, fire_at, reason)",
+    "CREATE INDEX due_event_state ON due_events(state, fire_at)",
+    """
+    -- The handoff seam: responsibility for a due event transfers into a durable
+    -- decision intent. This is not a delivery claim, and the state names that.
+    CREATE TABLE decision_intents(
+        id TEXT PRIMARY KEY,
+        event_id TEXT NOT NULL REFERENCES due_events(id),
+        goal_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('silent', 'next_turn', 'digest', 'notify_owner',
+            'draft', 'awaiting_analysis')),
+        policy_version TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('prepared', 'awaiting_analysis', 'delivered',
+            'suppressed', 'uncertain')),
+        payload_digest TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(event_id, revision, kind, policy_version)
+    )""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -501,6 +605,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0006_blobs", BLOB_STATEMENTS),
     Migration("0007_knowledge", KNOWLEDGE_STATEMENTS),
     Migration("0008_summaries", SUMMARY_STATEMENTS),
+    Migration("0009_prospective", PROSPECTIVE_STATEMENTS),
 )
 
 
