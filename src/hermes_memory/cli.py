@@ -32,6 +32,28 @@ def _status(settings) -> dict:
     }
 
 
+def _erasure_report(settings) -> dict:
+    """Outstanding forgetting debt, which must never be invisible.
+
+    A confirmed erasure whose derived copies are still on a backend is the one
+    state an operator has to be able to see at a glance.
+    """
+    with EvidenceStore(settings.db_path) as store:
+        counts = {
+            "awaiting_confirmation": store.db.execute(
+                "SELECT count(*) FROM erasure_ledger WHERE state='awaiting_confirmation'"
+            ).fetchone()[0],
+            "obligations_outstanding": store.db.execute(
+                "SELECT count(*) FROM erasure_targets WHERE state!='verified'").fetchone()[0],
+            "forgotten_records": store.db.execute(
+                "SELECT count(*) FROM tombstones").fetchone()[0],
+            "capture_backlog": store.db.execute(
+                "SELECT count(*) FROM records WHERE deleted=0").fetchone()[0],
+        }
+    return {**counts,
+            "confirmable_by": settings.owner_principal or "unset (forgetting cannot be confirmed)"}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes-memory")
     parser.add_argument("--env-file", help="owned env file (default: $HERMES_MEMORY_HOME/hermes-memory.env)")
@@ -51,7 +73,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "status":
-        print(json.dumps(_status(settings), indent=2, sort_keys=True))
+        report = _status(settings)
+        if settings.db_path.exists():
+            report["erasure"] = _erasure_report(settings)
+        print(json.dumps(report, indent=2, sort_keys=True))
         return 0
 
     if args.command == "init":
@@ -69,9 +94,26 @@ def main(argv: list[str] | None = None) -> int:
     problems: list[str] = []
     if not Path(settings.data_dir).exists():
         problems.append("data directory does not exist; run `hermes-memory init`")
-    report = {**_status(settings), "problems": problems}
-    report["ready_for_capture"] = not problems
-    report["ready_for_formation"] = not problems and not settings.capture_only
+    report = {**_status(settings)}
+    if settings.db_path.exists():
+        report["erasure"] = _erasure_report(settings)
+        if report["erasure"]["obligations_outstanding"]:
+            problems.append(
+                f"{report['erasure']['obligations_outstanding']} erasure obligation(s) are "
+                "still outstanding; forgetting is not finished until they verify")
+    if not settings.owner_principal:
+        # Not a startup failure: capture and recall work. But a request to
+        # forget cannot be honoured, and saying so beats accepting a preview that
+        # can never be confirmed.
+        report["forgetting"] = "requests can be previewed but not confirmed"
+    else:
+        report["forgetting"] = f"confirmable by {settings.owner_principal}"
+    report["problems"] = problems
+    # Stages are reported separately on purpose: outstanding cleanup debt makes
+    # `doctor` exit non-zero without implying that capture has stopped working.
+    report["ready_for_capture"] = Path(settings.data_dir).exists()
+    report["ready_for_formation"] = report["ready_for_capture"] and not settings.capture_only
+    report["ready_for_forgetting"] = bool(settings.owner_principal)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if not problems else 1
 

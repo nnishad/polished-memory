@@ -155,15 +155,65 @@ SYNC_STATEMENTS: tuple[str, ...] = (
 )
 
 
+ERASURE_STATEMENTS: tuple[str, ...] = (
+    """
+    -- The durable erasure ledger. It sits outside ordinary snapshot restore
+    -- scope: a restore that replays old records must apply this ledger's newest
+    -- state afterwards, or forgetting an item would be undone by a backup.
+    CREATE TABLE erasure_ledger(
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        requester_kind TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        preview_digest TEXT NOT NULL,
+        state TEXT NOT NULL,
+        confirmed_at TEXT,
+        confirmed_by TEXT,
+        completed_at TEXT,
+        epoch INTEGER NOT NULL
+    )""",
+    "CREATE INDEX erasure_ledger_state ON erasure_ledger(state, requested_at)",
+    """
+    -- One row per object that has to physically disappear, including the
+    -- derived copies in the backend. 'complete' means every row verified.
+    CREATE TABLE erasure_targets(
+        intent_id TEXT NOT NULL REFERENCES erasure_ledger(id),
+        kind TEXT NOT NULL,
+        reference TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        verified_at TEXT,
+        error TEXT,
+        PRIMARY KEY(intent_id, kind, reference)
+    )""",
+    "CREATE INDEX erasure_targets_state ON erasure_targets(state, intent_id)",
+    """
+    -- A tombstone outlives the record it hides so a restore can tell 'never
+    -- existed' apart from 'was forgotten and must not come back'.
+    CREATE TABLE tombstones(
+        record_id TEXT PRIMARY KEY REFERENCES records(id),
+        intent_id TEXT NOT NULL REFERENCES erasure_ledger(id),
+        fingerprint TEXT NOT NULL,
+        deleted_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX tombstones_intent ON tombstones(intent_id)",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
     statements: tuple[str, ...]
 
 
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("0001_evidence", EVIDENCE_STATEMENTS),
     Migration("0002_sync", SYNC_STATEMENTS),
+    Migration("0003_erasure", ERASURE_STATEMENTS),
 )
 
 

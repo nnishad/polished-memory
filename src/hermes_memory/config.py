@@ -92,6 +92,7 @@ class Settings:
     inference_enabled: bool = False
     background_budget_tokens: int = 0
     foreground_deadline_s: float = 8.0
+    owner_principal: str | None = None
 
     @property
     def capture_only(self) -> bool:
@@ -165,4 +166,8 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         inference_enabled=inference_enabled,
         background_budget_tokens=int(get("BACKGROUND_BUDGET_TOKENS", "0") or 0),
         foreground_deadline_s=float(get("FOREGROUND_DEADLINE_S", "8") or 8),
+        # Unnamed by default: with no owner principal, forgetting can be
+        # requested and previewed but never confirmed, which fails closed
+        # instead of accepting any caller that claims to be the owner.
+        owner_principal=(get("OWNER_PRINCIPAL") or "").strip() or None,
     )
