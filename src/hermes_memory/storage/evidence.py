@@ -15,7 +15,7 @@ from typing import Any, Iterable
 from ..ids import digest, now, record_id as make_record_id, timestamp
 from .migrations import apply_migrations, connect
 
-__all__ = ["EvidenceStore", "EvidenceError"]
+__all__ = ["EvidenceStore", "EvidenceError", "Evidence", "Prepared", "prepare_envelope", "journal"]
 
 _MAXIMUM_TEXT = 4_000_000
 _KNOWN_OCCURRED_PRECISION = {"second", "minute", "hour", "day", "week", "month", "year", "unknown"}
@@ -64,14 +64,109 @@ def _required_text(value: Any, label: str, maximum: int = 1000) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class Prepared:
+    """A validated envelope with every derived column already computed.
+
+    Validation is separated from writing so the sync layer can prepare a whole
+    page before opening a transaction and keep the lock held for writes only.
+    """
+
+    id: str
+    source: str
+    source_id: str
+    revision: str
+    occurred_at: str | None
+    occurred_precision: str
+    observed_at: str
+    ingested_at: str
+    kind: str
+    text: str
+    metadata: str
+    fingerprint: str
+    parents: tuple[str, ...]
+    receipt: str
+    receipt_id: str
+
+
+def prepare_envelope(envelope: dict[str, Any]) -> Prepared:
+    if not isinstance(envelope, dict):
+        raise EvidenceError("envelope must be an object")
+
+    source = _required_text(envelope.get("source"), "source", 500)
+    source_id = _required_text(envelope.get("source_id"), "source_id", 500)
+    revision = _required_text(envelope.get("revision", "1"), "revision", 500)
+    kind = _required_text(envelope.get("kind", "message"), "kind", 100)
+    text = envelope.get("text")
+    if not isinstance(text, str) or len(text) > _MAXIMUM_TEXT:
+        raise EvidenceError(f"text must be a string of at most {_MAXIMUM_TEXT} characters")
+    metadata = envelope.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise EvidenceError("metadata must be an object")
+
+    observed_at = timestamp(_required_text(envelope.get("observed_at"), "observed_at", 100))
+    # An unknown event time stays unknown. Filling it from ingestion time
+    # would silently turn "we received this on the 25th" into "this
+    # happened on the 25th".
+    occurred_raw = envelope.get("occurred_at")
+    precision = envelope.get("occurred_precision", "unknown")
+    if precision not in _KNOWN_OCCURRED_PRECISION:
+        raise EvidenceError(f"unknown occurred_precision {precision!r}")
+    if occurred_raw in (None, ""):
+        if precision != "unknown":
+            raise EvidenceError("occurred_precision requires an occurred_at value")
+        occurred_at: str | None = None
+    else:
+        occurred_at = timestamp(_required_text(occurred_raw, "occurred_at", 100))
+
+    parents = envelope.get("parent_record_ids") or []
+    if not isinstance(parents, list) or len(parents) > 100:
+        raise EvidenceError("parent_record_ids must be a list of at most 100 IDs")
+    parents = tuple(_required_text(parent, "parent_record_id", 100) for parent in parents)
+
+    fingerprint = digest([occurred_at, kind, text, metadata])
+    primary_key = make_record_id(source, source_id, revision)
+    receipt = {k: v for k, v in envelope.items() if k != "_contract"}
+    return Prepared(
+        id=primary_key, source=source, source_id=source_id, revision=revision,
+        occurred_at=occurred_at, occurred_precision=precision, observed_at=observed_at,
+        ingested_at=now(), kind=kind, text=text,
+        metadata=json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        fingerprint=fingerprint, parents=parents,
+        receipt=json.dumps(receipt, ensure_ascii=False),
+        receipt_id=digest([primary_key, fingerprint]),
+    )
+
+
+def journal(db: sqlite3.Connection, record_pk: str, change: str,
+            *, source: str | None = None, generation: int = 0) -> int:
+    """Append one change to the journal. Requires an ambient transaction.
+
+    Generation 0 means "not written by a connector" — a local tool call or an
+    operator action. Journal rows are only ever written inside the transaction
+    that commits the change, so a rolled back write leaves nothing to replay.
+    """
+    if source is None:
+        row = db.execute("SELECT source FROM records WHERE id=?", (record_pk,)).fetchone()
+        if row is None:
+            raise EvidenceError(f"cannot journal {change} for unknown record {record_pk!r}")
+        source = row["source"]
+    epoch = db.execute("SELECT value FROM memory_epoch WHERE id=1").fetchone()[0]
+    cursor = db.execute(
+        "INSERT INTO change_journal(source, generation, epoch, record_id, change, committed_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (source, generation, epoch, record_pk, change, now()),
+    )
+    return int(cursor.lastrowid)
+
+
 class EvidenceStore:
     def __init__(self, path: str | Path):
         path = Path(path)
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.path = path
         self.db = connect(path)
-        apply_migrations(self.db, at=now)
-        self.db.execute("PRAGMA user_version=1")
+        self.db.execute("PRAGMA user_version=%d" % apply_migrations(self.db, at=now))
 
     def close(self) -> None:
         self.db.close()
@@ -86,6 +181,27 @@ class EvidenceStore:
 
     def epoch(self) -> int:
         return int(self.db.execute("SELECT value FROM memory_epoch WHERE id=1").fetchone()[0])
+
+    def bump_epoch(self, *, reason: str, actor: str) -> int:
+        """Advance the global fence and invalidate every outstanding lease.
+
+        A reset or trust-revoking change must make in-flight writers fail
+        *forward*, not merely discard their output: a page already fetched under
+        the old epoch would otherwise be committed as though it were current.
+        """
+        _required_text(reason, "reason", 500)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute("UPDATE memory_epoch SET value=value+1 WHERE id=1")
+            epoch = self.epoch()
+            self.db.execute("UPDATE connectors SET lease=NULL, lease_until=NULL, holder=NULL")
+            self._audit("epoch_bump", "memory_epoch",
+                        {"actor": actor, "reason": reason, "epoch": epoch})
+            self.db.execute("COMMIT")
+            return epoch
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
 
     def get(self, record_pk: str, *, include_hidden: bool = False) -> Evidence | None:
         row = self.db.execute("SELECT * FROM records WHERE id=?", (record_pk,)).fetchone()
@@ -145,108 +261,81 @@ class EvidenceStore:
 
     # -- writes --------------------------------------------------------------
 
-    def commit(self, envelope: dict[str, Any]) -> dict[str, Any]:
+    def commit(self, envelope: dict[str, Any], *, fence: Any = None) -> dict[str, Any]:
         """Commit one canonical evidence item. Idempotent per content fingerprint.
 
         Returns ``{"id", "duplicate"}``. A duplicate revision is acknowledged
         without rewriting, so replaying a page never forks two records.
+
+        *fence*, when supplied, is validated inside the same transaction: a
+        connector whose lease, generation or epoch went stale cannot interleave
+        a check-then-write.
         """
-        if not isinstance(envelope, dict):
-            raise EvidenceError("envelope must be an object")
-
-        source = _required_text(envelope.get("source"), "source", 500)
-        source_id = _required_text(envelope.get("source_id"), "source_id", 500)
-        revision = _required_text(envelope.get("revision", "1"), "revision", 500)
-        kind = _required_text(envelope.get("kind", "message"), "kind", 100)
-        text = envelope.get("text")
-        if not isinstance(text, str) or len(text) > _MAXIMUM_TEXT:
-            raise EvidenceError(f"text must be a string of at most {_MAXIMUM_TEXT} characters")
-        metadata = envelope.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            raise EvidenceError("metadata must be an object")
-
-        observed_at = timestamp(_required_text(envelope.get("observed_at"), "observed_at", 100))
-        # An unknown event time stays unknown. Filling it from ingestion time
-        # would silently turn "we received this on the 25th" into "this
-        # happened on the 25th".
-        occurred_raw = envelope.get("occurred_at")
-        precision = envelope.get("occurred_precision", "unknown")
-        if precision not in _KNOWN_OCCURRED_PRECISION:
-            raise EvidenceError(f"unknown occurred_precision {precision!r}")
-        if occurred_raw in (None, ""):
-            if precision != "unknown":
-                raise EvidenceError("occurred_precision requires an occurred_at value")
-            occurred_at: str | None = None
-        else:
-            occurred_at = timestamp(_required_text(occurred_raw, "occurred_at", 100))
-
-        parents = envelope.get("parent_record_ids") or []
-        if not isinstance(parents, list) or len(parents) > 100:
-            raise EvidenceError("parent_record_ids must be a list of at most 100 IDs")
-
-        fingerprint = digest([occurred_at, kind, text, metadata])
-        primary_key = make_record_id(source, source_id, revision)
-        receipt = {k: v for k, v in envelope.items() if k != "_contract"}
-        receipt_id = digest([primary_key, fingerprint])
-        ingested_at = now()
-
+        prepared = prepare_envelope(envelope)
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            existing = self.db.execute(
-                "SELECT id, fingerprint FROM records WHERE source=? AND source_id=? AND revision=?",
-                (source, source_id, revision),
-            ).fetchone()
-            if existing and existing["fingerprint"] == fingerprint:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO ingestion_receipts(id, record_id, observed_at, envelope) "
-                    "VALUES(?, ?, ?, ?)",
-                    (receipt_id, existing["id"], observed_at, json.dumps(receipt, ensure_ascii=False)),
-                )
-                self.db.execute("COMMIT")
-                return {"id": existing["id"], "duplicate": True}
-            if existing:
-                raise EvidenceError(
-                    "revision content conflict: the same (source, source_id, revision) "
-                    "already exists with different bytes; use a new revision"
-                )
-
-            for parent in parents:
-                _required_text(parent, "parent_record_id", 100)
-                if not self.db.execute(
-                    "SELECT 1 FROM records WHERE id=? AND deleted=0", (parent,)
-                ).fetchone():
-                    raise EvidenceError(f"parent_record_id {parent!r} does not resolve to live evidence")
-
-            self.db.execute(
-                """
-                INSERT INTO records(id, source, source_id, revision, occurred_at, occurred_precision,
-                                    observed_at, ingested_at, kind, text, metadata, fingerprint, deleted)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)
-                """,
-                (
-                    primary_key, source, source_id, revision, occurred_at, precision,
-                    observed_at, ingested_at, kind, text,
-                    json.dumps(metadata, ensure_ascii=False, sort_keys=True), fingerprint,
-                ),
-            )
-            for parent in parents:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO record_dependencies(child_id, parent_id) VALUES(?,?)",
-                    (primary_key, parent),
-                )
-            self.db.execute(
-                "INSERT INTO record_fts(id, text) VALUES(?, ?)", (primary_key, text)
-            )
-            self.db.execute(
-                "INSERT INTO ingestion_receipts(id, record_id, observed_at, envelope) VALUES(?,?,?,?)",
-                (receipt_id, primary_key, observed_at, json.dumps(receipt, ensure_ascii=False)),
-            )
-            self._audit("evidence_commit", primary_key, {"source": source})
+            if fence is not None:
+                fence.validate(self.db)
+            record_pk, duplicate = self.write_prepared(self.db, prepared)
             self.db.execute("COMMIT")
-            return {"id": primary_key, "duplicate": False}
+            return {"id": record_pk, "duplicate": duplicate}
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
+
+    def write_prepared(self, db: sqlite3.Connection, prepared: Prepared, *, generation: int = 0) -> tuple[str, bool]:
+        """Write one prepared envelope. Requires an ambient transaction."""
+        existing = db.execute(
+            "SELECT id, fingerprint FROM records WHERE source=? AND source_id=? AND revision=?",
+            (prepared.source, prepared.source_id, prepared.revision),
+        ).fetchone()
+        if existing and existing["fingerprint"] == prepared.fingerprint:
+            db.execute(
+                "INSERT OR IGNORE INTO ingestion_receipts(id, record_id, observed_at, envelope) "
+                "VALUES(?, ?, ?, ?)",
+                (prepared.receipt_id, existing["id"], prepared.observed_at, prepared.receipt),
+            )
+            return existing["id"], True
+        if existing:
+            raise EvidenceError(
+                "revision content conflict: the same (source, source_id, revision) "
+                "already exists with different bytes; use a new revision"
+            )
+
+        for parent in prepared.parents:
+            if not db.execute(
+                "SELECT 1 FROM records WHERE id=? AND deleted=0", (parent,)
+            ).fetchone():
+                raise EvidenceError(
+                    f"parent_record_id {parent!r} does not resolve to live evidence"
+                )
+
+        db.execute(
+            """
+            INSERT INTO records(id, source, source_id, revision, occurred_at, occurred_precision,
+                                observed_at, ingested_at, kind, text, metadata, fingerprint, deleted)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)
+            """,
+            (
+                prepared.id, prepared.source, prepared.source_id, prepared.revision,
+                prepared.occurred_at, prepared.occurred_precision, prepared.observed_at,
+                prepared.ingested_at, prepared.kind, prepared.text, prepared.metadata,
+                prepared.fingerprint,
+            ),
+        )
+        for parent in prepared.parents:
+            db.execute(
+                "INSERT OR IGNORE INTO record_dependencies(child_id, parent_id) VALUES(?,?)",
+                (prepared.id, parent),
+            )
+        db.execute("INSERT INTO record_fts(id, text) VALUES(?, ?)", (prepared.id, prepared.text))
+        db.execute(
+            "INSERT INTO ingestion_receipts(id, record_id, observed_at, envelope) VALUES(?,?,?,?)",
+            (prepared.receipt_id, prepared.id, prepared.observed_at, prepared.receipt),
+        )
+        self._audit("evidence_commit", prepared.id, {"source": prepared.source})
+        journal(db, prepared.id, "add", source=prepared.source, generation=generation)
+        return prepared.id, False
 
     def supersede(self, old_id: str, new_id: str, *, reason: str, actor: str) -> None:
         """Point a superseded revision at its replacement and drop it from search.
@@ -274,6 +363,7 @@ class EvidenceStore:
             )
             self.db.execute("DELETE FROM record_fts WHERE id=?", (old_id,))
             self._audit("evidence_supersede", old_id, {"actor": actor, "replacement": new_id})
+            journal(self.db, old_id, "supersede")
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
@@ -297,6 +387,7 @@ class EvidenceStore:
             )
             self.db.execute("DELETE FROM record_fts WHERE id=?", (record_pk,))
             self._audit("evidence_hide", record_pk, {"actor": actor})
+            journal(self.db, record_pk, "hide")
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
@@ -312,6 +403,7 @@ class EvidenceStore:
             self.db.execute("DELETE FROM record_fts WHERE id=?", (record_pk,))
             self.db.execute("INSERT INTO record_fts(id, text) VALUES(?, ?)", (record_pk, row["text"]))
             self._audit("evidence_show", record_pk, {"actor": actor, "reason": reason})
+            journal(self.db, record_pk, "show")
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")

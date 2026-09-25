@@ -103,13 +103,68 @@ EVIDENCE_STATEMENTS: tuple[str, ...] = (
 )
 
 
+SYNC_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per connector. ``generation`` is bumped by reconfigure/reset so a
+    -- connector process still holding an old lease can never write into the new
+    -- source's identity.
+    CREATE TABLE connectors(
+        source TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL DEFAULT 1,
+        policy_version TEXT NOT NULL,
+        lease TEXT,
+        lease_until REAL,
+        holder TEXT,
+        cursor TEXT,
+        cursor_kind TEXT NOT NULL DEFAULT 'opaque',
+        coverage_state TEXT NOT NULL DEFAULT 'unknown',
+        last_success_at TEXT,
+        updated_at TEXT NOT NULL
+    )""",
+    """
+    -- Page-level idempotency: a retried page is recognised before any write,
+    -- so a crash between COMMIT and acknowledgement replays as a no-op.
+    CREATE TABLE source_pages(
+        source TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        page_token TEXT NOT NULL,
+        record_count INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL,
+        committed_at TEXT NOT NULL,
+        PRIMARY KEY(source, generation, page_token)
+    )""",
+    """
+    CREATE TABLE change_journal(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        epoch INTEGER NOT NULL,
+        record_id TEXT NOT NULL,
+        change TEXT NOT NULL,
+        committed_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX journal_record ON change_journal(record_id, seq)",
+    """
+    -- Consumers checkpoint independently and replay idempotently, so one slow
+    -- derived index cannot hold the upstream cursor back.
+    CREATE TABLE consumer_checkpoints(
+        consumer TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
     statements: tuple[str, ...]
 
 
-MIGRATIONS: Sequence[Migration] = (Migration("0001_evidence", EVIDENCE_STATEMENTS),)
+MIGRATIONS: Sequence[Migration] = (
+    Migration("0001_evidence", EVIDENCE_STATEMENTS),
+    Migration("0002_sync", SYNC_STATEMENTS),
+)
 
 
 def connect(path) -> sqlite3.Connection:

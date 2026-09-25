@@ -9,32 +9,14 @@ import pytest
 
 from hermes_memory.ids import backend_document_id, record_id
 from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
-from hermes_memory.storage.migrations import apply_migrations, connect, current_version
+from hermes_memory.storage.migrations import (
+    MIGRATIONS,
+    apply_migrations,
+    connect,
+    current_version,
+)
 
-SOURCE = "gmail"
-OBSERVED = "2026-09-25T12:00:00+00:00"
-
-
-def envelope(**overrides):
-    base = {
-        "source": SOURCE,
-        "source_id": "msg-1",
-        "revision": "1",
-        "kind": "email",
-        "text": "The meeting moved to Thursday at 3pm.",
-        "observed_at": OBSERVED,
-        "occurred_at": "2026-09-24T09:15:00+02:00",
-        "occurred_precision": "second",
-        "metadata": {"participants": [{"namespace": "email", "address": "a@example.com"}]},
-    }
-    base.update(overrides)
-    return base
-
-
-@pytest.fixture()
-def store(tmp_path: Path):
-    with EvidenceStore(tmp_path / "canonical.db") as opened:
-        yield opened
+from conftest import OBSERVED, SOURCE, envelope
 
 
 def test_replaying_the_same_revision_is_idempotent(store):
@@ -171,7 +153,7 @@ def test_migrations_refuse_a_schema_from_a_newer_build(tmp_path: Path):
     apply_migrations(db, at=lambda: "2026-09-25T00:00:00+00:00")
     db.execute("INSERT INTO schema_migrations(name, applied_at) VALUES('9999_from_the_future', ?)",
                ("2026-09-25T00:00:00+00:00",))
-    assert current_version(db) == 2
+    assert current_version(db) == len(MIGRATIONS) + 1  # real migrations plus the planted future
     db.close()
 
     fresh = connect(path)

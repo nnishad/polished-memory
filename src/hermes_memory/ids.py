@@ -12,7 +12,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-__all__ = ["digest", "now", "record_id", "backend_document_id", "timestamp"]
+__all__ = ["digest", "content_digest", "now", "record_id", "backend_document_id", "timestamp"]
 
 _INVALID_BACKEND_CHARS = re.compile(r"[~_]")
 
@@ -21,6 +21,13 @@ def digest(value) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def content_digest(raw: bytes) -> str:
+    """Hash of *bytes*. Kept separate from ``digest``: JSON cannot carry raw bytes."""
+    if not isinstance(raw, bytes):
+        raise TypeError("content_digest takes bytes")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def now() -> str:
