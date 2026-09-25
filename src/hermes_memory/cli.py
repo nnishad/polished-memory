@@ -47,7 +47,7 @@ def _erasure_report(settings) -> dict:
                 "SELECT count(*) FROM erasure_targets WHERE state!='verified'").fetchone()[0],
             "forgotten_records": store.db.execute(
                 "SELECT count(*) FROM tombstones").fetchone()[0],
-            "capture_backlog": store.db.execute(
+            "live_records": store.db.execute(
                 "SELECT count(*) FROM records WHERE deleted=0").fetchone()[0],
         }
     return {**counts,
