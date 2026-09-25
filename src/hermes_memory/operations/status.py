@@ -23,7 +23,8 @@ from ..processing.resource_gate import HELD, UNCERTAIN, WAITING, ResourceGate
 from ..sources.sync import COVERAGE_STATES
 from ..storage.evidence import EvidenceError
 
-__all__ = ["StatusReporter", "StageReport", "STATUS_STATES", "REPORTED_STAGES"]
+__all__ = ["StatusReporter", "StageReport", "STATUS_STATES", "REPORTED_STAGES",
+           "snapshot"]
 
 CONFIGURED = "configured"
 OPERATIONAL = "operational"
@@ -95,7 +96,7 @@ class StatusReporter:
 
     def report(self, *, profile: str | None = None) -> dict[str, Any]:
         """Everything, as one snapshot of one connection."""
-        with _ReadTransaction(self.db):
+        with snapshot(self.db):
             stages = [self._by_name[name]() for name in REPORTED_STAGES]
             erasure = self.erasure_backlog()
             waiting = self.pending_confirmations()
@@ -121,7 +122,7 @@ class StatusReporter:
         if name not in self._by_name:
             raise EvidenceError(f"unknown stage {name!r}; reportable stages are "
                                 f"{list(REPORTED_STAGES)}")
-        with _ReadTransaction(self.db):
+        with snapshot(self.db):
             return self._by_name[name]()
 
     # -- the stages ----------------------------------------------------------
@@ -497,12 +498,8 @@ class StatusReporter:
         return self._grouped("SELECT state, count(*) AS n FROM processing_jobs GROUP BY state")
 
 
-class _ReadTransaction:
-    """A deferred read transaction that leaves an outer one alone.
-
-    Status asked from inside a worker must not become the reason that worker failed,
-    and a nested ``BEGIN`` would raise.
-    """
+class _Snapshot:
+    """The transaction behind :func:`snapshot`."""
 
     def __init__(self, db):
         self.db = db
@@ -518,6 +515,15 @@ class _ReadTransaction:
         if self.owned:
             self.db.execute("ROLLBACK" if any(excinfo) else "COMMIT")
         return False
+
+
+def snapshot(db):
+    """A deferred read transaction that leaves an outer one alone.
+
+    Status asked from inside a worker must not become the reason that worker failed,
+    and a nested ``BEGIN`` would raise.
+    """
+    return _Snapshot(db)
 
 
 def _clock() -> float:

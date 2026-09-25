@@ -16,9 +16,7 @@ from hermes_memory.operations.status import (CONFIGURED, DEGRADED, DISABLED, OPE
                                              PAUSED, REPORTED_STAGES, UNCONFIGURED,
                                              StageReport, StatusReporter)
 from hermes_memory.processing.jobs import JobQueue
-from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import Route
-from hermes_memory.sources.sync import SyncController
 from hermes_memory.storage.evidence import EvidenceError
 
 from conftest import envelope
@@ -35,16 +33,6 @@ def settings(**overrides):
             "owner_principal": "owner"}
     base.update(overrides)
     return SimpleNamespace(**base)
-
-
-@pytest.fixture()
-def sync(store):
-    return SyncController(store)
-
-
-@pytest.fixture()
-def gate(store):
-    return ResourceGate(store)
 
 
 def insert(store, table, **columns):
@@ -169,8 +157,8 @@ def test_reading_status_never_writes(store, sync):
     assert store.db.execute("SELECT count(*) FROM audit").fetchone()[0] == audit_rows
 
 
-def test_the_report_is_plain_serialisable_data(store):
-    connector(store, SyncController(store))
+def test_the_report_is_plain_serialisable_data(store, sync):
+    connector(store, sync)
     recorded(store)
     json.dumps(StatusReporter(store).report(), default=str)
 

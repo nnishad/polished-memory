@@ -1,0 +1,437 @@
+"""C14 doctor: name the broken part, and say what would actually fix it.
+
+Status answers "what is happening"; the doctor answers "why is it not". The two are
+separate because they are asked at different times and by different people: status is
+watched, the doctor is run when something is wrong, and a run of it must never make
+the situation worse. So every default check is a read over the canonical store — no
+writes, no inference, and no outbound request. A probe is an explicit, bounded action
+the operator asks for by name, and the report says which probes ran so a later reader
+can tell what was actually looked at.
+
+Findings carry a remedy where one exists. "degraded" is not an answer; "run setup, or
+pause the gmail connector" is.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+from ..ids import now
+from ..sources.base import redact_secrets
+from .status import (DEGRADED, PAUSED, UNCONFIGURED, StatusReporter, snapshot)
+
+__all__ = ["Doctor", "Finding", "OK", "WARN", "FAIL", "SEVERITIES"]
+
+OK = "ok"
+WARN = "warn"
+FAIL = "fail"
+SEVERITIES = (OK, WARN, FAIL)
+
+# A record scan looks at the newest evidence only. A credential in archive form is
+# still a credential, but a doctor that reads every row is one nobody runs twice.
+SCAN_RECORDS = 500
+# How old an uncheckpointed WAL may get before it is worth mentioning, in bytes.
+WAL_WARN_BYTES = 64 * 1024 * 1024
+PROBE_TEXT = "Hermes doctor synthetic probe. This sentence is a connectivity test."
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One check's answer, with the action that follows from it."""
+
+    check: str
+    severity: str
+    detail: str
+    remedy: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.severity not in SEVERITIES:
+            raise ValueError(f"unknown severity {self.severity!r}; "
+                             f"findings are {list(SEVERITIES)}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"check": self.check, "severity": self.severity, "detail": self.detail,
+                "remedy": self.remedy, **self.evidence}
+
+
+class Doctor:
+    """Read-only diagnosis of one installation."""
+
+    def __init__(self, store, *, settings: Any = None, status: StatusReporter | None = None,
+                 backend: Callable[[], Any] | None = None,
+                 probe_bank: str = "hermes-doctor-probe"):
+        self.store = store
+        self.db = store.db
+        self.settings = settings
+        self.status = status or StatusReporter(store, settings=settings)
+        self._backend = backend
+        self.probe_bank = probe_bank
+
+    # -- entry point ---------------------------------------------------------
+
+    def examine(self, *, connectivity: bool = False, synthetic: bool = False,
+                profile: str | None = None) -> dict[str, Any]:
+        """Run every check. Probes only happen when they were asked for by name.
+
+        ``synthetic`` implies ``connectivity``: a round trip that writes to the
+        backend is not something to attempt against a backend that is down.
+        """
+        checks = [self.layout, self.database, self.schema, self.configuration,
+                  self.coverage, self.queue, self.provenance, self.erasure,
+                  self.delivery, self.gate, self.credentials_in_records, self.leases,
+                  self.backend_ledger]
+        with snapshot(self.db):
+            findings = [check() for check in checks]
+        if connectivity or synthetic:
+            findings.append(self.backend_connectivity())
+        if synthetic:
+            findings.append(self.backend_synthetic_round_trip())
+        worst = max((SEVERITIES.index(item.severity) for item in findings), default=0)
+        return {
+            "checked_at": now(),
+            "profile": profile or "default",
+            "severity": SEVERITIES[worst],
+            "ok": worst < SEVERITIES.index(FAIL),
+            "exit_code": 1 if worst >= SEVERITIES.index(FAIL) else 0,
+            "probes": {"connectivity": bool(connectivity or synthetic),
+                       "synthetic": bool(synthetic)},
+            "findings": [item.as_dict() for item in findings],
+            "actions": [item.remedy for item in findings if item.remedy],
+        }
+
+    # -- the installation itself ---------------------------------------------
+
+    def layout(self) -> Finding:
+        """The owned paths must exist and must be nobody else's to read."""
+        settings = self.settings
+        if settings is None:
+            return Finding("layout", WARN, "no configuration was supplied",
+                           "run setup, or pass --hermes-home for this profile")
+        missing = [str(path) for path in (settings.data_dir, settings.db_path,
+                                          settings.blob_dir) if not os.path.exists(path)]
+        if missing:
+            return Finding("layout", FAIL, f"missing: {', '.join(missing)}",
+                           "run setup to create the owned data directory",
+                           {"missing": missing})
+        exposed = [str(settings.data_dir)] if _world_readable(settings.data_dir) else []
+        if exposed:
+            return Finding("layout", FAIL, f"{', '.join(exposed)} is readable beyond the "
+                                           "owner; it holds private evidence",
+                           f"chmod 700 {settings.data_dir}", {"exposed": exposed})
+        return Finding("layout", OK, "the owned paths exist and are owner-only",
+                       evidence={"data_dir": str(settings.data_dir)})
+
+    def database(self) -> Finding:
+        """Corruption and journal shape, read from SQLite itself."""
+        check = self.db.execute("PRAGMA quick_check").fetchone()[0]
+        if str(check).lower() != "ok":
+            return Finding("database", FAIL, f"quick_check says: {check}",
+                           "restore from a backup, then re-run doctor", {"check": check})
+        mode = str(self.db.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        if mode != "wal":
+            return Finding("database", FAIL, f"journal mode is {mode!r}, not 'wal'",
+                           "the durability guarantees assume WAL; restart under this build",
+                           {"journal_mode": mode})
+        path = getattr(self.settings, "db_path", None)
+        wal = _size_of(str(path) + "-wal") if path else 0
+        evidence = {"journal_mode": mode, "wal_bytes": wal,
+                    "pages": int(self.db.execute("PRAGMA page_count").fetchone()[0])}
+        if wal > WAL_WARN_BYTES:
+            return Finding("database", WARN,
+                           f"the write-ahead log is {wal // 1024 // 1024} MiB, waiting to "
+                           "be checkpointed",
+                           "let an idle moment pass, or stop the services and run a "
+                           "checkpoint during maintenance",
+                           evidence)
+        return Finding("database", OK, "the store is intact and in WAL mode",
+                       evidence=evidence)
+
+    def schema(self) -> Finding:
+        """A store this build cannot read is not a store to run against."""
+        from ..storage.migrations import MIGRATIONS, current_version
+
+        applied = current_version(self.db)
+        head = len(MIGRATIONS)
+        evidence = {"applied": applied, "head": head}
+        if applied > head:
+            return Finding("schema", FAIL,
+                           f"the store is at migration {applied}; this build knows {head}",
+                           "upgrade the framework — running an older build against a newer "
+                           "schema is refused on purpose", evidence)
+        if applied < head:
+            return Finding("schema", WARN, f"{head - applied} migration(s) outstanding",
+                           "run setup or upgrade to apply them", evidence)
+        return Finding("schema", OK, f"schema is at {applied} of {head}", evidence=evidence)
+
+    def configuration(self) -> Finding:
+        """What the operator asked for, and the contradictions in it."""
+        settings = self.settings
+        if settings is None:
+            return Finding("configuration", WARN, "no configuration was supplied",
+                           "run setup")
+        notes = []
+        if not settings.hindsight_url:
+            notes.append("no backend URL, so capture and local recall only")
+        if settings.hindsight_url and not settings.inference_enabled:
+            notes.append("a backend is configured but inference is not enabled")
+        if settings.inference_enabled and settings.background_budget_tokens <= 0:
+            notes.append("inference is enabled with no background budget, so nothing "
+                         "will ever form")
+        if not settings.owner_principal:
+            notes.append("no owner principal, so no confirmation, revocation or delivery "
+                         "can be attributed")
+        if not settings.gate_token:
+            notes.append("no gate token, so the loopback mapper cannot admit a caller")
+        if notes:
+            return Finding("configuration", WARN, "; ".join(notes),
+                           "set the named values in the owned env file",
+                           {"capture_only": settings.capture_only})
+        return Finding("configuration", OK,
+                       "inference is routed to an approved local or LAN endpoint with a "
+                       "budget and an owner",
+                       evidence={"capture_only": settings.capture_only,
+                                 "allowed_hosts": sorted(settings.allowed_inference_hosts),
+                                 "budget": settings.background_budget_tokens})
+
+    # -- what the pipeline is doing ------------------------------------------
+
+    def coverage(self) -> Finding:
+        report = self.status.capture()
+        if report.state == UNCONFIGURED:
+            return Finding("coverage", WARN, "no source is registered",
+                           "add one with setup or import a fixture",
+                           {"state": report.state})
+        degraded = report.state == DEGRADED
+        return Finding("coverage", _severity_for(report.state), report.detail,
+                       "run the connector again, or pause it if the source is gone"
+                       if degraded else None,
+                       {"state": report.state,
+                        "unhealthy": report.evidence.get("unhealthy"),
+                        "open_gaps": report.evidence.get("open_gaps")})
+
+    def queue(self) -> Finding:
+        observations = self.status.observations()
+        counts = observations.evidence.get("queue") or {}
+        stuck = observations.evidence.get("stuck") or {}
+        age = self.status.queue_age()
+        if stuck:
+            return Finding("queue", FAIL, f"{stuck} job(s) will not be retried by "
+                                          "themselves",
+                           "reconcile or cancel them; a quarantined job's inputs are "
+                           "named in the job row", {"stuck": stuck, "age": age})
+        if age.get("stale"):
+            return Finding("queue", WARN,
+                           f"the oldest waiting job has waited {age['oldest_seconds']}s",
+                           "is a worker running? start it, or resume a paused stage",
+                           {"queue": counts, "age": age})
+        return Finding("queue", _severity_for(observations.state), observations.detail,
+                       evidence={"queue": counts, "age": age,
+                                 "state": observations.state})
+
+    def provenance(self) -> Finding:
+        summaries = self.status.summaries()
+        unsupported = summaries.evidence.get("unsupported") or {}
+        if unsupported.get("artifacts"):
+            return Finding("provenance", FAIL,
+                           f"{unsupported['artifacts']} derived artifact(s) cite evidence "
+                           "that no longer resolves",
+                           "withdraw or rebuild them; a citation that cannot be opened is "
+                           "not support", {"details": unsupported.get("details")})
+        return Finding("provenance", _severity_for(summaries.state), summaries.detail,
+                       evidence={"state": summaries.state})
+
+    def erasure(self) -> Finding:
+        backlog = self.status.erasure_backlog()
+        if backlog["obligations_open"]:
+            return Finding("erasure", FAIL,
+                           f"{backlog['obligations_open']} erasure obligation(s) are not "
+                           "verified gone everywhere",
+                           "run the backend reconcile pass, then verify each target",
+                           backlog)
+        if backlog["awaiting_owner"]:
+            return Finding("erasure", WARN,
+                           f"{backlog['awaiting_owner']} intent(s) await the owner's "
+                           "confirmation",
+                           "an agent cannot confirm an erasure; the owner must", backlog)
+        return Finding("erasure", OK, "nothing is half-forgotten", evidence=backlog)
+
+    def delivery(self) -> Finding:
+        report = self.status.delivery()
+        evidence = report.evidence
+        if evidence.get("unproven"):
+            return Finding("delivery", FAIL,
+                           f"{evidence['unproven']} artifact(s) have no delivery proof",
+                           "correlate the host receipts, or suppress what cannot be proved",
+                           {"by_state": evidence.get("by_state")})
+        if evidence.get("past_expiry"):
+            return Finding("delivery", FAIL,
+                           f"{evidence['past_expiry']} artifact(s) aged out unsent",
+                           "the host transport is not claiming the outbox; start it",
+                           {"by_state": evidence.get("by_state")})
+        return Finding("delivery", _severity_for(report.state), report.detail,
+                       evidence={"state": report.state,
+                                 "in_flight": evidence.get("in_flight")})
+
+    def gate(self) -> Finding:
+        report = self.status.resource_gate()
+        # One severity path for every stage: the reading decides, and the remedy
+        # follows it. A second FAIL branch here would mean two places that have to
+        # agree about how bad "uncertain" is, and only one of them would be tested.
+        return Finding("gate", _severity_for(report.state), report.detail,
+                       "the resource stays blocked until an operator settles them; the "
+                       "ledger names the holder" if report.state == DEGRADED else None,
+                       {"usage": report.evidence.get("usage"),
+                        "blocked": report.evidence.get("blocked"),
+                        "uncertain": report.evidence.get("uncertain"),
+                        "state": report.state})
+
+    def credentials_in_records(self) -> Finding:
+        """A credential in a record is in every prompt built from it. Find it here."""
+        rows = self.db.execute(
+            "SELECT id, text, metadata FROM records WHERE deleted=0 ORDER BY ingested_at "
+            "DESC LIMIT ?", (SCAN_RECORDS,)).fetchall()
+        hits = [row["id"] for row in rows
+                if redact_secrets(row["text"]) != row["text"]
+                or redact_secrets(row["metadata"]) != row["metadata"]]
+        if hits:
+            return Finding("credentials", FAIL,
+                           f"{len(hits)} recent record(s) carry what looks like a secret",
+                           "erase them through the erasure ledger, then rotate the "
+                           "credential at its source",
+                           {"records": hits[:20],
+                            "sample": redact_secrets(rows[0]["text"])[:120] if hits else None,
+                            "scanned": len(rows)})
+        return Finding("credentials", OK,
+                       "no credential-shaped text in the newest evidence",
+                       evidence={"scanned": len(rows)})
+
+    def leases(self) -> Finding:
+        """Fences left behind by a worker that died holding them."""
+        moment = datetime.now(timezone.utc).timestamp()
+        stale = self.db.execute(
+            "SELECT source, holder, lease_until FROM connectors WHERE lease IS NOT NULL "
+            "AND lease_until < ? ORDER BY lease_until", (moment,)).fetchall()
+        held = [f"{row['source']} by {row['holder']}" for row in stale]
+        if held:
+            return Finding("leases", WARN,
+                           f"{len(held)} connector lease(s) outlived their holder: "
+                           f"{', '.join(held[:5])}",
+                           "the next pass takes the lease once it expires; a source that "
+                           "always shows this is running two ways at once",
+                           {"stale": held})
+        return Finding("leases", OK, "no lease is being held past its word",
+                       evidence={"held": len(stale)})
+
+    # -- the backend, without touching it ------------------------------------
+
+    def client(self) -> Any:
+        """The configured backend client, or None. Built lazily; nothing here talks yet."""
+        if self._backend is not None:
+            return self._backend()
+        settings = self.settings
+        if settings is None or not settings.hindsight_url:
+            return None
+        from ..backend.hindsight_client import HindsightClient
+
+        key = (os.environ.get(settings.hindsight_api_key_env or "") or None
+               if settings.hindsight_api_key_env else None)
+        return HindsightClient(base_url=settings.hindsight_url, bank_id=self.probe_bank,
+                               api_key=key)
+
+    def backend_ledger(self) -> Finding:
+        """What the projection ledger says, which needs no socket to be true."""
+        report = self.status.backend()
+        return Finding("backend", _severity_for(report.state), report.detail,
+                       "reconcile the failed submissions; the document map names them"
+                       if report.state == DEGRADED else None,
+                       {"by_state": report.evidence.get("by_state"),
+                        "banks": report.evidence.get("banks"),
+                        "superseded_epoch": report.evidence.get("superseded_epoch"),
+                        "state": report.state})
+
+    def backend_connectivity(self) -> Finding:
+        """An explicit request: is anything answering. Never run by default."""
+        client = self.client()
+        if client is None:
+            return Finding("backend-connectivity", WARN,
+                           "no backend is configured, so there is nothing to reach",
+                           "configure a route first, or ignore this in capture-only mode")
+        try:
+            report = client.health()
+        except Exception as error:
+            return Finding("backend-connectivity", FAIL, f"unreachable: {error}",
+                           "start the backend, then re-run with --synthetic-probe to "
+                           "exercise the routes",
+                           {"error": str(error)[:300]})
+        return Finding("backend-connectivity", OK, "the backend answered",
+                       evidence={"reported_version": report.get("version"),
+                                 "observed_at": now()})
+
+    def backend_synthetic_round_trip(self) -> Finding:
+        """One bounded, synthetic write and read, in a bank of its own.
+
+        The text is a fixed sentence and the bank is named for the probe, so nothing
+        private is sent and nothing of the owner's is overwritten. This is the only
+        doctor action that talks to a model or stores anything outside the canonical
+        record set, and it happens only when it was asked for by name.
+        """
+        client = self.client()
+        if client is None:
+            return Finding("synthetic-probe", WARN, "no backend to probe",
+                           "configure a route first")
+        document_id = "doctor_probe"
+        try:
+            client.retain(document_id=document_id, content=PROBE_TEXT,
+                          metadata={"probe": "doctor"})
+            found = client.recall("doctor synthetic probe", max_tokens=64)
+        except Exception as error:
+            return Finding("synthetic-probe", FAIL, f"the round trip failed: {error}",
+                           "check the backend's own logs; the framework wrote nothing "
+                           "about this to the canonical store",
+                           {"error": str(error)[:300]})
+        finally:
+            try:
+                client.delete_document(document_id)
+            except Exception:
+                pass
+        if not found.results:
+            return Finding("synthetic-probe", FAIL,
+                           "the backend took the text and could not find it again",
+                           "a backend that retains without indexing makes recall silently "
+                           "empty; re-check after its index settles",
+                           {"returned": 0})
+        return Finding("synthetic-probe", OK,
+                       "a synthetic document survived retain and recall",
+                       evidence={"returned": len(found.results),
+                                 "bank": self.probe_bank})
+
+
+def _severity_for(state: str) -> str:
+    """Map a status stage state onto a doctor severity, in one place.
+
+    Only two stage states are inherently newsworthy: a degraded one is a fault, and a
+    paused one is somebody's decision that an operator should know is in force.
+    "Nothing is configured here" is not a finding on its own — a capture-only
+    installation is a supported shape — so a check that genuinely should warn about an
+    absent dependency says so itself rather than through this table.
+    """
+    if state == DEGRADED:
+        return FAIL
+    return WARN if state == PAUSED else OK
+
+
+def _world_readable(path: Any) -> bool:
+    try:
+        return bool(os.stat(path).st_mode & 0o077)
+    except OSError:
+        return False
+
+
+def _size_of(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0

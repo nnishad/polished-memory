@@ -36,3 +36,18 @@ def envelope(**overrides) -> dict:
 def store(tmp_path: Path):
     with EvidenceStore(tmp_path / "canonical.db") as opened:
         yield opened
+
+
+@pytest.fixture()
+def sync(store):
+    """The connector ledger over the same store, for tests that need a real row."""
+    from hermes_memory.sources.sync import SyncController
+
+    return SyncController(store)
+
+
+@pytest.fixture()
+def gate(store):
+    from hermes_memory.processing.resource_gate import ResourceGate
+
+    return ResourceGate(store)
