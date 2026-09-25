@@ -80,6 +80,19 @@ class IdentityStore:
             "SELECT * FROM identity_accounts WHERE id=?", (account_id,)).fetchone()
         return dict(row) if row else None
 
+    def resolve(self, namespace: str, identifier: str) -> str | None:
+        """Look an address up without creating it.
+
+        Registration is a deliberate act; resolving a stranger's address out of
+        a message must never mint an account behind the owner's back.
+        """
+        namespace = _check_namespace(namespace)
+        _, normalized = normalize_account(namespace, identifier)
+        row = self.db.execute(
+            "SELECT id FROM identity_accounts WHERE namespace=? AND normalized=? "
+            "AND state='active'", (namespace, normalized)).fetchone()
+        return row["id"] if row else None
+
     # -- candidates ----------------------------------------------------------
 
     def propose(self, *, account_a: str, account_b: str, rule: str, basis: str,

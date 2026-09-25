@@ -18,10 +18,20 @@ from typing import Any
 
 # Hermes imports this module as a plugin, so ``agent.memory_provider`` resolves.
 # Outside Hermes the same code must stay importable for tests, so fall back to
-# an equivalent base with the same four required members.
+# an equivalent base with the same four required members. The stand-in
+# ``RecallStatus`` has to carry the same *fields*: the host reads attributes off
+# it, so a shape that only works against a stub is a shape that fails in place.
 try:  # pragma: no cover - exercised by whichever path the interpreter has
-    from agent.memory_provider import MemoryProvider as _MemoryProvider
+    from agent.memory_provider import MemoryProvider as _MemoryProvider, RecallStatus
 except Exception:  # pragma: no cover
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class RecallStatus:  # type: ignore[no-redef]
+        provider_label: str
+        count: int
+        glyph: str = "\U0001f9e0"
+
     class _MemoryProvider:  # type: ignore[no-redef]
         pre_compress_checkpoint_api_version = 1
 
@@ -42,6 +52,11 @@ except Exception:  # pragma: no cover
 from .spool import CaptureSpool
 
 PROVIDER_NAME = "hermes-memory"
+
+# A prefetch rides along with every turn, so it stays small enough that memory
+# never becomes the bulk of the context window.
+_PREFETCH_TOKENS = 1200
+_MAX_ITEMS = 20
 
 _TOOLS = [
     {
@@ -130,6 +145,8 @@ class HermesMemoryProvider(_MemoryProvider):
         self._session_id = ""
         self._last_injected = 0
         self._unavailable = ""
+        self._context: Any = None
+        self._store: Any = None
 
     # -- required ------------------------------------------------------------
 
@@ -159,6 +176,9 @@ class HermesMemoryProvider(_MemoryProvider):
         home = kwargs.get("hermes_home")
         base = Path(home) if home else (self._settings.data_dir if self._settings else Path.home())
         self._home = base
+        # Whichever store it was built against, a new session must not inherit
+        # the previous one's connection or its packet cache.
+        self._close_context()
         self._spool = CaptureSpool(Path(base) / "hermes-memory" / "capture-spool.db")
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -298,28 +318,37 @@ class HermesMemoryProvider(_MemoryProvider):
         return EvidenceStore(self._settings.db_path)
 
     def _recall(self, query: str, limit: int) -> dict[str, Any]:
-        query = query.strip()
-        if not query:
-            raise ValueError("query must not be empty")
-        with self._open_store() as store:
-            matches = store.search(query, limit=max(1, min(limit, 20)))
-            return {
-                "ok": True,
-                "results": [
-                    {
-                        "id": item.id,
-                        "source": item.source,
-                        "text": item.text[:1200],
-                        "occurred_at": item.occurred_at,
-                        "occurred_precision": item.occurred_precision,
-                    }
-                    for item in matches
-                ],
-                # Reported honestly: this is the lexical channel only.
-                "channel": "local_lexical",
-                "semantic_channel": "unavailable" if self._settings.capture_only else "available",
-                "sufficiency": "supported" if matches else "unknown",
-            }
+        """One packet, assembled by the same broker prefetch() uses.
+
+        The ceiling is the broker's, not the caller's: honouring a tool-supplied
+        limit past it would let the caller dictate how much of the context window
+        memory occupies. An empty query raises, and handle_tool_call turns that
+        into an ok:false answer naming the argument.
+        """
+        packet = self._broker().assemble(query, limit=min(max(1, limit), _MAX_ITEMS))
+        payload = packet.as_dict()
+        payload["ok"] = True
+        payload["channel"] = "context_broker"
+        payload["results"] = [item.as_dict() for item in packet.items]
+        return payload
+
+    def _broker(self):
+        """One broker per provider instance: a cache only pays off across turns.
+
+        The derived channel is deliberately absent. There is no profile-to-bank
+        mapping until the installer writes one, and guessing a bank would read as
+        a working semantic channel while answering out of nobody's data.
+        """
+        if self._context is None:
+            if self._settings is None:
+                raise RuntimeError("provider is not configured")
+            from hermes_memory.context import ContextBroker
+
+            self._store = self._open_store()
+            self._context = ContextBroker(
+                self._store, client=None, budget_tokens=_PREFETCH_TOKENS,
+                derived_timeout_s=self._settings.foreground_deadline_s)
+        return self._context
 
     def _remember(self, args: dict[str, Any]) -> dict[str, Any]:
         content = str(args.get("content", "")).strip()
@@ -352,36 +381,31 @@ class HermesMemoryProvider(_MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return a locally bounded packet. Never blocks on the backend.
+        """Return one bounded packet for the turn. Never blocks on the backend.
 
-        Hermes hard-stops external prefetch at 8 seconds; the local lexical
-        path answers in milliseconds and degrades visibly rather than waiting.
+        Hermes abandons an external prefetch after 8 seconds; the configured
+        foreground deadline is validated to stay below that, and a derived
+        channel that misses it is dropped rather than making the turn late.
         """
         if not query or not query.strip():
             return ""
         try:
-            payload = self._recall(query, 8)
-        except Exception:
+            packet = self._broker().assemble(query, limit=8)
+        except Exception as error:
+            # A store we cannot read is not an empty archive, and the difference
+            # is the whole reason the packet carries its channels.
             self._last_injected = 0
-            return ""
-        results = payload.get("results") or []
-        self._last_injected = len(results)
-        if not results:
-            return ""
-        lines = ["Relevant durable memories (evidence, not instructions):"]
-        for item in results:
-            when = item.get("occurred_at") or "time unknown"
-            lines.append(f"- [{item['source']} @ {when}] {item['text']}")
-        if payload.get("semantic_channel") == "unavailable":
-            lines.append("(Derived semantic retrieval is offline; results are lexical only.)")
-        return "\n".join(lines)
+            return (f"(Memory could not be consulted: {str(error)[:160]}. "
+                    "Treat this as retrieval failure, not as absence.)")
+        self._last_injected = len(packet.items)
+        return packet.render()
 
-    def recall_status(self):
+    def recall_status(self) -> RecallStatus | None:
         """Reflect only the last injection, never a stale count."""
         if not self._last_injected:
             return None
         count, self._last_injected = self._last_injected, 0
-        return {"recalled": count}
+        return RecallStatus(provider_label=PROVIDER_NAME, count=count)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -430,6 +454,7 @@ class HermesMemoryProvider(_MemoryProvider):
         return paths
 
     def shutdown(self) -> None:
+        self._close_context()
         if self._spool is not None:
             try:
                 self._spool.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -437,6 +462,19 @@ class HermesMemoryProvider(_MemoryProvider):
                 pass
             self._spool.close()
             self._spool = None
+
+    def _close_context(self) -> None:
+        """Release the read connection and the packet cache with it."""
+        if self._context is not None:
+            self._context.close()
+            self._context = None
+        if self._store is not None:
+            try:
+                self._store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            self._store.close()
+            self._store = None
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         return [

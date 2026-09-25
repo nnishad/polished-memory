@@ -175,3 +175,23 @@ def test_a_hostname_is_refused_even_if_it_resolves_privately():
     # DNS can be redirected; only literal addresses are admissible.
     with pytest.raises(SettingError, match="neither loopback nor a literal private"):
         validate_inference_route("http://internal.example/v1", frozenset({"internal.example"}))
+
+
+@pytest.mark.parametrize("too_long", ["8", "8.0", "30", "0", "-1", "soon", ""])
+def test_a_foreground_deadline_the_host_will_not_honour_is_refused(too_long, tmp_path,
+                                                                    monkeypatch):
+    """Hermes abandons a prefetch at 8s; a longer deadline is a number nobody obeys."""
+    home = tmp_path / "home"
+    write_env(home, {"HERMES_MEMORY_FOREGROUND_DEADLINE_S": too_long})
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    with pytest.raises(SettingError, match="FOREGROUND_DEADLINE_S"):
+        load_settings()
+
+
+def test_the_default_foreground_deadline_leaves_room_inside_the_host_stop(tmp_path,
+                                                                          monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    settings = load_settings()
+    assert 0 < settings.foreground_deadline_s < 8.0

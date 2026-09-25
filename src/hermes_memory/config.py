@@ -23,6 +23,28 @@ class SettingError(RuntimeError):
 
 DEFAULT_ENV_FILENAME = "hermes-memory.env"
 
+# Hermes abandons an external prefetch after this many seconds. A foreground
+# deadline at or above it is a number the host will never honour, so it is
+# refused at startup rather than discovered on the first slow turn.
+HOST_PREFETCH_STOP_S = 8.0
+DEFAULT_FOREGROUND_DEADLINE_S = 4.0
+
+
+def _deadline(value: str | None) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise SettingError(
+            f"HERMES_MEMORY_FOREGROUND_DEADLINE_S must be a number of seconds, got {value!r}"
+        ) from None
+    if not 0 < seconds < HOST_PREFETCH_STOP_S:
+        raise SettingError(
+            f"HERMES_MEMORY_FOREGROUND_DEADLINE_S={value} is outside the admissible range: "
+            f"Hermes abandons an external prefetch after {HOST_PREFETCH_STOP_S}s, so a "
+            "deadline at or above that is never honoured, only truncated by the host"
+        )
+    return seconds
+
 
 def _read_env_file(path: Path) -> dict[str, str]:
     """Parse a minimal ``KEY=value`` env file. No shell evaluation, ever."""
@@ -115,7 +137,7 @@ class Settings:
     allowed_inference_hosts: frozenset[str] = field(default_factory=frozenset)
     inference_enabled: bool = False
     background_budget_tokens: int = 0
-    foreground_deadline_s: float = 8.0
+    foreground_deadline_s: float = DEFAULT_FOREGROUND_DEADLINE_S
     owner_principal: str | None = None
     text_route: ModelRoute | None = None
     vision_route: ModelRoute | None = None
@@ -185,6 +207,8 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
             "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS allowlist"
         )
 
+    foreground = _deadline(get("FOREGROUND_DEADLINE_S", str(DEFAULT_FOREGROUND_DEADLINE_S)))
+
     return Settings(
         home=home,
         data_dir=data_dir,
@@ -195,7 +219,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         allowed_inference_hosts=allowed,
         inference_enabled=inference_enabled,
         background_budget_tokens=int(get("BACKGROUND_BUDGET_TOKENS", "0") or 0),
-        foreground_deadline_s=float(get("FOREGROUND_DEADLINE_S", "8") or 8),
+        foreground_deadline_s=foreground,
         # Unnamed by default: with no owner principal, forgetting can be
         # requested and previewed but never confirmed, which fails closed
         # instead of accepting any caller that claims to be the owner.

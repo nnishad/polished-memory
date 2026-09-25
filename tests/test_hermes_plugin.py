@@ -236,16 +236,31 @@ def test_recall_reports_the_semantic_channel_honestly(provider):
     provider.handle_tool_call("memory_remember", {"content": "The garage door code is 8841."})
     payload = json.loads(provider.handle_tool_call("memory_recall", {"query": "garage"}))
     assert payload["results"], "lexical recall must work with the backend offline"
-    assert payload["channel"] == "local_lexical"
-    assert payload["semantic_channel"] == "unavailable"
-    assert payload["sufficiency"] == "supported"
+    assert payload["channels"]["lexical"] == "available"
+    # No profile-to-bank mapping exists yet, so the honest answer is that the
+    # semantic channel was never configured — not that it found nothing.
+    assert payload["semantic_channel"] == "not_configured"
+    assert payload["coverage"] == "supported"
+    assert json.loads(provider.handle_tool_call("memory_recall", {"query": "  "}))["ok"] is False
+
+
+def test_recall_uses_one_ceiling_for_every_caller(provider):
+    provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
+    greedy = json.loads(provider.handle_tool_call(
+        "memory_recall", {"query": "contracts", "limit": 5000}))
+    assert greedy["ok"] is True, "an absurd limit is a caller mistake, not a store failure"
+    assert greedy["tokens_used"] <= 1200
 
 
 def test_prefetch_injects_only_the_last_result_count(provider):
     provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
     block = provider.prefetch("Priya contracts", session_id="sess-1")
     assert "Priya" in block
-    assert provider.recall_status()["recalled"] == 1
+    # describe_recall() reads attributes off this, so the shape is part of the
+    # host contract and not something a stub may quietly redefine.
+    status = provider.recall_status()
+    assert (status.provider_label, status.count) == ("hermes-memory", 1)
+    assert isinstance(status.glyph, str) and status.glyph, "the host renders this verbatim"
     # A second status call must not re-report a stale count.
     assert provider.recall_status() is None
 
@@ -259,6 +274,20 @@ def test_prefetch_flags_degraded_semantic_coverage(provider):
 def test_trivial_and_empty_queries_inject_nothing(provider):
     assert provider.prefetch("", session_id="s") == ""
     assert provider.prefetch("   ", session_id="s") == ""
+
+
+def test_an_unreadable_store_is_reported_as_failure_not_as_absence(provider, monkeypatch):
+    def explode():
+        raise OSError("canonical store is on a dead disk")
+
+    monkeypatch.setattr(provider, "_open_store", explode)
+    block = provider.prefetch("garage door", session_id="s")
+
+    # Silence here reads exactly like "nothing was ever recorded", which is the
+    # one wrong answer the host cannot recover from.
+    assert "could not be consulted" in block
+    assert "dead disk" in block
+    assert provider.recall_status() is None
 
 
 def test_system_prompt_block_is_static_and_carries_no_memories(provider):

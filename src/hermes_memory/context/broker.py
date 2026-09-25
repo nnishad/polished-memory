@@ -1,0 +1,399 @@
+"""C9 context broker: one bounded packet, assembled from what is actually available.
+
+Two channels, reported separately. The lexical channel is local and answers in
+milliseconds with no model in the loop; the derived channel asks the backend for
+facts and may be down, slow, saturated, or simply not configured. A packet that
+silently omits one reads exactly like a packet that found nothing, and the
+difference decides whether the agent is entitled to say anything at all.
+
+Everything is bounded: the packet has a token ceiling, the derived channel has a
+deadline, and a channel that exceeds either is dropped rather than allowed to
+make the whole answer late or the whole turn long.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import replace
+from typing import Any, Callable, Iterable
+
+from ..ids import digest
+from ..storage.identity import IdentityStore
+from .cache import PacketCache
+from .lexical import AVAILABLE, LexicalChannel
+from .packet import (CONFLICTING, PARTIAL, SUPPORTED, UNKNOWN, Channels, EvidenceItem,
+                     Packet)
+
+__all__ = ["ContextBroker", "Packet", "EvidenceItem", "Channels", "PacketCache",
+           "CONFLICTING", "PARTIAL", "SUPPORTED", "UNKNOWN"]
+
+# A derived channel that was never tried or never configured is not a failure;
+# a channel that was tried and could not be reached is.
+_ATTEMPTED_FAILED = {"unavailable", "timeout", "partial", "unreachable", "paused", "denied"}
+# Below this, a prefix of an answer carries more risk of misleading than any
+# chance of helping, so the budget is left unused instead.
+_MIN_PREFIX_TOKENS = 40
+
+
+def _item(evidence, *, text: str | None = None, span_truncated: bool = False) -> EvidenceItem:
+    return EvidenceItem(
+        id=evidence.id, source=evidence.source, source_id=evidence.source_id,
+        text=evidence.text if text is None else text,
+        occurred_at=evidence.occurred_at, occurred_precision=evidence.occurred_precision,
+        observed_at=evidence.observed_at, channel="lexical", score=1.0,
+        span_truncated=span_truncated)
+
+
+class ContextBroker:
+    """Assemble a packet within a token ceiling and a wall-clock deadline."""
+
+    def __init__(self, store: Any, *, client: Any = None, identity: IdentityStore | None = None,
+                 budget_tokens: int = 1800, derived_timeout_s: float = 4.0,
+                 cache: PacketCache | None | bool = True, account_id: str | None = None,
+                 clock: Callable[[], float] = time.monotonic, estimator=None):
+        if not isinstance(budget_tokens, int) or not 1 <= budget_tokens <= 200_000:
+            raise ValueError("budget_tokens must be an integer between 1 and 200000")
+        if not isinstance(derived_timeout_s, (int, float)) or not 0 < derived_timeout_s <= 30:
+            raise ValueError("derived_timeout_s must be between 0 and 30 seconds")
+        self.store = store
+        self.client = client
+        self.identity = identity
+        self.budget_tokens = budget_tokens
+        self.derived_timeout_s = float(derived_timeout_s)
+        self.account_id = account_id
+        self.clock = clock
+        self.lexical = LexicalChannel(store)
+        # Chars/3 is a conservative stand-in; a real tokenizer can be injected.
+        self.estimate = estimator or (lambda text: max(1, len(text) // 3))
+        if isinstance(cache, PacketCache):
+            self.cache = cache
+        elif cache is True:
+            self.cache = PacketCache(store, clock=clock)
+        else:  # None or False: every turn goes back to the store.
+            self.cache = None
+        self._pool: ThreadPoolExecutor | None = None
+        self._pool_lock = threading.Lock()
+        self._closed = False
+
+    # -- assembly ------------------------------------------------------------
+
+    def assemble(self, query: str, *, limit: int = 8, include_derived: bool = True,
+                 sources: Iterable[str] | None = None,
+                 window: tuple[str | None, str | None] | None = None,
+                 account_id: str | None = None, commitments: Iterable[dict] = (),
+                 lessons: Iterable[dict] = ()) -> Packet:
+        """Build the packet for one question. Raises only on a caller bug."""
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("a context query must not be empty")
+        limit = limit if isinstance(limit, int) and 1 <= limit <= 50 else 8
+        caller = self.account_id if account_id is None else account_id
+        scope = self._scope(query, limit=limit, include_derived=include_derived,
+                            sources=sources, window=window, account_id=caller)
+        started = self.clock()
+        if self.cache is not None:
+            cached = self.cache.get(query, account_id=caller, scope=scope)
+            if cached is not None:
+                return replace(cached, took_ms=int((self.clock() - started) * 1000))
+
+        # Stamp first: anything the archive changes after this point is a change
+        # this packet did not see, and has to be reported rather than hidden.
+        epoch, revision = self.store.watermark()
+        truncated: list[str] = []
+
+        outcome = self.lexical.gather(query, limit=max(limit * 3, 20))
+        if outcome.dropped_terms:
+            truncated.append("terms")
+        allowed, withheld = self._authorize(outcome.items, account_id=caller)
+        considered = [evidence for evidence in allowed
+                      if _usable(evidence, sources=sources, window=window)]
+        conflicts = self._conflicts(considered)
+
+        spent = 0
+        items: list[EvidenceItem] = []
+        # Commitments and lessons are short and always worth their lines, so they
+        # reserve first; a long evidence list must not crowd out a due obligation.
+        kept_commitments, spent = self._bounded(commitments, spent, key="title", cap=4)
+        kept_lessons, spent = self._bounded(lessons, spent, key="text", cap=4)
+
+        for evidence in considered:
+            cost = self.estimate(evidence.text) + 12
+            if spent + cost > self.budget_tokens:
+                truncated.append("packet")
+                # A prefix of the best match beats an empty packet: the caller
+                # asked for a ceiling, not for amnesia. A sliver of room is not
+                # worth a line that could only mislead, so this stops early.
+                room = self.budget_tokens - spent - 12
+                if room >= _MIN_PREFIX_TOKENS:
+                    prefix = evidence.text[:room * 3]
+                    spent += self.estimate(prefix) + 12
+                    items.append(_item(evidence, text=prefix, span_truncated=True))
+                break
+            spent += cost
+            items.append(_item(evidence))
+
+        facts: tuple[dict[str, Any], ...] = ()
+        derived_state, derived_detail = "not_attempted", ""
+        if include_derived:
+            facts, derived_state, derived_detail, derived_truncated = self._derive(query, limit)
+            truncated.extend(derived_truncated)
+            # Derived text is charged too. A backend that returns an essay would
+            # otherwise overrun the ceiling the caller asked us to hold.
+            kept = []
+            for fact in facts:
+                text = str(fact.get("text") or fact.get("content") or "")[:600]
+                cost = self.estimate(text) + 12
+                if spent + cost > self.budget_tokens:
+                    truncated.append("packet")
+                    break
+                spent += cost
+                kept.append(fact)
+            facts = tuple(kept)
+
+        items, revoked, store_moved = self._recheck(items, stamp=(epoch, revision))
+        if revoked:
+            truncated.append("revoked_during_recall")
+        if store_moved:
+            # A reset or trust revocation happened while we were on the network.
+            # The packet still says what it found, but it cannot be reused.
+            truncated.append("store_moved")
+
+        notes = [text for text in (outcome.detail, derived_detail) if text]
+        if revoked:
+            notes.append(f"{revoked} item(s) were forgotten or hidden during retrieval")
+        if store_moved:
+            notes.append("the archive changed during retrieval; this packet is not cached")
+        channels = Channels(lexical=outcome.state, derived=derived_state,
+                            detail="; ".join(notes)[:400])
+
+        packet = Packet(
+            query=query, items=tuple(items), facts=facts,
+            lessons=kept_lessons, commitments=kept_commitments,
+            channels=channels,
+            coverage=self._coverage(items=items, facts=facts, conflicts=conflicts,
+                                    channels=channels, truncated=truncated),
+            truncated=tuple(dict.fromkeys(truncated)),
+            tokens_used=spent, took_ms=int((self.clock() - started) * 1000),
+            conflicts=conflicts, epoch=epoch, revision=revision, withheld=withheld,
+        )
+        packet = _with_id(packet)
+        if self.cache is not None and not store_moved:
+            self.cache.put(query, packet, account_id=caller, scope=scope)
+        return packet
+
+    def close(self) -> None:
+        self._closed = True
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+
+    # -- channels ------------------------------------------------------------
+
+    def _derive(self, query, limit):
+        """Ask the backend, and give up on deadline rather than making the turn late."""
+        if self.client is None:
+            return (), "not_configured", "", ()
+        try:
+            outcome = self._recall_within_deadline(query)
+        except FutureTimeout:
+            # The request was abandoned, not cancelled: the socket stays open
+            # until the client's own timeout fires. Nothing downstream may
+            # conclude that the backend did no work.
+            return (), "timeout", f"derived channel exceeded {self.derived_timeout_s}s", ()
+        except Exception as error:
+            # Unreachable, 5xx, unsupported capability, paused stage: to the
+            # caller these all mean this half of the answer is missing.
+            return (), "unavailable", f"{type(error).__name__}: {error}"[:200], ()
+        truncated = [str(name) for name in outcome.truncated]
+        facts = tuple(dict(fact) for fact in tuple(outcome.results)[:limit])
+        if len(outcome.results) > limit:
+            truncated.append("results")
+        complete = getattr(outcome, "provenance_complete", not truncated)
+        state = "available" if complete else "partial"
+        detail = "" if complete else "provenance came back truncated"
+        return facts, state, detail, tuple(dict.fromkeys(truncated))
+
+    def _recall_within_deadline(self, query):
+        executor = self._executor()
+        future = executor.submit(self.client.recall, query,
+                                 max_tokens=min(self.budget_tokens, 4096), types=None)
+        try:
+            return future.result(timeout=self.derived_timeout_s)
+        except FutureTimeout:
+            future.cancel()
+            raise
+
+    def _executor(self) -> ThreadPoolExecutor:
+        with self._pool_lock:
+            if self._closed:
+                raise RuntimeError("the broker is closed")
+            if self._pool is None:
+                # Two workers: a slow backend may stall one, and the next turn
+                # should still be able to try.
+                self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="derived")
+            return self._pool
+
+    # -- authority and quality ----------------------------------------------
+
+    def _authorize(self, matches, *, account_id):
+        """Split what this caller may see from what it must not reach.
+
+        Candidates never widen access: an unconfirmed join is a hypothesis, and
+        acting on it as if it were true would expose one person's evidence in
+        another's context. A record that claims no account at all is shared,
+        because it is not account-scoped evidence; withholding unscoped notes
+        would empty the store without protecting anyone. Where an account is
+        named but identity is unavailable, scoped evidence is withheld rather
+        than guessed at.
+        """
+        if self.identity is None:
+            return list(matches), 0
+        identifiers = set(self.identity.group(account_id)) if account_id else set()
+        allowed = []
+        for evidence in matches:
+            claims = self._claims(evidence)
+            if not claims or (identifiers and claims & identifiers):
+                allowed.append(evidence)
+        return allowed, len(matches) - len(allowed)
+
+    def _claims(self, evidence) -> set[str]:
+        """Accounts a record says it belongs to, resolved through identity only."""
+        claims = {str(value) for value in (evidence.metadata.get("account_ids") or [])
+                  if str(value).strip()}
+        for participant in evidence.metadata.get("participants") or []:
+            if not isinstance(participant, dict):
+                continue
+            namespace, address = participant.get("namespace"), participant.get("address")
+            if not namespace or not address:
+                continue
+            try:
+                resolved = self.identity.resolve(str(namespace), str(address))
+            except Exception:
+                # A stranger's address in someone else's message is not a bug
+                # here, and it must never become an argument for showing more.
+                resolved = None
+            if resolved:
+                claims.add(resolved)
+        return claims
+
+    def _coverage(self, *, items, facts, conflicts, channels, truncated):
+        """How much of the question this packet answers — never how true it is."""
+        if conflicts:
+            return CONFLICTING
+        degraded = (channels.lexical != AVAILABLE
+                    or channels.derived in _ATTEMPTED_FAILED
+                    or bool(set(truncated) & {"packet", "terms", "store_moved",
+                                              "revoked_during_recall",
+                                              "source_facts", "chunks", "results"}))
+        if not items and not facts:
+            # "Nothing here" and "we could not look" are different answers, and
+            # only the first entitles the agent to say the archive is empty.
+            return PARTIAL if degraded or not channels.any_available else UNKNOWN
+        if not items:
+            # A backend statement with no canonical evidence behind it is a
+            # hypothesis. The provenance ledger can point at a document that has
+            # since been corrected, and only the local store knows that.
+            return PARTIAL
+        return PARTIAL if degraded else SUPPORTED
+
+    def _conflicts(self, candidates):
+        """Live accounts that declare incompatible values for the same attribute.
+
+        Only declared disagreements count. Deciding that two free texts
+        contradict each other is a model judgement, and a model judgement
+        dressed up as a retrieval fact is how a wrong answer becomes
+        authoritative. So this reads ``metadata['claims']`` and the occurred_at
+        of records that name a subject, and invents nothing.
+        """
+        subjects: dict[str, dict[str, dict[str, str]]] = {}
+        for evidence in candidates:
+            subject = str(evidence.metadata.get("subject") or "").strip()
+            if not subject:
+                continue
+            declared = evidence.metadata.get("claims")
+            claims = dict(declared) if isinstance(declared, dict) else {}
+            if evidence.occurred_at:
+                claims.setdefault("occurred_at", evidence.occurred_at)
+            for attribute, value in claims.items():
+                if not isinstance(value, (str, int, float, bool)):
+                    continue
+                shown = str(value).strip()
+                if not shown:
+                    continue
+                bucket = subjects.setdefault(subject, {}).setdefault(str(attribute), {})
+                bucket.setdefault(shown.casefold(), shown)
+        conflicts = []
+        for subject in sorted(subjects):
+            for attribute in sorted(subjects[subject]):
+                values = sorted(subjects[subject][attribute].values())
+                if len(values) > 1:
+                    conflicts.append(f"{subject} {attribute} is disputed: "
+                                     + " vs ".join(values[:3]))
+        return tuple(conflicts[:8])
+
+    def _recheck(self, items, *, stamp):
+        """Drop what a concurrent forgetting or correction has already removed.
+
+        The lexical read happened before the network call, so an item can be
+        forgotten while this packet is in flight. The plan is explicit that
+        scope, epoch, visibility and revisions are rechecked after the network,
+        and a stale line surviving that window is an exposure, not a race.
+        """
+        epoch, revision = self.store.watermark()
+        kept = [item for item in items if self.store.live_and_visible(item.id)]
+        return kept, len(items) - len(kept), (epoch, revision) != stamp
+
+    # -- helpers -------------------------------------------------------------
+
+    def _bounded(self, entries, spent, *, key, cap):
+        """Take the first few of a section, and stop when the ceiling says so."""
+        kept: tuple[dict[str, Any], ...] = ()
+        for entry in tuple(entries or ())[:cap]:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get(key) or entry.get("text") or "")
+            if not text.strip():
+                continue
+            cost = self.estimate(text) + 12
+            if spent + cost > self.budget_tokens:
+                break
+            spent += cost
+            kept = kept + (entry,)
+        return kept, spent
+
+    def _scope(self, query, **options) -> tuple[str, ...]:
+        """Everything that changes the right answer, so the cache cannot mix it up."""
+        parts = [f"limit={options['limit']}", f"derived={int(bool(options['include_derived']))}",
+                 f"sources={','.join(sorted(options['sources'] or ())) or '-'}",
+                 f"window={options['window'] or '-'}",
+                 f"account={options['account_id'] or '-'}",
+                 f"budget={self.budget_tokens}"]
+        return tuple(parts)
+
+
+def _usable(evidence, *, sources, window) -> bool:
+    if sources and evidence.source not in set(sources):
+        return False
+    return _in_window(evidence.occurred_at, window)
+
+
+def _in_window(occurred_at, window):
+    if not window:
+        return True
+    if occurred_at is None:
+        return True  # an undated item is not excluded by a filter it cannot satisfy
+    start, end = window
+    if start and occurred_at < start:
+        return False
+    if end and occurred_at > end:
+        return False
+    return True
+
+
+def _with_id(packet: Packet) -> Packet:
+    packet_id = "ctx_" + digest([packet.query, packet.epoch, packet.revision,
+                                 [item.id for item in packet.items],
+                                 [str(fact)[:80] for fact in packet.facts],
+                                 list(packet.conflicts), packet.coverage])[:24]
+    return replace(packet, packet_id=packet_id)

@@ -225,6 +225,16 @@ class EvidenceStore:
     def live_and_visible(self, record_pk: str) -> bool:
         return self._visible(record_pk)
 
+    def watermark(self) -> tuple[int, int]:
+        """(epoch, journal sequence) — a cheap 'has anything changed' stamp.
+
+        The epoch alone is not enough: hiding one record is reversible and does
+        not revoke outstanding leases, yet a context packet built before it is
+        already wrong.
+        """
+        row = self.db.execute("SELECT MAX(seq) FROM change_journal").fetchone()
+        return self.epoch(), int(row[0] or 0)
+
     def search(self, match: str, *, limit: int = 20) -> list[Evidence]:
         """Lexical search over committed, visible evidence.
 
