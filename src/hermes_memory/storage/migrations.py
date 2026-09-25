@@ -270,6 +270,85 @@ IDENTITY_STATEMENTS: tuple[str, ...] = (
 )
 
 
+PROCESSING_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per physical resource in use. The partial unique index is the
+    -- whole design: SQLite itself refuses a second concurrent holder, so the
+    -- single-slot rule survives multiple processes and profiles without any
+    -- in-memory lock that a crash could orphan.
+    CREATE TABLE gate_reservations(
+        id TEXT PRIMARY KEY,
+        resource TEXT NOT NULL,
+        route TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        acquired_at REAL NOT NULL,
+        lease_until REAL NOT NULL,
+        job_id TEXT,
+        released_at REAL,
+        outcome TEXT
+    )""",
+    """
+    CREATE UNIQUE INDEX gate_single_slot ON gate_reservations(resource)
+        WHERE state IN ('held', 'uncertain')""",
+    "CREATE INDEX gate_lease ON gate_reservations(state, lease_until)",
+    """
+    CREATE TABLE gate_ledger(
+        id INTEGER PRIMARY KEY,
+        reservation_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        route TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        event TEXT NOT NULL,
+        at REAL NOT NULL,
+        detail TEXT NOT NULL
+    )""",
+    "CREATE INDEX gate_ledger_reservation ON gate_ledger(reservation_id)",
+    """
+    CREATE TABLE processing_jobs(
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        state TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        resource TEXT NOT NULL,
+        route TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        processor_fingerprint TEXT NOT NULL,
+        inputs TEXT NOT NULL,
+        input_revision TEXT NOT NULL,
+        submission_id TEXT,
+        backend_operation_id TEXT,
+        backend_state TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL,
+        tokens_used INTEGER NOT NULL DEFAULT 0,
+        token_budget INTEGER NOT NULL,
+        deadline REAL,
+        lease TEXT,
+        lease_until REAL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+    )""",
+    "CREATE INDEX jobs_dispatch ON processing_jobs(state, priority, created_at)",
+    "CREATE INDEX jobs_submission ON processing_jobs(submission_id)",
+    """
+    -- Budget consumption is measured, including internal retries, so a job that
+    -- keeps producing truncated output runs out rather than looping.
+    CREATE TABLE budget_usage(
+        scope TEXT NOT NULL,
+        period TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        calls INTEGER NOT NULL DEFAULT 0,
+        seconds REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY(scope, period, resource)
+    )""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -282,6 +361,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0002_sync", SYNC_STATEMENTS),
     Migration("0003_erasure", ERASURE_STATEMENTS),
     Migration("0004_identity", IDENTITY_STATEMENTS),
+    Migration("0005_processing", PROCESSING_STATEMENTS),
 )
 
 
