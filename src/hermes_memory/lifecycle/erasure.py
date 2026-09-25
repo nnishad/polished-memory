@@ -5,6 +5,7 @@ import json
 from typing import Any, Iterable, Sequence
 
 from ..ids import digest, new_id, now, timestamp
+from ..storage.blobs import BlobStore
 from ..storage.evidence import EvidenceError, journal
 
 __all__ = ["ErasureManager", "AWAITING", "PENDING", "COMPLETE"]
@@ -30,6 +31,7 @@ class ErasureManager:
         self.db = store.db
         self.owner_principal = owner_principal
         self.backend = backend
+        self.blobs = BlobStore(store)
 
     # -- phase one: preview --------------------------------------------------
 
@@ -41,7 +43,7 @@ class ErasureManager:
             raise EvidenceError("nothing to forget: no live evidence matched")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
             raise EvidenceError("reason must be nonempty text of at most 1000 characters")
-        rows, dependents, obligations, fingerprint = self._radius(
+        rows, dependents, obligations, attachments, fingerprint = self._radius(
             [row["id"] for row in targets])
         intent_id = new_id("erase")
         self.db.execute("BEGIN IMMEDIATE")
@@ -54,7 +56,8 @@ class ErasureManager:
                  now(), actor, actor_kind, reason,
                  json.dumps({"records": [row["id"] for row in rows],
                              "dependents": dependents,
-                             "obligations": obligations}, sort_keys=True),
+                             "obligations": obligations,
+                             "attachments": attachments}, sort_keys=True),
                  fingerprint, AWAITING, self.store.epoch()),
             )
             self.store._audit("erasure_preview", intent_id,
@@ -70,6 +73,7 @@ class ErasureManager:
             "records": [row["id"] for row in rows],
             "dependent_artifacts": dependents,
             "obligations": obligations,
+            "attachments": attachments,
             "confirmable_by": self.owner_principal,
             "note": ("Nothing has been deleted. Confirmation must come from the owner with "
                      "this exact digest."),
@@ -108,16 +112,16 @@ class ErasureManager:
             # Re-measure the blast radius: the caller's digest only proves they
             # saw *a* preview, not that the store still matches it. New evidence
             # or a projection added since the preview changes the debt.
-            rows, _dependents, _obligations, current = self._radius(record_ids)
+            rows, _dependents, _obligations, _attachments, current = self._radius(record_ids)
             if len(rows) != len(record_ids):
                 raise EvidenceError(
                     "part of the previewed set no longer exists; re-run the preview")
             if current != intent["preview_digest"]:
                 raise EvidenceError(
-                    "the evidence set or its derived copies changed after this preview; "
-                    "confirm the new preview instead")
+                    "the evidence set, its derived copies or its attachments changed after "
+                    "this preview; confirm the new preview instead")
 
-            self._erase(record_ids, intent_id, payload["dependents"])
+            destroyed = self._erase(record_ids, intent_id, payload["dependents"])
             for item in payload["obligations"]:
                 self.db.execute(
                     "INSERT INTO erasure_targets(intent_id, kind, reference, state) "
@@ -141,10 +145,12 @@ class ErasureManager:
             self.db.execute("ROLLBACK")
             raise
         return {"intent_id": intent_id, "state": state, "erased": len(record_ids),
-                "obligations_outstanding": outstanding}
+                "obligations_outstanding": outstanding, "attachments": destroyed}
 
-    def _erase(self, record_ids: Iterable[str], intent_id: str, dependents: Sequence[str]) -> None:
-        """Tombstone the evidence and invalidate everything that leaned on it."""
+    def _erase(self, record_ids: Iterable[str], intent_id: str,
+               dependents: Sequence[str]) -> dict[str, int]:
+        """Tombstone the evidence, destroy its bytes, invalidate what leaned on it."""
+        released = {"attachments": 0, "contents": 0, "bytes": 0}
         for record_pk in record_ids:
             row = self.db.execute(
                 "SELECT source, fingerprint FROM records WHERE id=?", (record_pk,)).fetchone()
@@ -155,6 +161,11 @@ class ErasureManager:
                 "VALUES(?,?,?,?)",
                 (record_pk, intent_id, row["fingerprint"], now()),
             )
+            # The tombstone and the bytes go in the same transaction as the
+            # intent, so there is no window where forgotten evidence is still
+            # readable through its attachments.
+            for key, value in self.blobs.release([record_pk], db=self.db).items():
+                released[key] = released.get(key, 0) + value
             journal(self.db, record_pk, "erase")
         # A summary or lesson built on forgotten evidence must not stay on file
         # as if it were still supported. It is hidden, not deleted: the artifact
@@ -171,6 +182,7 @@ class ErasureManager:
             )
             self.db.execute("DELETE FROM record_fts WHERE id=?", (record_pk,))
             journal(self.db, record_pk, "invalidate")
+        return released
 
     # -- obligations ---------------------------------------------------------
 
@@ -298,11 +310,23 @@ class ErasureManager:
         live = [row["id"] for row in rows]
         obligations = self._obligations(live) if live else []
         dependents = self._transitive_dependents(live) if live else []
+        attachments = self._attachments(live)
         fingerprint = digest([
             [[row["id"], row["fingerprint"]] for row in rows],
             [[item["kind"], item["reference"]] for item in obligations],
+            [attachments["files"], attachments["bytes"]],
         ])
-        return rows, dependents, obligations, fingerprint
+        return rows, dependents, obligations, attachments, fingerprint
+
+    def _attachments(self, record_ids: Sequence[str]) -> dict[str, int]:
+        """How much attachment material this radius would destroy."""
+        if not record_ids:
+            return {"files": 0, "bytes": 0}
+        placeholders = ",".join("?" * len(record_ids))
+        row = self.db.execute(
+            f"SELECT count(*) AS files, COALESCE(sum(size), 0) AS bytes FROM attachments "
+            f"WHERE record_id IN ({placeholders})", list(record_ids)).fetchone()
+        return {"files": int(row["files"] or 0), "bytes": int(row["bytes"] or 0)}
 
     def _transitive_dependents(self, record_ids: Sequence[str], *, cap: int = 2000) -> list[str]:
         """Everything that cites the targets, directly or through other artifacts."""

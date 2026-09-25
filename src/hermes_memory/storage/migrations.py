@@ -350,6 +350,47 @@ PROCESSING_STATEMENTS: tuple[str, ...] = (
 )
 
 
+BLOB_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per distinct byte string, referenced by every attachment that
+    -- points at it. Chunks belong to the content, not to a record, so a
+    -- forwarded attachment cannot be destroyed by forgetting one of its
+    -- carriers — and cannot be kept alive by accident either, because refs is
+    -- the only thing standing between an orphan and the vacuum.
+    CREATE TABLE blob_contents(
+        sha256 TEXT PRIMARY KEY,
+        size INTEGER NOT NULL CHECK(size > 0),
+        refs INTEGER NOT NULL DEFAULT 0 CHECK(refs >= 0),
+        first_seen TEXT NOT NULL
+    )""",
+    """
+    CREATE TABLE blob_chunks(
+        sha256 TEXT NOT NULL REFERENCES blob_contents(sha256),
+        chunk_index INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY(sha256, chunk_index)
+    )""",
+    """
+    CREATE TABLE attachments(
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL REFERENCES records(id),
+        position INTEGER NOT NULL,
+        filename TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL CHECK(size > 0),
+        sha256 TEXT NOT NULL REFERENCES blob_contents(sha256),
+        added_at TEXT NOT NULL,
+        UNIQUE(record_id, position)
+    )""",
+    "CREATE INDEX attachments_record ON attachments(record_id, position)",
+    "CREATE INDEX attachments_content ON attachments(sha256)",
+    """
+    -- A crash can leave bytes with no reference holding them; this is the only
+    -- shape that makes such an orphan findable without a full scan.
+    CREATE INDEX contents_unreferenced ON blob_contents(sha256) WHERE refs = 0""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -363,6 +404,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0003_erasure", ERASURE_STATEMENTS),
     Migration("0004_identity", IDENTITY_STATEMENTS),
     Migration("0005_processing", PROCESSING_STATEMENTS),
+    Migration("0006_blobs", BLOB_STATEMENTS),
 )
 
 
