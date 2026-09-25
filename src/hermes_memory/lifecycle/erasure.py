@@ -7,6 +7,7 @@ from typing import Any, Iterable, Sequence
 from ..ids import digest, new_id, now, timestamp
 from ..storage.blobs import BlobStore
 from ..storage.evidence import EvidenceError, journal
+from ..storage.lineage import Lineage
 
 __all__ = ["ErasureManager", "AWAITING", "PENDING", "COMPLETE"]
 
@@ -32,6 +33,7 @@ class ErasureManager:
         self.owner_principal = owner_principal
         self.backend = backend
         self.blobs = BlobStore(store)
+        self.lineage = Lineage(store)
 
     # -- phase one: preview --------------------------------------------------
 
@@ -43,7 +45,7 @@ class ErasureManager:
             raise EvidenceError("nothing to forget: no live evidence matched")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
             raise EvidenceError("reason must be nonempty text of at most 1000 characters")
-        rows, dependents, obligations, attachments, fingerprint = self._radius(
+        rows, dependents, obligations, attachments, artifacts, fingerprint = self._radius(
             [row["id"] for row in targets])
         intent_id = new_id("erase")
         self.db.execute("BEGIN IMMEDIATE")
@@ -57,6 +59,7 @@ class ErasureManager:
                  json.dumps({"records": [row["id"] for row in rows],
                              "dependents": dependents,
                              "obligations": obligations,
+                             "artifacts": artifacts,
                              "attachments": attachments}, sort_keys=True),
                  fingerprint, AWAITING, self.store.epoch()),
             )
@@ -72,6 +75,7 @@ class ErasureManager:
             "preview_digest": fingerprint,
             "records": [row["id"] for row in rows],
             "dependent_artifacts": dependents,
+            "derived_products": artifacts,
             "obligations": obligations,
             "attachments": attachments,
             "confirmable_by": self.owner_principal,
@@ -112,7 +116,8 @@ class ErasureManager:
             # Re-measure the blast radius: the caller's digest only proves they
             # saw *a* preview, not that the store still matches it. New evidence
             # or a projection added since the preview changes the debt.
-            rows, _dependents, _obligations, _attachments, current = self._radius(record_ids)
+            rows, _dependents, _obligations, _attachments, artifacts, current = \
+                self._radius(record_ids)
             if len(rows) != len(record_ids):
                 raise EvidenceError(
                     "part of the previewed set no longer exists; re-run the preview")
@@ -298,7 +303,7 @@ class ErasureManager:
         return found
 
     def _radius(self, record_ids: Sequence[str]):
-        """Recompute (rows, dependents, obligations, digest) from live state.
+        """Recompute (rows, dependents, obligations, attachments, artifacts, digest).
 
         Both the preview and the confirmation go through here, so a confirm
         that no longer matches what was shown cannot slip past the digest.
@@ -311,12 +316,17 @@ class ErasureManager:
         obligations = self._obligations(live) if live else []
         dependents = self._transitive_dependents(live) if live else []
         attachments = self._attachments(live)
+        # The summaries and typed claims quoting this evidence are part of what the
+        # owner is agreeing to lose. They are read live rather than stored, so this is
+        # the moment their absence would otherwise be silent.
+        artifacts = self.lineage.artifacts(live) if live else []
         fingerprint = digest([
             [[row["id"], row["fingerprint"]] for row in rows],
             [[item["kind"], item["reference"]] for item in obligations],
+            [[item["kind"], item["id"]] for item in artifacts],
             [attachments["files"], attachments["bytes"]],
         ])
-        return rows, dependents, obligations, attachments, fingerprint
+        return rows, dependents, obligations, attachments, artifacts, fingerprint
 
     def _attachments(self, record_ids: Sequence[str]) -> dict[str, int]:
         """How much attachment material this radius would destroy."""
@@ -329,17 +339,14 @@ class ErasureManager:
         return {"files": int(row["files"] or 0), "bytes": int(row["bytes"] or 0)}
 
     def _transitive_dependents(self, record_ids: Sequence[str], *, cap: int = 2000) -> list[str]:
-        """Everything that cites the targets, directly or through other artifacts."""
-        seen: set[str] = set()
-        frontier = list(record_ids)
-        while frontier and len(seen) < cap:
-            placeholders = ",".join("?" * len(frontier))
-            rows = self.db.execute(
-                f"SELECT child_id FROM record_dependencies WHERE parent_id IN ({placeholders})",
-                frontier).fetchall()
-            frontier = [row["child_id"] for row in rows if row["child_id"] not in seen]
-            seen.update(frontier)
-        return sorted(seen)
+        """Everything that cites the targets, directly or through other artifacts.
+
+        Traversal lives in one place: an erasure that missed an edge the broker could
+        follow would leave evidence reachable through a path nobody had to confirm.
+        """
+        targets = set(record_ids)
+        closure, _truncated = self.lineage.closure(record_ids, cap=cap)
+        return [item for item in closure if item not in targets]
 
     def _obligations(self, record_ids: Sequence[str]) -> list[dict[str, str]]:
         rows = self.db.execute(
