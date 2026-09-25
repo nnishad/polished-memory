@@ -360,12 +360,34 @@ class JobQueue:
             self.db.execute("ROLLBACK")
             raise
 
-    def _reclaim_expired_leases(self) -> None:
+    def _reclaim_expired_leases(self, *, at: float | None = None) -> int:
         """An expired lease becomes uncertain work, never a free retry."""
-        self.db.execute(
+        moment = self.clock() if at is None else float(at)
+        return self.db.execute(
             "UPDATE processing_jobs SET state=?, last_error='lease expired', lease=NULL, "
             "updated_at=? WHERE state=? AND lease_until < ?",
-            (UNCERTAIN, now(), LEASED, self.clock()))
+            (UNCERTAIN, now(), LEASED, moment)).rowcount
+
+    def reconcile(self, *, at: float | None = None) -> dict[str, int]:
+        """Startup pass over the queue, before any worker claims.
+
+        Two things cannot be inferred from a crash, so both are recorded as what is
+        known rather than as what would be convenient: a job whose lease lapsed may
+        already have reached the backend, and a job queued under a superseded epoch
+        describes coverage the store no longer has. Each step is a narrowing update,
+        so running this twice reports nothing the second time.
+        """
+        report: dict[str, int] = {}
+        expired = self._reclaim_expired_leases(at=at)
+        if expired:
+            report["lease_expired"] = expired
+        superseded = self.abandon_stale_epoch()
+        if superseded:
+            report["stale_epoch"] = superseded
+        unresolved = len(self.unresolved())
+        if unresolved:
+            report["unresolved"] = unresolved
+        return report
 
     def _inputs_json(self, job_id: str) -> str:
         row = self.db.execute("SELECT inputs FROM processing_jobs WHERE id=?",
