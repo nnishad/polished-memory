@@ -677,6 +677,86 @@ PROACTIVITY_STATEMENTS: tuple[str, ...] = (
 )
 
 
+LEARNING_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per version of one lesson. A lesson is never edited in place: the
+    -- version that was evaluated is the version that earned its status, and a
+    -- reworded lesson is a new claim that has to be evaluated again.
+    CREATE TABLE lessons(
+        id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        applicability TEXT NOT NULL,
+        prerequisites TEXT NOT NULL DEFAULT '[]',
+        exceptions TEXT NOT NULL DEFAULT '[]',
+        contrary_cases TEXT NOT NULL DEFAULT '[]',
+        evidence TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'active', 'retracted')),
+        created_by TEXT NOT NULL,
+        created_kind TEXT NOT NULL CHECK(created_kind IN ('owner', 'agent', 'evaluation')),
+        created_at TEXT NOT NULL,
+        evaluation_id TEXT REFERENCES evaluations(id),
+        decided_by TEXT,
+        decided_at TEXT,
+        retraction_reason TEXT,
+        PRIMARY KEY(id, version)
+    )""",
+    "CREATE INDEX lessons_status ON lessons(status, id, version)",
+    """
+    -- Who reported what, kept apart on purpose. An assistant that announced success
+    -- is a fact about a message, not a fact about the world, and the three kinds are
+    -- never allowed to add up to the same thing.
+    CREATE TABLE outcomes(
+        id TEXT PRIMARY KEY,
+        subject_kind TEXT NOT NULL CHECK(subject_kind IN ('lesson', 'goal', 'artifact',
+            'task')),
+        subject_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('host_receipt', 'owner_report',
+            'assistant_claim')),
+        valence TEXT NOT NULL CHECK(valence IN ('success', 'failure', 'unknown')),
+        note TEXT NOT NULL,
+        evidence TEXT NOT NULL DEFAULT '[]',
+        actor TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX outcome_subject ON outcomes(subject_kind, subject_id, kind)",
+    """
+    -- An evaluation is a claim about a run: which lesson version, which fixtures,
+    -- which baseline, and which code and model actually executed. Change any of the
+    -- five and the verdict stops being about the thing in front of you.
+    CREATE TABLE evaluations(
+        id TEXT PRIMARY KEY,
+        lesson_id TEXT NOT NULL,
+        lesson_version INTEGER NOT NULL,
+        lesson_digest TEXT NOT NULL,
+        runner TEXT NOT NULL,
+        fixture_digest TEXT NOT NULL,
+        baseline_digest TEXT NOT NULL,
+        code_version TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK(verdict IN ('running', 'passed', 'failed',
+            'incomplete', 'stale')),
+        detail TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE(lesson_id, lesson_version, fixture_digest, baseline_digest, code_version,
+               model_version)
+    )""",
+    """
+    -- Per case, because "the suite passed" is not evidence unless the cases it
+    -- passed are. Targeted cases show the lesson does its job; regression cases
+    -- show it did not break the ones that already did.
+    CREATE TABLE evaluation_cases(
+        evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
+        case_id TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('targeted', 'regression')),
+        outcome TEXT NOT NULL CHECK(outcome IN ('pass', 'fail', 'error', 'skipped')),
+        detail TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(evaluation_id, case_id)
+    )""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -695,6 +775,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0008_summaries", SUMMARY_STATEMENTS),
     Migration("0009_prospective", PROSPECTIVE_STATEMENTS),
     Migration("0010_proactivity", PROACTIVITY_STATEMENTS),
+    Migration("0011_learning", LEARNING_STATEMENTS),
 )
 
 
