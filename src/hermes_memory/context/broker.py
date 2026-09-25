@@ -19,7 +19,7 @@ from dataclasses import replace
 from typing import Any, Callable, Iterable
 
 from ..ids import digest
-from ..storage.identity import IdentityStore
+from ..storage.identity import IdentityStore, evidence_accounts
 from .cache import PacketCache
 from .lexical import AVAILABLE, LexicalChannel
 from .packet import (CONFLICTING, PARTIAL, SUPPORTED, UNKNOWN, Channels, EvidenceItem,
@@ -49,7 +49,8 @@ class ContextBroker:
     """Assemble a packet within a token ceiling and a wall-clock deadline."""
 
     def __init__(self, store: Any, *, client: Any = None, identity: IdentityStore | None = None,
-                 budget_tokens: int = 1800, derived_timeout_s: float = 4.0,
+                 assertions: Any = None, budget_tokens: int = 1800,
+                 derived_timeout_s: float = 4.0,
                  cache: PacketCache | None | bool = True, account_id: str | None = None,
                  clock: Callable[[], float] = time.monotonic, estimator=None):
         if not isinstance(budget_tokens, int) or not 1 <= budget_tokens <= 200_000:
@@ -59,6 +60,7 @@ class ContextBroker:
         self.store = store
         self.client = client
         self.identity = identity
+        self.assertions = assertions
         self.budget_tokens = budget_tokens
         self.derived_timeout_s = float(derived_timeout_s)
         self.account_id = account_id
@@ -117,6 +119,13 @@ class ContextBroker:
         kept_commitments, spent = self._bounded(commitments, spent, key="title", cap=4)
         kept_lessons, spent = self._bounded(lessons, spent, key="text", cap=4)
 
+        # Typed claims are checked, attributable and short, so they go in before
+        # the raw spans that would crowd them out.
+        asserted, assertion_conflicts, assertion_note, spent = self._assertions(query, spent)
+        conflicts = conflicts + assertion_conflicts
+        if assertion_note:
+            truncated.append("assertions")
+
         for evidence in considered:
             cost = self.estimate(evidence.text) + 12
             if spent + cost > self.budget_tokens:
@@ -159,7 +168,7 @@ class ContextBroker:
             # The packet still says what it found, but it cannot be reused.
             truncated.append("store_moved")
 
-        notes = [text for text in (outcome.detail, derived_detail) if text]
+        notes = [text for text in (outcome.detail, derived_detail, assertion_note) if text]
         if revoked:
             notes.append(f"{revoked} item(s) were forgotten or hidden during retrieval")
         if store_moved:
@@ -168,7 +177,7 @@ class ContextBroker:
                             detail="; ".join(notes)[:400])
 
         packet = Packet(
-            query=query, items=tuple(items), facts=facts,
+            query=query, items=tuple(items), assertions=asserted, facts=facts,
             lessons=kept_lessons, commitments=kept_commitments,
             channels=channels,
             coverage=self._coverage(items=items, facts=facts, conflicts=conflicts,
@@ -252,30 +261,10 @@ class ContextBroker:
         identifiers = set(self.identity.group(account_id)) if account_id else set()
         allowed = []
         for evidence in matches:
-            claims = self._claims(evidence)
+            claims = evidence_accounts(self.identity, evidence)
             if not claims or (identifiers and claims & identifiers):
                 allowed.append(evidence)
         return allowed, len(matches) - len(allowed)
-
-    def _claims(self, evidence) -> set[str]:
-        """Accounts a record says it belongs to, resolved through identity only."""
-        claims = {str(value) for value in (evidence.metadata.get("account_ids") or [])
-                  if str(value).strip()}
-        for participant in evidence.metadata.get("participants") or []:
-            if not isinstance(participant, dict):
-                continue
-            namespace, address = participant.get("namespace"), participant.get("address")
-            if not namespace or not address:
-                continue
-            try:
-                resolved = self.identity.resolve(str(namespace), str(address))
-            except Exception:
-                # A stranger's address in someone else's message is not a bug
-                # here, and it must never become an argument for showing more.
-                resolved = None
-            if resolved:
-                claims.add(resolved)
-        return claims
 
     def _coverage(self, *, items, facts, conflicts, channels, truncated):
         """How much of the question this packet answers — never how true it is."""
@@ -284,7 +273,7 @@ class ContextBroker:
         degraded = (channels.lexical != AVAILABLE
                     or channels.derived in _ATTEMPTED_FAILED
                     or bool(set(truncated) & {"packet", "terms", "store_moved",
-                                              "revoked_during_recall",
+                                              "revoked_during_recall", "assertions",
                                               "source_facts", "chunks", "results"}))
         if not items and not facts:
             # "Nothing here" and "we could not look" are different answers, and
@@ -296,6 +285,31 @@ class ContextBroker:
             # since been corrected, and only the local store knows that.
             return PARTIAL
         return PARTIAL if degraded else SUPPORTED
+
+    def _assertions(self, query, spent):
+        """Time-valid typed claims about what the archive asserts, plus their disputes."""
+        if self.assertions is None:
+            return (), (), "", spent
+        try:
+            found = self.assertions.matching(query, limit=6)
+        except Exception as error:
+            # A section we could not read is missing, not settled: it goes in the
+            # caveats as a degradation, never in the conflict list.
+            return (), (), f"assertions could not be read: {error}"[:160], spent
+        kept: list[dict[str, Any]] = []
+        for assertion in found:
+            cost = self.estimate(f"{assertion.subject} {assertion.predicate} "
+                                 f"{assertion.value}") + 24
+            if spent + cost > self.budget_tokens:
+                break
+            spent += cost
+            kept.append(assertion.as_dict())
+        conflicts: list[str] = []
+        for subject in dict.fromkeys(item["subject"] for item in kept):
+            for clash in self.assertions.contradictions(subject=subject):
+                values = " vs ".join(sorted({item.value for item in clash.assertions})[:3])
+                conflicts.append(f"{clash.subject} {clash.predicate} is disputed: {values}")
+        return tuple(kept), tuple(dict.fromkeys(conflicts)), "", spent
 
     def _conflicts(self, candidates):
         """Live accounts that declare incompatible values for the same attribute.

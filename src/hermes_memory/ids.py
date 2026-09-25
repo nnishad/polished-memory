@@ -12,7 +12,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-__all__ = ["digest", "content_digest", "now", "record_id", "backend_document_id", "timestamp"]
+__all__ = ["digest", "content_digest", "now", "record_id", "backend_document_id",
+           "timestamp", "intervals_overlap", "interval_contains"]
 
 _INVALID_BACKEND_CHARS = re.compile(r"[~_]")
 
@@ -41,6 +42,20 @@ def timestamp(value: str) -> str:
     if parsed.tzinfo is None:
         raise ValueError("timestamp must include a timezone")
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def intervals_overlap(a_from: str | None, a_to: str | None, b_from: str | None,
+                      b_to: str | None) -> bool:
+    """Do two validity intervals share a moment? Open ends are unbounded."""
+    if a_from and b_to and a_from > b_to:
+        return False
+    if b_from and a_to and b_from > a_to:
+        return False
+    return True
+
+
+def interval_contains(start: str | None, end: str | None, at: str) -> bool:
+    return not ((start and at < start) or (end and at > end))
 
 
 def record_id(source: str, source_id: str, revision: str) -> str:

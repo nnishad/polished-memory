@@ -391,6 +391,58 @@ BLOB_STATEMENTS: tuple[str, ...] = (
 )
 
 
+KNOWLEDGE_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One typed thing the archive asserts about a subject, over an interval, with
+    -- the exact span of the evidence behind it. The quote offsets matter as much
+    -- as the text: a claim that cannot point at what it was quoted from is a
+    -- hypothesis about what the archive says, not a fact in it.
+    CREATE TABLE assertions(
+        id TEXT PRIMARY KEY,
+        subject TEXT NOT NULL,
+        predicate TEXT NOT NULL,
+        value TEXT NOT NULL,
+        category TEXT NOT NULL,
+        unit TEXT,
+        evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('owner_declared',
+            'explicit_statement', 'observed_pattern', 'derived')),
+        record_id TEXT NOT NULL REFERENCES records(id),
+        quote_start INTEGER NOT NULL,
+        quote_end INTEGER NOT NULL,
+        quote TEXT NOT NULL,
+        valid_from TEXT,
+        valid_to TEXT,
+        status TEXT NOT NULL CHECK(status IN ('candidate', 'confirmed', 'superseded',
+            'retracted')),
+        created_by TEXT NOT NULL,
+        confirmed_by TEXT,
+        created_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        supersedes TEXT REFERENCES assertions(id),
+        revision INTEGER NOT NULL DEFAULT 1
+    )""",
+    "CREATE INDEX assertions_subject ON assertions(subject, predicate, status, valid_from)",
+    "CREATE INDEX assertions_record ON assertions(record_id, status)",
+    """
+    -- Derived artifacts declare what they were built from before anyone asks.
+    -- The verdict is computed on read and never stored: a summary does not stop
+    -- being supported because the row said so. The quoted text is kept, because
+    -- drift can only be noticed against something to compare with.
+    CREATE TABLE derived_citations(
+        artifact_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        coverage TEXT NOT NULL CHECK(coverage IN ('full', 'truncated')),
+        record_id TEXT NOT NULL REFERENCES records(id),
+        quote TEXT,
+        quote_start INTEGER,
+        quote_end INTEGER,
+        added_at TEXT NOT NULL,
+        PRIMARY KEY(artifact_id, record_id)
+    )""",
+    "CREATE INDEX citations_record ON derived_citations(record_id, artifact_id)",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -405,6 +457,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0004_identity", IDENTITY_STATEMENTS),
     Migration("0005_processing", PROCESSING_STATEMENTS),
     Migration("0006_blobs", BLOB_STATEMENTS),
+    Migration("0007_knowledge", KNOWLEDGE_STATEMENTS),
 )
 
 

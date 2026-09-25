@@ -13,10 +13,11 @@ import json
 import re
 from typing import Any, Sequence
 
-from ..ids import digest, now, timestamp
+from ..ids import digest, intervals_overlap, now, timestamp
 from .evidence import EvidenceError
 
-__all__ = ["IdentityStore", "PENDING", "CONFIRMED", "REJECTED", "STALE", "RULES"]
+__all__ = ["IdentityStore", "evidence_accounts", "PENDING", "CONFIRMED", "REJECTED",
+           "STALE", "RULES"]
 
 PENDING = "pending"
 CONFIRMED = "confirmed"
@@ -479,12 +480,7 @@ def _ordered_pair(a: str, b: str) -> tuple[str, str]:
 
 
 def _intervals_overlap(a_from, a_until, b_from, b_until) -> bool:
-    """Open-ended intervals are unbounded, so they overlap everything."""
-    if a_from and b_until and a_from > b_until:
-        return False
-    if b_from and a_until and b_from > a_until:
-        return False
-    return True
+    return intervals_overlap(a_from, a_until, b_from, b_until)
 
 
 def _interval_contains(start, end, at) -> bool:
@@ -493,3 +489,32 @@ def _interval_contains(start, end, at) -> bool:
     if end and at and at > end:
         return False
     return True
+
+
+def evidence_accounts(identity: "IdentityStore | None", evidence) -> set[str]:
+    """Which accounts a record says it belongs to, resolved through identity only.
+
+    An address that is not a registered account scopes nothing. That direction
+    matters: unregistered participants are ordinary noise in imported mail, and
+    letting noise quarantine a record would empty the archive without protecting
+    anyone in it.
+    """
+    claims = {str(value) for value in (evidence.metadata.get("account_ids") or [])
+              if str(value).strip()}
+    if identity is None:
+        return claims
+    for participant in evidence.metadata.get("participants") or []:
+        if not isinstance(participant, dict):
+            continue
+        namespace, address = participant.get("namespace"), participant.get("address")
+        if not namespace or not address:
+            continue
+        try:
+            resolved = identity.resolve(str(namespace), str(address))
+        except EvidenceError:
+            # A stranger's address in someone else's message is not a bug here,
+            # and it must never become an argument for showing more.
+            resolved = None
+        if resolved:
+            claims.add(resolved)
+    return claims

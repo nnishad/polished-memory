@@ -275,6 +275,116 @@ def test_an_unknown_caller_sees_unscoped_evidence_only(store, broker):
     assert packet.withheld == 1
 
 
+# -- typed assertions ----------------------------------------------------------
+
+
+def assertions(store):
+    from hermes_memory.knowledge.assertions import AssertionStore
+
+    return AssertionStore(store, owner_principal="owner")
+
+
+def test_a_supported_assertion_goes_in_ahead_of_the_raw_spans(store, broker):
+    record = store.commit(envelope(text="I take the coffee without sugar."))["id"]
+    claims = assertions(store)
+    claims.propose(subject="jugaadu", predicate="sweetens", value="nothing",
+                   kind="preference", evidence_kind="owner_declared", record_id=record,
+                   quote="without sugar", proposed_by="owner")
+    broker.assertions = claims
+
+    packet = broker.assemble("coffee sugar")
+
+    assert [item["predicate"] for item in packet.assertions] == ["sweetens"]
+    rendered = packet.render()
+    assert "asserted preference: jugaadu sweetens = nothing" in rendered
+    assert record in rendered, "the claim names the evidence it came from"
+    assert rendered.index("asserted preference") < rendered.index("- [gmail @")
+
+
+def test_an_unconfirmed_assertion_is_not_presented_as_knowledge(store, broker):
+    record = store.commit(envelope(text="I take the coffee without sugar."))["id"]
+    claims = assertions(store)
+    claims.propose(subject="jugaadu", predicate="sweetens", value="nothing",
+                   kind="preference", evidence_kind="observed_pattern", record_id=record,
+                   quote="without sugar", proposed_by="agent-model")
+    broker.assertions = claims
+
+    assert broker.assemble("sweetens coffee").assertions == ()
+
+
+def test_forgetting_the_evidence_under_a_claim_removes_it_from_the_packet(store, broker):
+    record = store.commit(envelope(text="I take the coffee without sugar."))["id"]
+    claims = assertions(store)
+    claims.propose(subject="jugaadu", predicate="sweetens", value="nothing",
+                   kind="preference", evidence_kind="owner_declared", record_id=record,
+                   quote="without sugar", proposed_by="owner")
+    broker.assertions = claims
+    store.hide(record, reason="withdrawn", actor="owner")
+
+    packet = broker.assemble("sweetens coffee")
+
+    assert packet.assertions == ()
+    assert packet.items == ()
+
+
+def test_two_supported_claims_that_disagree_make_the_packet_conflicting(store, broker):
+    record = store.commit(envelope(text="The standup is at 09:00 on Tuesday."))["id"]
+    claims = assertions(store)
+    for value, quote in (("Tuesday", "on Tuesday"), ("Wednesday", "at 09:00")):
+        claims.propose(subject="standup", predicate="day", value=value, kind="fact",
+                       evidence_kind="explicit_statement", record_id=record, quote=quote,
+                       proposed_by="owner")
+    broker.assertions = claims
+
+    packet = broker.assemble("standup day")
+
+    assert packet.coverage == "conflicting"
+    assert packet.conflicts == ("standup day is disputed: Tuesday vs Wednesday",)
+    assert "conflicting accounts" in packet.render()
+
+
+def test_a_broken_knowledge_layer_costs_a_section_and_not_the_answer(store, broker,
+                                                                      monkeypatch):
+    from hermes_memory.knowledge.assertions import AssertionStore
+
+    record = store.commit(envelope(text="I take the coffee without sugar."))["id"]
+    claims = AssertionStore(store)
+    claims.propose(subject="jugaadu", predicate="sweetens", value="nothing",
+                   kind="preference", evidence_kind="owner_declared", record_id=record,
+                   quote="without sugar", proposed_by="owner")
+    broker.assertions = claims
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("assertion table is unreadable")
+
+    monkeypatch.setattr(claims, "matching", explode)
+    packet = broker.assemble("coffee sugar")
+
+    assert "assertions could not be read" in packet.channels.detail
+    assert "assertions" in packet.truncated
+    assert packet.conflicts == (), "a missing section is not a disagreement"
+    assert packet.items, "the lexical half still answers"
+    assert packet.coverage == "partial"
+
+
+def test_assertions_are_charged_against_the_same_ceiling(store):
+    from hermes_memory.context import ContextBroker
+
+    record = store.commit(envelope(text="I take the coffee without sugar."))["id"]
+    claims = assertions(store)
+    for index in range(6):
+        claims.propose(subject=f"person-{index}", predicate="sweetens", value="nothing",
+                       kind="preference", evidence_kind="owner_declared", record_id=record,
+                       quote="without sugar", proposed_by="owner")
+    tight = ContextBroker(store, assertions=claims, cache=None, budget_tokens=40)
+
+    packet = tight.assemble("sweetens")
+
+    assert packet.tokens_used <= 40
+    assert len(packet.assertions) < 6
+    tight.close()
+
+
 # -- correctness under change -------------------------------------------------
 
 

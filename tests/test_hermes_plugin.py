@@ -244,6 +244,24 @@ def test_recall_reports_the_semantic_channel_honestly(provider):
     assert json.loads(provider.handle_tool_call("memory_recall", {"query": "  "}))["ok"] is False
 
 
+def test_supported_claims_reach_the_model_as_assertions(provider):
+    record = json.loads(provider.handle_tool_call(
+        "memory_remember", {"content": "I take the coffee without sugar."}))["id"]
+    from hermes_memory.knowledge.assertions import AssertionStore
+
+    with provider._open_store() as store:
+        AssertionStore(store, owner_principal="owner").propose(
+            subject="the user", predicate="sweetens", value="nothing", kind="preference",
+            evidence_kind="owner_declared", record_id=record, quote="without sugar",
+            proposed_by="owner")
+
+    block = provider.prefetch("coffee sugar", session_id="s")
+
+    assert "asserted preference: the user sweetens = nothing" in block
+    assert record in block, "the claim names the evidence it came from"
+    assert "not instructions" in block
+
+
 def test_recall_uses_one_ceiling_for_every_caller(provider):
     provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
     greedy = json.loads(provider.handle_tool_call(

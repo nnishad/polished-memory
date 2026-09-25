@@ -343,10 +343,13 @@ class HermesMemoryProvider(_MemoryProvider):
             if self._settings is None:
                 raise RuntimeError("provider is not configured")
             from hermes_memory.context import ContextBroker
+            from hermes_memory.knowledge.assertions import AssertionStore
 
             self._store = self._open_store()
             self._context = ContextBroker(
                 self._store, client=None, budget_tokens=_PREFETCH_TOKENS,
+                assertions=AssertionStore(
+                    self._store, owner_principal=self._settings.owner_principal),
                 derived_timeout_s=self._settings.foreground_deadline_s)
         return self._context
 
