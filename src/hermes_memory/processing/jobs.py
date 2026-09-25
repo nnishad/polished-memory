@@ -159,6 +159,30 @@ class JobQueue:
             raise
         return self.get(row["id"])
 
+    def release(self, job: Job) -> str:
+        """Put a leased job back without spending an attempt.
+
+        Failing to obtain a resource slot is not the job's fault, so counting it
+        would let contention alone quarantine work that never ran.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT state FROM processing_jobs WHERE id=?",
+                                  (job.id,)).fetchone()
+            if row is None:
+                raise EvidenceError(f"unknown job {job.id!r}")
+            if row["state"] != LEASED:
+                self.db.execute("COMMIT")
+                return row["state"]
+            self.db.execute(
+                "UPDATE processing_jobs SET state=?, lease=NULL, lease_until=NULL, updated_at=?"
+                " WHERE id=?", (QUEUED, now(), job.id))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return QUEUED
+
     def begin_submission(self, job: Job, *, submission_id: str,
                          operation_id: str | None = None) -> None:
         """Record the submission identity *before* the request leaves the process."""
@@ -328,15 +352,9 @@ class JobQueue:
                  None if release_lease or state == SUCCEEDED else row["state"],
                  None, error, now(),
                  now() if state == SUCCEEDED else None, job_id))
-            if seconds or tokens:
-                fresh = self.get(job_id)
-                self.store.db.execute(
-                    "INSERT INTO budget_usage(scope, period, resource, tokens, calls, seconds) "
-                    "VALUES('global',?,?,?,?,?) ON CONFLICT(scope, period, resource) DO UPDATE "
-                    "SET tokens=budget_usage.tokens+excluded.tokens, "
-                    "calls=budget_usage.calls+1, seconds=budget_usage.seconds+excluded.seconds",
-                    (now()[:10], fresh.resource if fresh else "unknown", tokens,
-                     1 if state == SUCCEEDED else 0, seconds))
+            # tokens_used on the row is bookkeeping for the job. The shared
+            # budget_usage ledger is written by the gate, which is the physical
+            # boundary: charging it here as well would double-count every call.
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
