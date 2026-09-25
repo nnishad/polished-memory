@@ -261,8 +261,11 @@ class DueEventLog:
         row = connection.execute("SELECT * FROM due_events WHERE id=?", (event_id,)).fetchone()
         if row is None:
             raise EvidenceError(f"unknown due event {event_id!r}")
-        intent_id = "dec_" + digest([event_id, row["revision"], decision,
-                                     policy_version])[:32]
+        # The intention is identified by the promise, not by what was decided about
+        # it: an event handed over as awaiting-analysis and later settled on a digest
+        # is one intention, and a second ack — even with a different decision — is a
+        # replay rather than a second artifact.
+        intent_id = "dec_" + digest([event_id, row["revision"], policy_version])[:32]
         existing = connection.execute("SELECT * FROM decision_intents WHERE id=?",
                                       (intent_id,)).fetchone()
         if existing is not None:
@@ -294,6 +297,72 @@ class DueEventLog:
             (intent_id, event_id, row["goal_id"], row["revision"], decision, policy_version,
              state, payload_digest, stamp, stamp))
         return {"intent": intent_id, "state": state, "replayed": False, "event": event_id}
+
+    def settle(self, *, event_id: str, intent_id: str, decision: str,
+               payload_digest: str | None = None, policy_version: str | None = None,
+               db: sqlite3.Connection | None = None) -> dict[str, Any]:
+        """Replace an unfinished handoff with the decision that was actually made.
+
+        ``ack`` says responsibility moved; this says where it moved to. Splitting
+        the two is what lets a crash between them be recovered: the intention is
+        left in ``awaiting_analysis``, which reads as "promised, not finished" to
+        whoever looks next, instead of silently looking like a delivered reminder.
+        """
+        if decision not in DECISION_KINDS or decision == "awaiting_analysis":
+            raise EvidenceError(
+                f"{decision!r} is not something a handoff can be settled into")
+        with self._writing(db) as connection:
+            row = connection.execute("SELECT * FROM decision_intents WHERE id=?",
+                                     (intent_id,)).fetchone()
+            if row is None:
+                raise EvidenceError(f"unknown intention {intent_id!r}")
+            if row["event_id"] != event_id:
+                raise EvidenceError(
+                    f"{intent_id} belongs to another event; a decision about one "
+                    "reminder cannot settle another")
+            if row["state"] != "awaiting_analysis":
+                return {"intent": intent_id, "state": row["state"], "kind": row["kind"],
+                        "replayed": True,
+                        "note": "this intention was already settled; nothing was decided "
+                                "twice"}
+            state = "suppressed" if decision == "silent" else "prepared"
+            stamp = now()
+            connection.execute(
+                "UPDATE decision_intents SET kind=?, state=?, payload_digest=?, "
+                "policy_version=?, updated_at=? WHERE id=? AND state='awaiting_analysis'",
+                (decision, state, payload_digest,
+                 policy_version or row["policy_version"], stamp, intent_id))
+            connection.execute(
+                "UPDATE due_events SET decision_kind=?, policy_version=? WHERE id=?",
+                (decision, policy_version or row["policy_version"], event_id))
+            return {"intent": intent_id, "state": state, "kind": decision,
+                    "replayed": False}
+
+    def suppress(self, event_id: str, *, reason: str,
+                 db: sqlite3.Connection | None = None) -> dict[str, Any]:
+        """Close a handed-off event with a decision of silence, and say why."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise EvidenceError("suppressing a reminder has to say why")
+        with self._writing(db) as connection:
+            row = connection.execute("SELECT * FROM due_events WHERE id=?",
+                                     (event_id,)).fetchone()
+            if row is None:
+                raise EvidenceError(f"unknown due event {event_id!r}")
+            if row["state"] not in (PENDING, CLAIMED, HANDED_OFF):
+                raise EvidenceError(
+                    f"{event_id} is {row['state']}; it cannot be suppressed any more "
+                    "than it can be un-delivered")
+            stamp = now()
+            connection.execute(
+                "UPDATE due_events SET state=?, decided_at=?, decision_kind=?, "
+                "claim_token=NULL, claim_until=NULL WHERE id=?",
+                (SUPPRESSED, stamp, "silent", event_id))
+            connection.execute(
+                "UPDATE decision_intents SET kind='silent', state='suppressed', "
+                "updated_at=? WHERE event_id=? AND state IN ('prepared', "
+                "'awaiting_analysis')", (stamp, event_id))
+            self.store._audit("due_event_suppressed", event_id, {"reason": reason[:200]})
+            return {"id": event_id, "state": SUPPRESSED, "reason": reason[:400]}
 
     def intents(self, *, state: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
         clause = " WHERE state=?" if state else ""

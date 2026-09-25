@@ -589,6 +589,94 @@ PROSPECTIVE_STATEMENTS: tuple[str, ...] = (
 )
 
 
+PROACTIVITY_STATEMENTS: tuple[str, ...] = (
+    """
+    -- What the owner allows, per topic, with the clock they live on. Defaults are
+    -- the conservative end of the range and only the owner may move them.
+    CREATE TABLE topic_policies(
+        topic TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('allowed', 'opted_out')),
+        shadow INTEGER NOT NULL DEFAULT 1,
+        quiet_from TEXT,
+        quiet_until TEXT,
+        timezone TEXT NOT NULL DEFAULT 'UTC',
+        digest_per_day INTEGER NOT NULL DEFAULT 1,
+        max_immediate INTEGER NOT NULL DEFAULT 2,
+        cooldown_minutes INTEGER NOT NULL DEFAULT 240,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL
+    )""",
+    """
+    -- A digest is a slot, not a message: items coalesce into the one window that
+    -- closes next outside quiet hours. The id is derived from the slot so a
+    -- retried write cannot fork a second window for the same boundary.
+    CREATE TABLE attention_windows(
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('digest', 'immediate')),
+        opens_at TEXT NOT NULL,
+        closes_at TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('open', 'closed')),
+        items INTEGER NOT NULL DEFAULT 0,
+        closed_at TEXT,
+        UNIQUE(scope, kind, closes_at)
+    )""",
+    """
+    -- One policy outcome per handed-off intention. The intention itself belongs to
+    -- C8; this row records what was decided about it and whether a model was even
+    -- allowed to look.
+    CREATE TABLE proactive_decisions(
+        id TEXT PRIMARY KEY,
+        intent_id TEXT NOT NULL UNIQUE REFERENCES decision_intents(id),
+        goal_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        topic TEXT NOT NULL,
+        window_id TEXT REFERENCES attention_windows(id),
+        action TEXT NOT NULL CHECK(action IN ('silent', 'next_turn', 'digest',
+            'notify_owner', 'draft')),
+        reason TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        shadow INTEGER NOT NULL DEFAULT 1,
+        model_used INTEGER NOT NULL DEFAULT 0,
+        packet_id TEXT,
+        citations TEXT,
+        decided_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX decision_topic_time ON proactive_decisions(topic, decided_at)",
+    """
+    -- The framework makes artifacts; the host delivers them. Every state here is
+    -- about the artifact, and only 'confirmed' has a receipt from outside.
+    -- The revalidation inputs are stored *with* the artifact rather than looked up
+    -- at delivery time only: a digest prepared on Tuesday and delivered on Friday
+    -- must be able to say what it was true about, and whether it still is.
+    CREATE TABLE outbox(
+        id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL REFERENCES proactive_decisions(id),
+        kind TEXT NOT NULL CHECK(kind IN ('next_turn', 'digest', 'notify_owner', 'draft')),
+        topic TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        evidence TEXT NOT NULL DEFAULT '[]',
+        policy_version TEXT NOT NULL,
+        expires_at TEXT,
+        state TEXT NOT NULL CHECK(state IN ('prepared', 'leased', 'attempted', 'confirmed',
+            'accepted_unverified', 'uncertain', 'suppressed', 'expired')),
+        reason TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT,
+        lease_until REAL,
+        held_by TEXT,
+        proof TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        delivered_at TEXT,
+        UNIQUE(decision_id, kind)
+    )""",
+    "CREATE INDEX outbox_ready ON outbox(state, kind, created_at)",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -606,6 +694,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0007_knowledge", KNOWLEDGE_STATEMENTS),
     Migration("0008_summaries", SUMMARY_STATEMENTS),
     Migration("0009_prospective", PROSPECTIVE_STATEMENTS),
+    Migration("0010_proactivity", PROACTIVITY_STATEMENTS),
 )
 
 
