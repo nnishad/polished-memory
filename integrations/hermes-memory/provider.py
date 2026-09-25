@@ -82,16 +82,23 @@ _TOOLS = [
     {
         "name": "memory_identity_candidate",
         "description": (
-            "Propose that two accounts may be the same person. This records a "
-            "candidate for owner review only; it cannot confirm an identity."
+            "Propose that two accounts may be the same person, citing the deterministic rule "
+            "and the canonical records that support it. This queues a candidate for owner "
+            "review only; it cannot confirm an identity, and a name similarity or a guess is "
+            "not an admissible rule."
         ),
         "parameters": {
             "type": "object",
-            "required": ["account_a", "account_b", "basis"],
+            "required": ["account_a", "account_b", "rule", "basis", "evidence"],
             "properties": {
                 "account_a": {"type": "string"},
                 "account_b": {"type": "string"},
-                "basis": {"type": "string", "description": "Deterministic rule and supporting records."},
+                "rule": {"type": "string", "enum": [
+                    "email-thread-participant", "email-normalized-equal", "phone-e164-equal",
+                    "explicit-alias-declared", "source-account-self"]},
+                "basis": {"type": "string", "description": "What structurally agrees."},
+                "evidence": {"type": "array", "items": {"type": "string"},
+                             "description": "Canonical rec_ ids supporting the join."},
             },
         },
     },
@@ -206,15 +213,42 @@ class HermesMemoryProvider(_MemoryProvider):
         if tool_name == "memory_remember":
             return self._remember(args)
         if tool_name == "memory_identity_candidate":
-            # Candidates only. Confirmation is owner-only and not reachable here.
-            return {
-                "ok": True,
-                "queued_for_owner_review": True,
-                "note": "A candidate is not an identity. Owner confirmation is required.",
-            }
+            return self._identity_candidate(args)
         if tool_name == "memory_forget_request":
             return self._forget_request(args)
         raise ValueError(f"unsupported tool {tool_name!r}")
+
+    def _identity_candidate(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Queue a proposal. Confirmation is owner-only and unreachable here."""
+        from hermes_memory.storage.identity import IdentityStore
+
+        account_a = str(args.get("account_a", "")).strip()
+        account_b = str(args.get("account_b", "")).strip()
+        if not account_a or not account_b:
+            raise ValueError("account_a and account_b must not be empty")
+        evidence = args.get("evidence") or []
+        if not isinstance(evidence, list) or not evidence:
+            raise ValueError("evidence must be a nonempty list of canonical record ids")
+        with self._open_store() as store:
+            identity = IdentityStore(store, owner_principal=self._settings.owner_principal)
+            first = identity.account(_namespace_of(account_a), account_a)
+            second = identity.account(_namespace_of(account_b), account_b)
+            outcome = identity.propose(
+                account_a=first, account_b=second,
+                rule=str(args.get("rule", "")).strip(),
+                basis=str(args.get("basis", "")).strip(),
+                evidence=[str(item) for item in evidence],
+                proposed_by=f"agent:{self._session_id or 'unassigned'}",
+                proposed_kind="agent",
+            )
+            return {
+                "ok": True,
+                "queued_for_owner_review": True,
+                "candidate_id": outcome["candidate_id"],
+                "state": outcome["state"],
+                "note": ("A candidate is not an identity. Only the owner principal can confirm "
+                         "it, and an agent credential cannot reach that call."),
+            }
 
     def _forget_request(self, args: dict[str, Any]) -> dict[str, Any]:
         """Open a preview intent. The agent's own credential cannot close it.
@@ -451,6 +485,15 @@ def _utc_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _namespace_of(value: str) -> str:
+    """Classify an account string. Guessing a namespace would merge account kinds."""
+    if "@" in value:
+        return "email"
+    if value.startswith("+") and any(char.isdigit() for char in value):
+        return "phone"
+    return "handle"
 
 
 def post_setup(hermes_home: str, config: dict[str, Any]) -> None:

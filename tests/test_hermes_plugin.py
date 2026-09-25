@@ -156,12 +156,39 @@ def test_unknown_tool_is_an_error_result_not_an_exception(provider):
 
 
 def test_identity_candidate_tool_cannot_confirm(provider):
+    recorded = json.loads(provider.handle_tool_call(
+        "memory_remember", {"content": "Priya and +41555123456 were both on the same thread."}))
     payload = json.loads(provider.handle_tool_call("memory_identity_candidate", {
-        "account_a": "a@example.com", "account_b": "+41555123456",
-        "basis": "same thread participants"}))
+        "account_a": "priya@example.com", "account_b": "+41555123456",
+        "rule": "email-thread-participant",
+        "basis": "both appeared as participants of thread 4f2a",
+        "evidence": [recorded["id"]]}))
     assert payload["ok"] is True
     assert payload["queued_for_owner_review"] is True
-    assert "confirmed" not in json.dumps(payload).replace("cannot confirm", "")
+    assert payload["state"] == "pending"
+    assert payload["candidate_id"].startswith("cand_")
+    assert "confirmed" not in json.dumps(payload).replace("cannot reach", "")
+
+
+def test_identity_candidate_refuses_a_rule_that_is_not_structural(provider):
+    """A name similarity is not evidence, and the tool must say so."""
+    recorded = json.loads(provider.handle_tool_call(
+        "memory_remember", {"content": "Two people named Jordan."}))
+    for rule in ("display-name-match", "model-suggested", "co-occurrence", ""):
+        payload = json.loads(provider.handle_tool_call("memory_identity_candidate", {
+            "account_a": "jordan@a.com", "account_b": "jordan@b.com",
+            "rule": rule, "basis": "same first name", "evidence": [recorded["id"]]}))
+        assert payload["ok"] is False, rule
+        assert "identity" in payload["error"].lower() or "rule" in payload["error"].lower()
+
+
+def test_identity_candidate_needs_retrievable_evidence(provider):
+    payload = json.loads(provider.handle_tool_call("memory_identity_candidate", {
+        "account_a": "a@example.com", "account_b": "+415551234",
+        "rule": "phone-e164-equal", "basis": "same number",
+        "evidence": ["rec_" + "0" * 32]}))
+    assert payload["ok"] is False
+    assert "live evidence" in payload["error"]
 
 
 def test_forget_request_does_not_erase(provider):

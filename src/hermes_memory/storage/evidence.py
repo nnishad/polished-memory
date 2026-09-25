@@ -212,12 +212,15 @@ class EvidenceStore:
         return Evidence.from_row(row)
 
     def _visible(self, record_pk: str) -> bool:
-        if self.db.execute("SELECT deleted FROM records WHERE id=?", (record_pk,)).fetchone()[0]:
+        """An unknown id is not visible. It is also not an error: callers legitimately
+        hold ids that a later erasure or a stale cursor has invalidated."""
+        row = self.db.execute("SELECT deleted FROM records WHERE id=?", (record_pk,)).fetchone()
+        if row is None or row[0]:
             return False
-        row = self.db.execute(
+        hidden = self.db.execute(
             "SELECT hidden FROM record_visibility WHERE record_id=?", (record_pk,)
         ).fetchone()
-        return row is None or not row[0]
+        return hidden is None or not hidden[0]
 
     def live_and_visible(self, record_pk: str) -> bool:
         return self._visible(record_pk)

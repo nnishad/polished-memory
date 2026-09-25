@@ -1,0 +1,482 @@
+"""C7 — identity accounts, deterministic candidates and owner-only confirmation.
+
+The authority split is the whole point: an agent may *propose*, because it can
+see a thread with two addresses in it. Only the owner may *confirm*, because a
+wrong join silently merges two people's evidence and every later retrieval
+inherits the mistake. Confirmation is therefore unreachable from any
+agent-role credential, and a proposal records the rule and evidence that
+produced it so the decision can be judged rather than trusted.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Sequence
+
+from ..ids import digest, now, timestamp
+from .evidence import EvidenceError
+
+__all__ = ["IdentityStore", "PENDING", "CONFIRMED", "REJECTED", "STALE", "RULES"]
+
+PENDING = "pending"
+CONFIRMED = "confirmed"
+REJECTED = "rejected"
+STALE = "stale"
+
+# Rules that may produce a candidate. Each is deterministic: it fires on exact
+# structural agreement, never on similarity. A rule absent from this table
+# cannot propose anything, which is how "a model suggested these are the same
+# person" is kept out of canonical identity.
+RULES = {
+    "email-thread-participant": "1",
+    "email-normalized-equal": "1",
+    "phone-e164-equal": "1",
+    "explicit-alias-declared": "1",
+    "source-account-self": "1",
+}
+
+# Explicitly refused: these look like evidence and are not.
+_REFUSED_RULES = {
+    "display-name-match": "a shared display name is not a shared identity",
+    "co-occurrence": "appearing together is not being the same person",
+    "model-suggested": "a model may describe an association; it may not persist one",
+    "fuzzy-name": "name similarity is not structural agreement",
+}
+
+_EMAIL = re.compile(r"^(?P<local>[^@]+)@(?P<domain>[^@]+)$")
+_PHONE_ALLOWED = re.compile(r"^[+\d][\d\s\-().]*$")
+
+
+class IdentityStore:
+    def __init__(self, store, *, owner_principal: str | None = None):
+        self.store = store
+        self.db = store.db
+        self.owner_principal = owner_principal
+
+    # -- accounts ------------------------------------------------------------
+
+    def account(self, namespace: str, identifier: str, *, label: str | None = None) -> str:
+        """Register or fetch an account. Identifiers are case- and form-faithful."""
+        namespace = _check_namespace(namespace)
+        kept, normalized = normalize_account(namespace, identifier)
+        account_id = "acct_" + digest([namespace, normalized])[:32]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "INSERT INTO identity_accounts(id, namespace, identifier, normalized, label, "
+                "state, created_at) VALUES(?,?,?,?,?, 'active', ?) "
+                "ON CONFLICT(namespace, normalized) DO UPDATE SET "
+                "label=COALESCE(excluded.label, identity_accounts.label)",
+                (account_id, namespace, kept, normalized, label, now()),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return account_id
+
+    def get_account(self, account_id: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM identity_accounts WHERE id=?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
+    # -- candidates ----------------------------------------------------------
+
+    def propose(self, *, account_a: str, account_b: str, rule: str, basis: str,
+                evidence: Sequence[str], proposed_by: str, proposed_kind: str = "agent",
+                rule_version: str | None = None) -> dict[str, Any]:
+        """Open a candidate join. Deterministic rules only; idempotent per pair."""
+        if rule in _REFUSED_RULES:
+            raise EvidenceError(f"rule {rule!r} cannot propose an identity: {_REFUSED_RULES[rule]}")
+        if rule not in RULES:
+            raise EvidenceError(
+                f"unknown identity rule {rule!r}; admissible rules are {sorted(RULES)}")
+        version = rule_version or RULES[rule]
+        if version != RULES[rule]:
+            raise EvidenceError(f"rule {rule!r} is at version {RULES[rule]}, not {version}")
+        pair = _ordered_pair(account_a, account_b)
+        if pair[0] == pair[1]:
+            raise EvidenceError("an account cannot be a candidate for itself")
+        for account_id in pair:
+            if self.get_account(account_id) is None:
+                raise EvidenceError(f"unknown account {account_id!r}")
+        if isinstance(evidence, (str, bytes)) or not isinstance(evidence, Sequence):
+            raise EvidenceError("evidence must be a list of record ids")
+        if not evidence or len(evidence) > 200:
+            raise EvidenceError("a candidate cites between 1 and 200 evidence records")
+        for record_pk in evidence:
+            if not isinstance(record_pk, str) or not record_pk.startswith("rec_"):
+                raise EvidenceError(f"evidence must be canonical record ids, got {record_pk!r}")
+            if not self.store.live_and_visible(record_pk):
+                raise EvidenceError(
+                    f"evidence record {record_pk!r} does not resolve to live evidence; a "
+                    "candidate must be supportable by something retrievable")
+        if not isinstance(basis, str) or not basis.strip() or len(basis) > 1000:
+            raise EvidenceError("basis must be nonempty text of at most 1000 characters")
+
+        candidate_id = "cand_" + digest([pair[0], pair[1], rule])[:32]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.db.execute(
+                "SELECT state FROM identity_candidates WHERE id=?", (candidate_id,)).fetchone()
+            if existing:
+                # A rejected candidate is durable: re-proposing must not quietly
+                # revive a decision the owner already made.
+                if existing["state"] in (REJECTED, CONFIRMED):
+                    self.db.execute("COMMIT")
+                    return {"candidate_id": candidate_id, "state": existing["state"],
+                            "reopened": False}
+                self.db.execute(
+                    "UPDATE identity_candidates SET basis=?, evidence=?, proposed_by=?, "
+                    "proposed_kind=?, proposed_at=? WHERE id=?",
+                    (basis, json.dumps(list(evidence), sort_keys=True), proposed_by,
+                     proposed_kind, now(), candidate_id),
+                )
+                self.db.execute("COMMIT")
+                return {"candidate_id": candidate_id, "state": PENDING, "reopened": False}
+            self.db.execute(
+                "INSERT INTO identity_candidates(id, account_a, account_b, rule, rule_version, "
+                "basis, evidence, proposed_by, proposed_kind, proposed_at, state) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (candidate_id, pair[0], pair[1], rule, version, basis,
+                 json.dumps(list(evidence), sort_keys=True), proposed_by, proposed_kind,
+                 now(), PENDING),
+            )
+            self.store._audit("identity_propose", candidate_id,
+                              {"rule": rule, "proposed_by": proposed_by,
+                               "proposed_kind": proposed_kind, "evidence": len(evidence)})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"candidate_id": candidate_id, "state": PENDING, "reopened": True,
+                "rule": rule, "rule_version": version}
+
+    def pending(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        if not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise EvidenceError("limit must be between 1 and 200")
+        rows = self.db.execute(
+            """
+            SELECT c.*, a.identifier AS identifier_a, b.identifier AS identifier_b
+            FROM identity_candidates c
+            JOIN identity_accounts a ON a.id=c.account_a
+            JOIN identity_accounts b ON b.id=c.account_b
+            WHERE c.state=? ORDER BY c.proposed_at, c.id LIMIT ?
+            """, (PENDING, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- decisions -----------------------------------------------------------
+
+    def confirm(self, *, candidate_id: str, actor: str, reason: str,
+                valid_from: str | None = None, valid_until: str | None = None) -> dict[str, Any]:
+        """Owner-only. Creates the canonical edge and refuses overlapping claims."""
+        self._require_owner(actor)
+        _check_reason(reason)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            candidate = self._candidate_or_raise(candidate_id)
+            if candidate["state"] == CONFIRMED:
+                self.db.execute("COMMIT")
+                return {"state": CONFIRMED, "edge_id": None,
+                        "note": "already confirmed; no second edge was created"}
+            if candidate["state"] == REJECTED:
+                raise EvidenceError(
+                    f"candidate {candidate_id!r} was rejected by {candidate['decided_by']!r}; "
+                    "re-proposing evidence is required before it can be confirmed")
+            if candidate["state"] == STALE:
+                raise EvidenceError(
+                    f"candidate {candidate_id!r} lost its supporting evidence; re-propose it")
+            self._refuse_conflicting(candidate["account_a"], candidate["account_b"],
+                                    valid_from, valid_until)
+            start = timestamp(valid_from) if valid_from else None
+            end = timestamp(valid_until) if valid_until else None
+            if start and end and end < start:
+                raise EvidenceError("valid_until precedes valid_from")
+            edge_id = "iedge_" + digest([candidate_id, start, end])[:32]
+            self.db.execute(
+                "INSERT INTO identity_edges(id, account_a, account_b, candidate_id, valid_from, "
+                "valid_until, state, confirmed_by, confirmed_at) VALUES(?,?,?,?,?,?,'active',?,?)",
+                (edge_id, candidate["account_a"], candidate["account_b"], candidate_id,
+                 start, end, actor, now()),
+            )
+            self.db.execute(
+                "UPDATE identity_candidates SET state=?, decided_by=?, decided_at=?, "
+                "decision_reason=? WHERE id=?",
+                (CONFIRMED, actor, now(), reason, candidate_id),
+            )
+            self.store._audit("identity_confirm", edge_id,
+                              {"actor": actor, "candidate": candidate_id})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"state": CONFIRMED, "edge_id": edge_id}
+
+    def reject(self, *, candidate_id: str, actor: str, reason: str) -> dict[str, Any]:
+        """Owner-only, and durable: a rejection survives later re-proposals."""
+        self._require_owner(actor)
+        _check_reason(reason)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            candidate = self._candidate_or_raise(candidate_id)
+            if candidate["state"] == CONFIRMED:
+                raise EvidenceError(
+                    "a confirmed identity cannot be rejected; revoke the edge instead, so the "
+                    "record shows it was once believed")
+            self.db.execute(
+                "UPDATE identity_candidates SET state=?, decided_by=?, decided_at=?, "
+                "decision_reason=? WHERE id=?",
+                (REJECTED, actor, now(), reason, candidate_id),
+            )
+            self.store._audit("identity_reject", candidate_id, {"actor": actor})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"state": REJECTED, "candidate_id": candidate_id}
+
+    def revoke(self, *, edge_id: str, actor: str, reason: str) -> dict[str, Any]:
+        self._require_owner(actor)
+        _check_reason(reason)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            edge = self.db.execute(
+                "SELECT * FROM identity_edges WHERE id=?", (edge_id,)).fetchone()
+            if edge is None:
+                raise EvidenceError(f"unknown identity edge {edge_id!r}")
+            if edge["state"] != "active":
+                self.db.execute("COMMIT")
+                return {"state": edge["state"], "note": "already revoked"}
+            self.db.execute(
+                "UPDATE identity_edges SET state='revoked', revoked_at=?, revoked_by=?, "
+                "revocation_reason=? WHERE id=?",
+                (now(), actor, reason, edge_id),
+            )
+            self.store._audit("identity_revoke", edge_id, {"actor": actor})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"state": "revoked", "edge_id": edge_id}
+
+    def _require_owner(self, actor: str) -> None:
+        if self.owner_principal is None:
+            raise EvidenceError(
+                "no owner principal is configured, so identity cannot be confirmed or "
+                "revoked; set HERMES_MEMORY_OWNER_PRINCIPAL")
+        if actor != self.owner_principal:
+            raise EvidenceError(
+                f"identity decisions require the owner principal, not {actor!r}")
+
+    def _candidate_or_raise(self, candidate_id: str):
+        row = self.db.execute(
+            "SELECT * FROM identity_candidates WHERE id=?", (candidate_id,)).fetchone()
+        if row is None:
+            raise EvidenceError(f"unknown candidate {candidate_id!r}")
+        return row
+
+    def _refuse_conflicting(self, account_a: str, account_b: str,
+                            valid_from: str | None, valid_until: str | None) -> None:
+        """Refuse a confirmation that contradicts a decision the owner already made.
+
+        Merging groups is normal — that is what transitive identity means. What
+        is not acceptable is silently uniting two accounts the owner explicitly
+        declared to be different people, or stacking a second active edge over
+        the same pair for the same interval.
+        """
+        duplicate = self.db.execute(
+            "SELECT id FROM identity_edges WHERE state='active' "
+            "AND ((account_a=? AND account_b=?) OR (account_a=? AND account_b=?))",
+            (account_a, account_b, account_b, account_a)).fetchone()
+        if duplicate and _intervals_overlap(
+                *(self.db.execute("SELECT valid_from, valid_until FROM identity_edges WHERE id=?",
+                                  (duplicate["id"],)).fetchone()), valid_from, valid_until):
+            raise EvidenceError(
+                f"an active edge already links this pair over an overlapping interval "
+                f"({duplicate['id']}); revoke it before confirming another")
+
+        group_a, group_b = self.group(account_a), self.group(account_b)
+        placeholders_a = ",".join("?" * len(group_a))
+        placeholders_b = ",".join("?" * len(group_b))
+        rejected = self.db.execute(
+            f"SELECT account_a, account_b FROM identity_candidates WHERE state=? "
+            f"AND ((account_a IN ({placeholders_a}) AND account_b IN ({placeholders_b})) "
+            f"OR (account_a IN ({placeholders_b}) AND account_b IN ({placeholders_a})))",
+            [REJECTED] + group_a + group_b + group_b + group_a).fetchone()
+        if rejected:
+            raise EvidenceError(
+                "the owner already rejected a join between these two identities; confirming "
+                "this edge would merge them anyway, so that rejection must be revisited first")
+
+    # -- queries -------------------------------------------------------------
+
+    def same_person(self, account_a: str, account_b: str, *, at: str | None = None) -> bool:
+        """Confirmed, active, time-valid edges only. Nothing else joins accounts."""
+        if account_a == account_b:
+            return True
+        seen = {account_a}
+        frontier = [account_a]
+        while frontier:
+            placeholders = ",".join("?" * len(frontier))
+            rows = self.db.execute(
+                f"SELECT account_a, account_b, valid_from, valid_until FROM identity_edges "
+                f"WHERE state='active' AND (account_a IN ({placeholders}) "
+                f"OR account_b IN ({placeholders}))",
+                frontier + frontier).fetchall()
+            nxt = []
+            for row in rows:
+                if not _interval_contains(row["valid_from"], row["valid_until"], at):
+                    continue
+                for candidate in (row["account_a"], row["account_b"]):
+                    if candidate not in seen:
+                        seen.add(candidate)
+                        nxt.append(candidate)
+            frontier = nxt
+        return account_b in seen
+
+    def group(self, account_id: str) -> list[str]:
+        seen = {account_id}
+        frontier = [account_id]
+        while frontier:
+            placeholders = ",".join("?" * len(frontier))
+            rows = self.db.execute(
+                f"SELECT account_a, account_b FROM identity_edges WHERE state='active' "
+                f"AND (account_a IN ({placeholders}) OR account_b IN ({placeholders}))",
+                frontier + frontier).fetchall()
+            frontier = []
+            for row in rows:
+                for candidate in (row["account_a"], row["account_b"]):
+                    if candidate not in seen:
+                        seen.add(candidate)
+                        frontier.append(candidate)
+        return sorted(seen)
+
+    def invalidate_stale(self) -> dict[str, Any]:
+        """Drop candidates whose cited evidence has been forgotten or hidden.
+
+        An edge confirmed on evidence that no longer exists is a claim nobody
+        can re-check, so confirmed edges are reported for owner review rather
+        than silently revoked.
+        """
+        rows = self.db.execute(
+            "SELECT id, evidence, state FROM identity_candidates WHERE state IN (?,?)",
+            (PENDING, CONFIRMED)).fetchall()
+        stale, needs_review = [], []
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for row in rows:
+                cited = json.loads(row["evidence"])
+                alive = [rid for rid in cited
+                         if self.store.live_and_visible(rid)]
+                if alive:
+                    continue
+                if row["state"] == PENDING:
+                    self.db.execute(
+                        "UPDATE identity_candidates SET state=?, decided_at=?, "
+                        "decision_reason='all cited evidence is gone' WHERE id=?",
+                        (STALE, now(), row["id"]))
+                    stale.append(row["id"])
+                else:
+                    needs_review.append(row["id"])
+            self.store._audit("identity_invalidate", "identity_candidates",
+                              {"stale": len(stale), "needs_review": len(needs_review)})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"stale": stale, "confirmed_needing_review": needs_review}
+
+    # -- topics --------------------------------------------------------------
+
+    def link_topic(self, *, account_id: str, topic: str, kind: str = "structural",
+                   source_record_id: str | None = None) -> None:
+        """Structural topics may feed rules; labels may only retrieve candidates."""
+        if kind not in {"structural", "label"}:
+            raise EvidenceError("topic kind must be 'structural' or 'label'")
+        if not isinstance(topic, str) or not topic.strip() or len(topic) > 500:
+            raise EvidenceError("topic must be nonempty text of at most 500 characters")
+        if self.get_account(account_id) is None:
+            raise EvidenceError(f"unknown account {account_id!r}")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "INSERT INTO topic_links(id, account_id, topic, kind, source_record_id, "
+                "observed_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(account_id, topic, kind) DO UPDATE SET "
+                "source_record_id=COALESCE(excluded.source_record_id, topic_links.source_record_id), "
+                "observed_at=excluded.observed_at",
+                ("topic_" + digest([account_id, topic, kind])[:32], account_id, topic.strip(),
+                 kind, source_record_id, now()),
+            )
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    def accounts_for_topic(self, topic: str, *, kind: str = "structural") -> list[str]:
+        rows = self.db.execute(
+            "SELECT account_id FROM topic_links WHERE topic=? AND kind=? ORDER BY account_id",
+            (topic, kind)).fetchall()
+        return [row["account_id"] for row in rows]
+
+
+def normalize_account(namespace: str, identifier: str) -> tuple[str, str]:
+    """Return (identifier as written, normalized form used for matching).
+
+    Email local parts keep their case because some providers treat it as
+    significant, while the domain is folded — the reverse of what naive
+    lowercasing does. Phone numbers keep an explicit international form.
+    """
+    if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 500:
+        raise EvidenceError("identifier must be nonempty text of at most 500 characters")
+    value = identifier.strip()
+    if namespace == "email":
+        match = _EMAIL.match(value)
+        if not match:
+            raise EvidenceError(f"{value!r} is not an email address")
+        return value, f"{match['local']}@{match['domain'].lower()}"
+    if namespace == "phone":
+        if not _PHONE_ALLOWED.match(value):
+            raise EvidenceError(f"{value!r} is not a phone number")
+        digits = re.sub(r"[\s\-().]", "", value)
+        if not digits.startswith("+"):
+            raise EvidenceError(
+                f"phone {value!r} has no explicit international prefix; guessing a country "
+                "code would merge accounts across countries")
+        return value, digits
+    return value, value.lower()
+
+
+def _check_namespace(value: str) -> str:
+    if value not in {"email", "phone", "handle", "profile", "source_account"}:
+        raise EvidenceError(
+            f"unknown identity namespace {value!r}; admissible are email, phone, handle, "
+            "profile, source_account")
+    return value
+
+
+def _check_reason(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 1000:
+        raise EvidenceError("reason must be nonempty text of at most 1000 characters")
+    return value
+
+
+def _ordered_pair(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
+
+
+def _intervals_overlap(a_from, a_until, b_from, b_until) -> bool:
+    """Open-ended intervals are unbounded, so they overlap everything."""
+    if a_from and b_until and a_from > b_until:
+        return False
+    if b_from and a_until and b_from > a_until:
+        return False
+    return True
+
+
+def _interval_contains(start, end, at) -> bool:
+    if start and at and at < start:
+        return False
+    if end and at and at > end:
+        return False
+    return True

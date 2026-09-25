@@ -203,6 +203,73 @@ ERASURE_STATEMENTS: tuple[str, ...] = (
 )
 
 
+IDENTITY_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE identity_accounts(
+        id TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        identifier TEXT NOT NULL,
+        normalized TEXT NOT NULL,
+        label TEXT,
+        state TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        UNIQUE(namespace, identifier)
+    )""",
+    "CREATE UNIQUE INDEX identity_accounts_norm ON identity_accounts(namespace, normalized)",
+    """
+    -- A proposal is not an identity. It records the deterministic rule that
+    -- produced it and the evidence, so an owner can judge it later.
+    CREATE TABLE identity_candidates(
+        id TEXT PRIMARY KEY,
+        account_a TEXT NOT NULL REFERENCES identity_accounts(id),
+        account_b TEXT NOT NULL REFERENCES identity_accounts(id),
+        rule TEXT NOT NULL,
+        rule_version TEXT NOT NULL,
+        basis TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        proposed_by TEXT NOT NULL,
+        proposed_kind TEXT NOT NULL,
+        proposed_at TEXT NOT NULL,
+        state TEXT NOT NULL,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_reason TEXT,
+        UNIQUE(account_a, account_b)
+    )""",
+    "CREATE INDEX identity_candidates_state ON identity_candidates(state, proposed_at)",
+    """
+    CREATE TABLE identity_edges(
+        id TEXT PRIMARY KEY,
+        account_a TEXT NOT NULL REFERENCES identity_accounts(id),
+        account_b TEXT NOT NULL REFERENCES identity_accounts(id),
+        candidate_id TEXT NOT NULL REFERENCES identity_candidates(id),
+        valid_from TEXT,
+        valid_until TEXT,
+        state TEXT NOT NULL,
+        confirmed_by TEXT NOT NULL,
+        confirmed_at TEXT NOT NULL,
+        revoked_at TEXT,
+        revoked_by TEXT,
+        revocation_reason TEXT,
+        CHECK(valid_until IS NULL OR valid_from IS NOT NULL)
+    )""",
+    "CREATE INDEX identity_edges_pair ON identity_edges(account_a, account_b, state)",
+    """
+    -- Structural topics and model labels live together but are never
+    -- interchangeable: kind distinguishes them and only structural rows may
+    -- feed a deterministic rule.
+    CREATE TABLE topic_links(
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES identity_accounts(id),
+        topic TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('structural', 'label')),
+        source_record_id TEXT,
+        observed_at TEXT NOT NULL,
+        UNIQUE(account_id, topic, kind)
+    )""",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -214,6 +281,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0001_evidence", EVIDENCE_STATEMENTS),
     Migration("0002_sync", SYNC_STATEMENTS),
     Migration("0003_erasure", ERASURE_STATEMENTS),
+    Migration("0004_identity", IDENTITY_STATEMENTS),
 )
 
 

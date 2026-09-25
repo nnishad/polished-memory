@@ -191,3 +191,9 @@ def test_store_opens_and_writes_with_no_backend_or_network(tmp_path: Path):
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "rec_"
+
+
+def test_an_unknown_id_is_not_visible_rather_than_an_error(store):
+    """Callers legitimately hold ids an erasure or a stale cursor invalidated."""
+    assert store.live_and_visible("rec_" + "0" * 32) is False
+    assert store.get("rec_" + "0" * 32) is None
