@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
@@ -357,3 +358,44 @@ def test_shutdown_checkpoints_and_closes(provider):
     assert provider._spool is None
     # A late turn after shutdown must not raise inside the host's drain path.
     provider.sync_turn("x", "y", session_id="s", messages=[])
+
+
+HERMES_SOURCE = os.environ.get("HERMES_SOURCE")
+requires_hermes = pytest.mark.skipif(
+    not HERMES_SOURCE,
+    reason="set HERMES_SOURCE to a Hermes checkout to verify against the real host",
+)
+
+
+@requires_hermes
+def test_provider_satisfies_the_real_hermes_abstract_base_class():
+    """The rest of this suite runs against a stub base, so the ABC contract is
+    only genuinely proven against a real Hermes checkout.
+
+    The plugin must be imported *with* Hermes already on the path: the provider
+    binds its base class at import time, so reusing a module loaded against the
+    stub would compare two unrelated MemoryProvider classes.
+    """
+    import sys
+
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith("hm")}
+    for name in saved:
+        del sys.modules[name]
+    sys.path.insert(0, HERMES_SOURCE)
+    try:
+        from agent.memory_provider import MemoryProvider
+
+        fresh = load_plugin("hm_real_contract_check")
+        instance = fresh.HermesMemoryProvider()
+        assert isinstance(instance, MemoryProvider)
+        assert not fresh.HermesMemoryProvider.__abstractmethods__, (
+            "the host added a required member the provider does not implement")
+        for hook in ("sync_turn", "prefetch", "recall_status", "on_pre_compress",
+                     "on_memory_write", "backup_paths", "handle_tool_call",
+                     "get_config_schema", "save_config", "unavailable_reason",
+                     "system_prompt_block"):
+            assert hasattr(MemoryProvider, hook), hook
+    finally:
+        sys.path.remove(HERMES_SOURCE)
+        sys.modules.pop("hm_real_contract_check", None)
+        sys.modules.update(saved)
