@@ -465,12 +465,13 @@ def test_a_canary_that_cannot_be_found_is_a_failed_installation(installation, tm
         approve(settings, home, environ, runner=Heremes(home / "config.yaml"), ref=REF)
 
 
-def test_a_backend_unit_names_only_an_executable_that_was_staged(tmp_path, monkeypatch):
-    """A worker unit pointing at a binary nobody installed fails months later, quietly.
+def test_a_unit_is_written_only_for_an_executable_that_was_staged(tmp_path, monkeypatch):
+    """Every program the owned units ExecStart is checked, read off the units themselves.
 
-    The units ExecStart two programs from the backend environment. Checking only the API
-    would let the transaction write a unit whose start always fails on a machine the
-    owner believed was working.
+    The worker no longer starts the distribution's own script — our launcher has to, so the
+    wrapper can record what is about to run. That makes the backend environment's
+    interpreter an executable this installation depends on, and a list hard-coded in the
+    staging step is a check a template edit can walk away from.
     """
     home = tmp_path / "instance"
     home.mkdir()
@@ -484,12 +485,28 @@ def test_a_backend_unit_names_only_an_executable_that_was_staged(tmp_path, monke
     arguments = {"hermes_home": activity(tmp_path),
                  "environ": {"HERMES_MEMORY_RELEASE": str(release)}}
     proposal = plan(settings, **arguments)
-    assert any("hindsight-worker is not staged" in line for line in proposal["blocked"])
+    assert any("hindsight/bin/python is not staged" in line
+               for line in proposal["blocked"])
     assert not any("hindsight-api is not staged" in line for line in proposal["blocked"])
-    (release / "hindsight" / "bin" / "hindsight-worker").write_text("#!/bin/sh\n",
-                                                                   encoding="utf-8")
+    (release / "hindsight" / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
     staged = plan(settings, **arguments)
-    assert not any("hindsight-worker" in line for line in staged["blocked"])
+    assert not any("is not staged" in line for line in staged["blocked"]), staged["blocked"]
+
+
+def test_a_capture_only_installation_is_checked_only_for_its_own_unit(tmp_path, monkeypatch):
+    """No backend route means no backend processes to start, so none to demand either."""
+    home = tmp_path / "instance"
+    home.mkdir()
+    release = host(home)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.delenv("HERMES_MEMORY_RELEASE", raising=False)
+    arguments = {"hermes_home": activity(tmp_path),
+                 "environ": {"HERMES_MEMORY_RELEASE": str(release)}}
+    assert not any("is not staged" in line
+                   for line in plan(load_settings(), **arguments)["blocked"])
+    (release / "bin" / "hermes-memory").unlink()
+    gone = plan(load_settings(), **arguments)
+    assert any("bin/hermes-memory is not staged" in line for line in gone["blocked"])
 
 
 def test_an_unstaged_release_stops_before_anything_is_written(installation, tmp_path,

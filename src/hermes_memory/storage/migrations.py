@@ -17,7 +17,7 @@ from typing import Callable, Sequence
 
 __all__ = ["Migration", "MIGRATIONS", "MIGRATION_LEDGER", "apply_migrations",
            "current_version", "connect", "GATE_STATEMENTS", "CONTROLS_STATEMENTS",
-           "BUDGET_STATEMENTS"]
+           "BUDGET_STATEMENTS", "OPERATION_STATEMENTS"]
 
 MIGRATION_LEDGER = "CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
 
@@ -97,6 +97,35 @@ GATE_STATEMENTS: tuple[str, ...] = (
         detail TEXT NOT NULL
     )""",
     "CREATE INDEX gate_ledger_reservation ON gate_ledger(reservation_id)",
+)
+
+# §8.1.2: what the backend's own worker was doing. The native poller hands the executor a
+# task payload carrying the operation it claimed, so the identity is recorded *before*
+# anything runs and a retry can be charged to the same operation across restarts rather
+# than being counted as a second piece of work. This belongs in the instance ledger because
+# the thing being attributed is a claim on one machine's models.
+OPERATION_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE backend_operations(
+        operation_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        bank_id TEXT NOT NULL,
+        resource TEXT,
+        budget_scope TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('recorded', 'running', 'finished',
+                                            'uncertain', 'refused', 'cancelled')),
+        cancellation TEXT NOT NULL DEFAULT 'none'
+            CHECK(cancellation IN ('none', 'requested', 'confirmed')),
+        attempts INTEGER NOT NULL DEFAULT 1,
+        folded INTEGER NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        error TEXT
+    )""",
+    "CREATE INDEX backend_operations_state ON backend_operations(state, updated_at)",
+    "CREATE INDEX backend_operations_bank ON backend_operations(bank_id, state)",
 )
 
 

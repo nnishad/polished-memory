@@ -20,13 +20,14 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ..ids import content_digest, digest, now
 from .profiles import InstallationError
 
 __all__ = ["UNITS", "RUNTIME_UNIT", "BACKEND_UNIT", "WORKER_UNIT", "Layout", "layout",
-           "render", "plan", "apply", "Services", "unit_directory", "wanted_units"]
+           "render", "executables", "plan", "apply", "Services",
+           "unit_directory", "wanted_units"]
 
 # Kebab-case, the host convention, and the only names these functions will ever pass to
 # systemctl. A unit outside this set is somebody else's service.
@@ -165,6 +166,37 @@ def render(settings, *, environ: dict[str, str] | None = None,
         _check_locations(name, text, placed)
         rendered[name] = text
     return rendered
+
+
+# The prefixes systemd strips before it looks for the program. ``@`` is deliberately not
+# one of them: a line starting that way does not name the executable with a path this
+# installation can point at, and guessing which path it meant would check the wrong file.
+_EXEC_PREFIXES = "-+!:"
+
+
+def executables(rendered: Mapping[str, str]) -> list[Path]:
+    """The programs the rendered units actually start, in the order they appear.
+
+    A unit whose ExecStart is not there fails as a start error — quietly, on a machine its
+    owner believes is working. Deriving the list from the units rather than naming it in
+    the staging step means a template edit cannot leave the check behind.
+    """
+    found: list[Path] = []
+    for text in rendered.values():
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("ExecStart="):
+                continue
+            argv = stripped[len("ExecStart="):].split()
+            program = argv[0] if argv else ""
+            while program and program[0] in _EXEC_PREFIXES:
+                # The prefixes ride in front of the path, not as their own word.
+                program = program[1:]
+            # A relative program is resolved out of the service's own PATH, which this
+            # installation does not own; an absolute one has to be in the release.
+            if program.startswith("/") and Path(program) not in found:
+                found.append(Path(program))
+    return found
 
 
 def _check_locations(name: str, text: str, placed: Layout) -> None:

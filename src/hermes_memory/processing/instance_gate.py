@@ -18,23 +18,29 @@ profiles genuinely have in common.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from ..ids import now
 from ..storage.migrations import (BUDGET_STATEMENTS, CONTROLS_STATEMENTS,
-                                  GATE_STATEMENTS, connect)
+                                  GATE_STATEMENTS, OPERATION_STATEMENTS, connect)
 from .resource_gate import ResourceGate
 
-__all__ = ["GATE_FILENAME", "GATE_SCHEMA_VERSION", "GateStore", "GateError",
+__all__ = ["GATE_FILENAME", "GATE_SCHEMA_VERSION", "SCHEMA_STEPS", "GateStore", "GateError",
            "gate_path", "instance_gate", "status_gate"]
 
 GATE_FILENAME = "gate.db"
-GATE_SCHEMA_VERSION = 1
 # The whole of it: reservations, their accounting, the measured consumption the gate
-# charges when it releases a slot, and the hold an operator puts on inference.
+# charges when it releases a slot, the hold an operator puts on inference, and what the
+# backend's own worker was running (§8.1.2).
 GATE_SCHEMA = (*GATE_STATEMENTS, *CONTROLS_STATEMENTS, *BUDGET_STATEMENTS)
+# Statements to run when the ledger is found at a given version. A schema is not replaced
+# wholesale on upgrade: an existing installation's reservations must survive the arrival of
+# a new table, so each step adds only what is missing.
+SCHEMA_STEPS: dict[int, tuple[str, ...]] = {0: GATE_SCHEMA, 1: OPERATION_STATEMENTS}
+GATE_SCHEMA_VERSION = max(SCHEMA_STEPS) + 1
 
 
 class GateError(sqlite3.Error):
@@ -81,11 +87,19 @@ class GateStore:
                 f"the gate database at {self.path} is at schema {version} and this build "
                 f"understands {GATE_SCHEMA_VERSION}; upgrade the framework rather than "
                 "reading a newer admission ledger with an older one")
-        if version == GATE_SCHEMA_VERSION:
+        statements = [statement for step in range(version, GATE_SCHEMA_VERSION)
+                      for statement in SCHEMA_STEPS[step]]
+        if not statements:
             return
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            for statement in GATE_SCHEMA:
+            for statement in statements:
+                if _already_present(self.db, statement):
+                    # A step that ran and then lost the process leaves the ledger at the
+                    # old version with some of the new objects in it. Re-running it must
+                    # finish the job, not fail on the first table it already made, or a
+                    # torn upgrade would take the machine's admission out permanently.
+                    continue
                 self.db.execute(statement)
             self.db.execute(f"PRAGMA user_version={GATE_SCHEMA_VERSION}")
         except BaseException:
@@ -161,3 +175,22 @@ def status_gate(settings) -> ResourceGate | None:
         return instance_gate(settings, create=False)
     except GateError:
         return None
+
+
+_CREATED = re.compile(r"^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+                      r"[\"`']?([A-Za-z0-9_]+)", re.IGNORECASE)
+
+
+def _already_present(db, statement: str) -> bool:
+    """Whether this DDL's own object is already in the file.
+
+    Only names are compared, and only for CREATE statements: every object in
+    :data:`GATE_SCHEMA` lives in the gate database's single namespace, so there is no
+    schema-qualified edge case to get wrong here.
+    """
+    match = _CREATED.match(statement)
+    if not match:
+        return False
+    kind, name = match.groups()
+    return bool(db.execute(f"SELECT 1 FROM sqlite_master WHERE type=? AND name=?",
+                           (kind.lower(), name)).fetchone())

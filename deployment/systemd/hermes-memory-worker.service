@@ -9,7 +9,12 @@ Type=simple
 Environment=HERMES_MEMORY_RELEASE=@RELEASE@
 Environment=HERMES_MEMORY_HOME=@INSTANCE_HOME@
 WorkingDirectory=@HINDSIGHT_DATA_DIR@
-ExecStart=@RELEASE@/hindsight/bin/hindsight-worker
+# Our launcher, not the distribution's own script: §8.1.2 needs the operation
+# identity, the bank it belongs to and the cancellation state written down before
+# the engine is asked to run anything, and that wrapper has to be in the process.
+# hindsight_api is imported from this environment, which is why the framework
+# package carries no dependencies of its own.
+ExecStart=@RELEASE@/hindsight/bin/python -m hermes_memory.backend.worker_launcher
 
 Restart=on-failure
 RestartSec=15
@@ -19,7 +24,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=@HINDSIGHT_DATA_DIR@ @PG0_DIR@
+# The instance home holds the admission ledger this worker writes its operation
+# records into; without it the wrapper would fail on its first write under
+# ProtectSystem=strict.
+ReadWritePaths=@INSTANCE_HOME@ @HINDSIGHT_DATA_DIR@ @PG0_DIR@
 EnvironmentFile=@HINDSIGHT_ENV@
 Environment=PG0_HOME=@PG0_DIR@
 Environment=PYTHONDONTWRITEBYTECODE=1

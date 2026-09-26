@@ -215,28 +215,32 @@ def _plan_step(ctx: Context, *, apply: bool) -> dict[str, Any]:
 def _stage(ctx: Context, *, apply: bool) -> dict[str, Any]:
     """Prove the release is laid out and importable. Nothing here installs anything.
 
-    §10.3 makes the environments a packaging artefact; this is the check that one
-    arrived. Fetching a package on the way past would answer a question nobody asked, so
-    a missing release is reported with the path it was expected at.
+    §10.3 makes the environments a packaging artefact; this is the check that one arrived.
+    Fetching a package on the way past would answer a question nobody asked, so a missing
+    release is reported with the path it was expected at. The executables are read out of
+    the units this installation would write, because a unit naming a binary that is not
+    there starts as a failure months later rather than as one now.
     """
+    from .services import executables, render
+
     release = Path((ctx.environ or {}).get("HERMES_MEMORY_RELEASE")
                    or Path(ctx.settings.home) / "runtime" / "current")
     backend_configured = bool(ctx.settings.hindsight_url)
-    wanted = [release / "bin" / "hermes-memory"]
-    if backend_configured:
-        # Both executables the owned units ExecStart. Checking only the API would write a
-        # worker unit pointing at a binary nobody staged, and the failure would surface
-        # as a start error months later on a machine that was expected to be quiet.
-        wanted += [release / "hindsight" / "bin" / name
-                   for name in ("hindsight-api", "hindsight-worker")]
+    blocking: list[str] = []
+    try:
+        wanted = executables(render(ctx.settings, environ=ctx.environ))
+    except InstallationError as error:
+        wanted = []
+        blocking.append(str(error))
     missing = [str(path) for path in wanted if not path.is_file()]
     importable = {"hermes_memory": _import_util.find_spec("hermes_memory") is not None,
                   "hindsight_client": _import_util.find_spec("hindsight_client") is not None}
     actions = [f"release {release}: " + ", ".join(
         f"{name} {'importable' if found else 'absent'}"
-        for name, found in sorted(importable.items()))]
-    blocking = [f"{path} is not staged; unpack the pinned release there or point "
-                "HERMES_MEMORY_RELEASE at it" for path in missing]
+        for name, found in sorted(importable.items())),
+        "units would start: " + (", ".join(str(path) for path in wanted) or "nothing rendered")]
+    blocking += [f"{path} is not staged; unpack the pinned release there or point "
+                 "HERMES_MEMORY_RELEASE at it" for path in missing]
     if backend_configured and not importable["hindsight_client"]:
         blocking.append("a backend route is configured and hindsight_client is not "
                         "importable; install the backend extra rather than the metapackage")

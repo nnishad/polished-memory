@@ -19,8 +19,9 @@ from hermes_memory.config import load_settings
 from hermes_memory.install import services
 from hermes_memory.install.profiles import InstallationError
 from hermes_memory.install.services import (BACKEND_UNIT, RUNTIME_UNIT, UNITS,
-                                            WORKER_UNIT, Services, apply, layout, plan,
-                                            render, unit_directory, wanted_units)
+                                            WORKER_UNIT, Services, apply, executables,
+                                            layout, plan, render, unit_directory,
+                                            wanted_units)
 
 OWNER = "jugaadu"
 RELEASE = "/srv/releases/hermes-memory/0.1.0"
@@ -123,6 +124,46 @@ def test_the_release_pointer_names_the_code_and_the_home_names_the_data(instance
     assert placed.pg0_dir == settings.home / "pg0"
     without = layout(settings, environ={})
     assert without.release == settings.home / "runtime" / "current"
+
+
+def test_the_programs_named_off_the_units_are_the_ones_the_release_ships(instance):
+    """Three units, three absolute programs — and one of them is our launcher.
+
+    The staging step asks this question instead of keeping its own list, so the answer
+    has to include the worker's ``python -m`` program: a check that only looked at
+    ``ExecStart`` lines with a single word would report a staged release whose worker
+    cannot start at all.
+    """
+    _, settings = instance
+    programs = executables(render(settings, environ=environment()))
+    assert programs == [Path(RELEASE) / "bin" / "hermes-memory",
+                        Path(RELEASE) / "hindsight" / "bin" / "hindsight-api",
+                        Path(RELEASE) / "hindsight" / "bin" / "python"]
+
+
+def test_a_program_written_as_a_relative_path_is_not_one_anybody_installed(tmp_path):
+    """A unit that ExecStarts ``hindsight-api`` starts it out of systemd's own PATH.
+
+    Treating that as staged would approve a release that does not contain the binary and
+    then watch the service fail on a machine its owner believed was working.
+    """
+    programs = executables({"hermes-memory-hindsight.service":
+                            "[Service]\nExecStart=hindsight-api\n"})
+    assert programs == []
+
+
+def test_the_prefixes_systemd_strips_are_not_part_of_the_program_name():
+    """``-``/``+``/``!``/``:`` change how a program runs, not which program it is.
+
+    A prefix left on the path would be reported missing even in a perfectly staged
+    release, and the installer would refuse a machine that works.
+    """
+    programs = executables({
+        "a.service": "[Service]\nExecStart=-/srv/bin/a\n",
+        "b.service": "[Service]\nExecStart=+!/srv/bin/b arg\n",
+        "c.service": "[Service]\nExecStart=/srv/bin/a\n",
+    })
+    assert programs == [Path("/srv/bin/a"), Path("/srv/bin/b")]
 
 
 def test_the_unit_directory_is_the_owner_own_manager_config():

@@ -616,6 +616,33 @@ def test_a_gate_with_only_finished_work_is_idle_rather_than_unused(store, gate):
     assert report.evidence["held"] == []
 
 
+def test_an_operation_that_cannot_be_charged_makes_the_gate_degraded(store):
+    """Nobody's allowance paid for this one, and that is a fault, not a curiosity.
+
+    The alternative reading of a null resource is that another profile's budget covered it,
+    which is the thing §8.1.2 refuses to allow by construction.
+    """
+    from hermes_memory.backend.worker_launcher import OperationLedger
+    from hermes_memory.processing.instance_gate import instance_gate
+
+    configuration = settings()
+    with instance_gate(configuration) as gate:
+        OperationLedger(gate.store).record(
+            {"_operation_id": "op-9", "operation_type": "consolidate", "bank_id": "hermes"},
+            worker_id="worker-1", bank_id="hermes", resource=None)
+        report = StatusReporter(store, settings=configuration, gate=gate).resource_gate()
+    assert report.state == DEGRADED
+    assert report.evidence["operations"]["unattributed"] == 1
+    assert "unaccounted" in report.detail
+
+
+def test_a_gate_ledger_from_before_the_operation_table_is_reported_not_crashed(store, gate):
+    """A reading cannot upgrade the ledger it was handed, so it says the table is absent."""
+    report = StatusReporter(store, settings=settings(), gate=gate).resource_gate()
+    assert report.evidence["operations"]["ledger"] == "absent"
+    assert report.state != DEGRADED
+
+
 def test_the_gate_reports_what_it_charged_without_leaking_credentials(store, gate):
     reservation = gate.try_acquire(route="retain", holder="worker-1",
                                    resource="remote-9b", priority=1, ttl=60)

@@ -387,6 +387,27 @@ def test_an_inference_pause_is_reported_as_a_decision_in_force(store, gate):
     assert Doctor(store).gate().severity == WARN
 
 
+def test_an_operation_nobody_could_charge_points_at_the_revision_contract(store):
+    """A null resource is the launcher saying it could not read the task.
+
+    That is a different fault from a stuck device, and the remedy has to say so: the
+    operator's next command is the launcher's own check in the backend environment, not a
+    reservation that nothing is holding.
+    """
+    from hermes_memory.backend.worker_launcher import OperationLedger
+    from hermes_memory.processing.instance_gate import instance_gate
+
+    config = configured()
+    with instance_gate(config) as ledger_gate:
+        OperationLedger(ledger_gate.store).record(
+            {"_operation_id": "op-7", "operation_type": "refresh", "bank_id": "hermes"},
+            worker_id="worker-1", bank_id="hermes", resource=None)
+        finding = Doctor(store, settings=config).gate()
+    assert finding.severity == FAIL
+    assert "worker_launcher --check" in finding.remedy
+    assert finding.evidence["operations"]["unattributed"] == 1
+
+
 # -- credentials and fences --------------------------------------------------
 
 def test_a_key_in_the_record_set_is_found_and_not_echoed_back(store):

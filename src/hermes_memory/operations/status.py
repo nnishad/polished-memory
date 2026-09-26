@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
+from ..backend.worker_launcher import OperationLedger
 from ..ids import now, timestamp
 from ..processing.instance_gate import instance_gate, status_gate
 from ..processing.resource_gate import UNCERTAIN, WAITING, ResourceGate
@@ -397,22 +398,31 @@ class StatusReporter:
                                "no admission ledger exists, so nothing has been queued "
                                "against a physical model from here",
                                {"occupancy": {}, "held": [], "uncertain": 0,
-                                "waiting": 0, "blocked": [], "usage": None})
+                                "waiting": 0, "blocked": [], "usage": None,
+                                "operations": {"by_state": {}, "unattributed": 0,
+                                               "unresolved": 0}})
         held = self.gate.held()
         occupancy = {resource: dict(states)
                      for resource, states in self.gate.occupancy().items()}
         uncertain = sum(int(states.get(UNCERTAIN, 0)) for states in occupancy.values())
         waiting = sum(int(states.get(WAITING, 0)) for states in occupancy.values())
         taken = sum(sum(states.values()) for states in occupancy.values())
+        # The backend's own worker writes its operation identities into this same ledger,
+        # because the thing being attributed is a claim on one machine's models. Operations
+        # that could not be placed on a resource are an accounting fault, not a curiosity:
+        # the alternative reading is that somebody else's allowance paid for them.
+        operations = OperationLedger(self.gate.store).report()
         # A pause on a gate nobody has used yet is still somebody's decision, so it is
         # reported before the "never reserved" case rather than hidden behind it.
-        state = (DEGRADED if uncertain else
+        state = (DEGRADED if uncertain or operations["unattributed"] else
                  PAUSED if self.gate.paused else
                  OPERATIONAL if taken or self.gate.ever_used() else UNCONFIGURED)
         return StageReport(
             "resource_gate", state,
             f"{taken} slot(s) occupied, {waiting} waiting"
-            + (f", {uncertain} unresolved reservation(s)" if uncertain else ""),
+            + (f", {uncertain} unresolved reservation(s)" if uncertain else "")
+            + (f", {operations['unresolved']} backend operation(s) unaccounted"
+               if operations["unresolved"] or operations["unattributed"] else ""),
             {"occupancy": occupancy,
              "held": [{"resource": row["resource"], "route": row["route"],
                        "holder": row["holder"], "priority": int(row["priority"]),
@@ -421,6 +431,7 @@ class StatusReporter:
                       for row in held],
              "uncertain": uncertain, "waiting": waiting,
              "blocked": self.gate.blocked_resources(),
+             "operations": operations,
              "usage": self.gate.usage()})
 
     # -- supporting reads ----------------------------------------------------
