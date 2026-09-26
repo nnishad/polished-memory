@@ -168,8 +168,8 @@ def deliver_once(outbox: Any, *, policy: DeliveryPolicy, sink: Callable[[str], A
 
 def deliver_for_home(hermes_home: str | Path, *, settings: Any = None,
                      sink: Callable[[str], Any] | None = None, limit: int = 1,
-                     holder: str = "hermes-memory-delivery",
-                     out: TextIO | None = None) -> dict[str, Any]:
+                     holder: str = "hermes-memory-delivery", out: TextIO | None = None,
+                     at: float | None = None) -> dict[str, Any]:
     """Deliver this profile's own ready artifacts, through this profile's own outbox.
 
     A separate process — the owner's scheduler, or one command — reaches the same
@@ -200,7 +200,8 @@ def deliver_for_home(hermes_home: str | Path, *, settings: Any = None,
                                                    owner_principal=activity.settings.owner_principal),
                             owner_principal=activity.settings.owner_principal)
             for _ in range(limit):
-                report = deliver_once(outbox, policy=policy, sink=sink, holder=holder, out=out)
+                report = deliver_once(outbox, policy=policy, sink=sink, holder=holder,
+                                      out=out, at=at)
                 reports.append(report)
                 # Anything that did not reach the handover will not change by trying
                 # again in the same run: the queue is empty, or this one is refused.

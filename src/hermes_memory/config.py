@@ -156,6 +156,10 @@ class Settings:
     profile: str = DEFAULT_PROFILE
     bank_id: str = DEFAULT_BANK
     credential_scope: str = "profile-default"
+    # Provider-initiated delivery is off until an owner names a concrete private
+    # destination. Nothing else can authorise it, and no default is "on".
+    delivery_enabled: bool = False
+    delivery_target: str | None = None
 
     @property
     def capture_only(self) -> bool:
@@ -219,6 +223,14 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         )
 
     foreground = _deadline(get("FOREGROUND_DEADLINE_S", str(DEFAULT_FOREGROUND_DEADLINE_S)))
+    delivery_target = (get("DELIVERY_TARGET") or "").strip() or None
+    delivery_enabled = flag("DELIVERY_ENABLED")
+    if delivery_enabled and not delivery_target:
+        raise SettingError(
+            "HERMES_MEMORY_DELIVERY_ENABLED needs HERMES_MEMORY_DELIVERY_TARGET: an "
+            "approved destination is what makes delivery an owner's decision rather "
+            "than a capability the runtime has on its own"
+        )
 
     return Settings(
         home=home,
@@ -243,6 +255,8 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
             reflect=_cap(get, "REFLECT"), foreground=_cap(get, "FOREGROUND")),
         route_credentials=_credentials(values),
         gate_token=(get("GATE_TOKEN") or "").strip() or None,
+        delivery_enabled=delivery_enabled,
+        delivery_target=delivery_target,
     )
 
 

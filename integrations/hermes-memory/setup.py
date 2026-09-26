@@ -94,7 +94,16 @@ def retire(hermes_home: Any, *, actor: str, reason: str, profile: str | None = N
 
 
 def pending(hermes_home: Any, *, instance_home: Any = None) -> dict[str, Any]:
-    """Is this home enrolled? If not, the exact command that would finish setup."""
+    """Is this home enrolled? If not, the exact command that would finish setup.
+
+    A question about the ledger must not create one. An installation that has never
+    enrolled anything would otherwise acquire a ledger from a status call, and setup
+    would end up having written the state it just said it had not.
+    """
+    if not _has_ledger(instance_home):
+        return {"enrolled": False, "profile": _guess_profile(hermes_home),
+                "command": enrollment_command(hermes_home),
+                "reason": "there is no instance ledger yet, so no home is enrolled"}
     ledger = registry(instance_home)
     try:
         try:
@@ -107,6 +116,14 @@ def pending(hermes_home: Any, *, instance_home: Any = None) -> dict[str, Any]:
                 "data_dir": str(profile.data_dir), "command": None, "reason": None}
     finally:
         ledger.db.close()
+
+
+def _has_ledger(instance_home: Any) -> bool:
+    if instance_home is None:
+        from hermes_memory.config import load_settings
+
+        return (Path(load_settings().home) / "installation.db").exists()
+    return (Path(instance_home).expanduser().resolve() / "installation.db").exists()
 
 
 def report(hermes_home: Any, *, instance_home: Any = None) -> dict[str, Any]:

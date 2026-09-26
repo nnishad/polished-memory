@@ -574,10 +574,8 @@ class HermesMemoryProvider(_MemoryProvider):
         previous = self._session_id
         self._session_id = new_session_id or previous
         # Anything warmed under the previous binding answers a question that is
-        # no longer the upcoming one.
+        # no longer the upcoming one; _close_context() is where that cache lives.
         self._generation += 1
-        self._queued.pop(previous, None)
-        self._queued.pop(self._session_id, None)
         self._close_context()
         if reset:
             self._checkpoint_spool()

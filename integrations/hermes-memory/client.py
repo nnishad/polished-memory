@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from hermes_memory.config import load_settings, scoped_secret
-from hermes_memory.install.profiles import InstallationError, Profile, ProfileRegistry
+from hermes_memory.install.profiles import (STATE_FILENAME, InstallationError, Profile,
+                                            ProfileRegistry)
 
 __all__ = ["Activity", "bind", "BindingError", "unenrolled_reason"]
 
@@ -58,10 +59,6 @@ class Activity:
         return self.profile.bank_id
 
     @property
-    def credential_scope(self) -> str:
-        return self.profile.credential_scope
-
-    @property
     def data_dir(self) -> Path:
         return self.profile.data_dir
 
@@ -78,35 +75,31 @@ class Activity:
         """This profile's credential, or None. Never another profile's."""
         return scoped_secret(self.settings, name)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {"profile": self.profile.profile, "bank_id": self.profile.bank_id,
-                "credential_scope": self.profile.credential_scope,
-                "data_dir": str(self.profile.data_dir),
-                "store_present": self.profile.db_path.exists(),
-                "model_config_untouched": True}
-
     def close(self) -> None:
         if self._registry is not None:
             self._registry.db.close()
             self._registry = None
 
 
-def bind(hermes_home: str | Path, *, settings: Any = None,
-         registry: ProfileRegistry | None = None) -> Activity:
+def bind(hermes_home: str | Path, *, settings: Any = None) -> Activity:
     """Resolve *hermes_home* to the profile that owns it.
 
     Raises :class:`BindingError` when nothing is enrolled there. There is no argument
     that means "use the default": an activity that cannot say whose home it is in has
-    no business reading anybody's memory. A registry passed in by the caller is not
-    closed here — the caller owns that connection.
+    no business reading anybody's memory. And a lookup never creates the ledger it is
+    asking — a refused read that leaves state behind has changed the installation it
+    was only supposed to consult.
     """
     base = settings if settings is not None else load_settings()
-    owns = registry is None
-    ledger = registry if registry is not None else ProfileRegistry.open(base)
+    ledger_path = Path(base.home) / STATE_FILENAME
+    if not ledger_path.exists():
+        raise BindingError(f"nothing is enrolled for {hermes_home} yet: there is no "
+                           f"installation ledger at {ledger_path}. Run setup, then "
+                           "enroll this profile with the owner's approval")
+    ledger = ProfileRegistry.open(base)
     try:
         profile = ledger.resolve(hermes_home)
     except InstallationError as error:
-        if owns:
-            ledger.db.close()
+        ledger.db.close()
         raise BindingError(unenrolled_reason(hermes_home)) from error
-    return Activity(ledger if owns else None, profile, profile.scoped(base))
+    return Activity(ledger, profile, profile.scoped(base))

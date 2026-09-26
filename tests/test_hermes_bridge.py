@@ -381,7 +381,7 @@ def test_a_home_with_no_profile_delivers_nothing(plugin, instance, tmp_path):
 
     outbox_home = tmp_path / "homes" / "work"
     with pytest.raises(plugin.client.BindingError,
-                         match="no memory profile is enrolled"):
+                       match="no installation ledger"):
         plugin.delivery.deliver_for_home(outbox_home, settings=load_settings(),
                                          sink=lambda body: None)
 
@@ -422,3 +422,65 @@ def test_a_disabled_profile_reports_why_rather_than_an_empty_queue(
 def test_a_delivery_run_takes_a_bounded_number_of_artifacts(plugin, instance, limit):
     with pytest.raises(ValueError, match="between 1 and 25"):
         plugin.delivery.deliver_for_home(instance, limit=limit, sink=lambda body: None)
+
+
+def test_delivery_needs_an_owner_to_notify(plugin):
+    """No principal named means nobody may be told anything, not even themselves."""
+    blocked = enabled_policy(plugin, owner_principal=None).refusal()
+    assert blocked and "owner principal" in blocked
+
+
+def test_a_run_delivers_this_profiles_artifacts_and_nobody_elses(
+        plugin, instance, tmp_path, monkeypatch):
+    """Two profiles, two outboxes, and one of them has something to say."""
+    settings = settings_for(plugin, instance, tmp_path, monkeypatch,
+                            DATA_DIR=instance / "data", INFERENCE_ENABLED="false",
+                            OWNER_PRINCIPAL=OWNER, DELIVERY_ENABLED="true",
+                            DELIVERY_TARGET="signal:owner-1234")
+    homes = {"work": tmp_path / "homes" / "work",
+             "personal": tmp_path / "homes" / "personal"}
+    for name, home in homes.items():
+        enrolled(plugin, instance, home, profile=name)
+
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    work = plugin.client.bind(homes["work"], settings=settings)
+    work.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with EvidenceStore(work.db_path) as store:
+        attention = AttentionPolicy(store, owner_principal=OWNER)
+        attention.configure(actor=OWNER, timezone_name=UTC, quiet_from="22:00",
+                            quiet_until="06:00", max_immediate_per_day=10,
+                            cooldown_minutes=0, shadow=False)
+        events = DueEventLog(store)
+        goals = GoalStore(store, events=events, owner_principal=OWNER)
+        subject = Outbox(store, policy=attention, owner_principal=OWNER,
+                         clock=lambda: EPOCH)
+        decision = attention.decide(topic="general", at=MORNING)
+        goal_id = goals.propose(title="Send the invoice", statement="Client waiting.",
+                                timezone_name=UTC, due=timestamp(MORNING),
+                                proposed_by=OWNER, proposed_kind="owner")["id"]
+        event_id = store.db.execute("SELECT id FROM due_events WHERE goal_id=?",
+                                    (goal_id,)).fetchone()[0]
+        claim = events.claim(event_id, holder="worker", at=EPOCH)
+        intent = events.ack(event_id=event_id, token=claim.token,
+                            decision="awaiting_analysis",
+                            policy_version=POLICY_VERSION)["intent"]
+        written = attention.record(decision, intent_id=intent, goal_id=goal_id, revision=1)
+        prepared = subject.prepare(decision_id=written["id"], kind="notify_owner",
+                                   topic="general", payload="The invoice is still owed.")
+        assert prepared["prepared"] is True
+    work.close()
+
+    seen = []
+    report = plugin.delivery.deliver_for_home(homes["work"], settings=settings,
+                                              sink=seen.append, at=EPOCH)
+    assert report["delivered"] == 1, report
+    assert "The invoice is still owed." in seen[0]
+    assert report["profile"] == "work"
+
+    untouched = []
+    elsewhere = plugin.delivery.deliver_for_home(homes["personal"], settings=settings,
+                                                 sink=untouched.append, at=EPOCH)
+    assert untouched == [] and elsewhere["delivered"] == 0
+    assert elsewhere["reason"] == "nothing is ready to send right now", \
+        "the other profile's archive was not even opened"

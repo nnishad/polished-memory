@@ -523,10 +523,8 @@ def test_capturing_nothing_is_better_than_capturing_into_the_wrong_profile(
     provider.on_session_end([{"role": "user", "content": "My card pin is 1234"}])
     provider.handle_tool_call("memory_remember", {"content": "My card pin is 1234"})
 
-    written = sorted(path.name for path in tmp_path.rglob("*") if path.suffix == ".db")
-    assert written == ["installation.db"], \
-        "an unbound activity may create the ledger it was refused by, nothing else"
-    assert not (instance / "data").exists()
+    assert not list(tmp_path.rglob("*.db")), \
+        "a refused activity creates no ledger, no store and no spool"
 
 
 def test_two_profiles_in_one_process_do_not_share_one_store(plugin, monkeypatch, tmp_path):
@@ -802,3 +800,118 @@ def test_a_repeated_native_note_is_mirrored_once_but_a_change_twice(provider):
             ("previous_content", "session_id", "write_origin")} or True
     assert [row["metadata"]["previous_content"] for row in rows] == \
            ["Prefers evenings", "Prefers noons"]
+
+
+# -- the binding's own hygiene -------------------------------------------------
+
+def test_a_refused_bind_closes_the_ledger_it_opened(plugin, monkeypatch, tmp_path):
+    """A refused lookup must not leave a handle on somebody else's installation.
+
+    A cron run that is turned away would otherwise keep the ledger's write-ahead log
+    open until the process ended, and the next writer would wait on it for nothing.
+    """
+    import sqlite3
+
+    from hermes_memory.install.profiles import ProfileRegistry
+
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "someone", profile="someone")
+    opened = []
+    real = ProfileRegistry.open
+
+    def spying(settings):
+        registry = real(settings)
+        opened.append(registry)
+        return registry
+
+    monkeypatch.setattr(plugin.client.ProfileRegistry, "open", staticmethod(spying))
+    with pytest.raises(plugin.client.BindingError, match="not used as a fallback"):
+        plugin.client.bind(tmp_path / "homes" / "stranger")
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].db.execute("SELECT 1")
+
+
+def test_a_missing_ledger_is_refused_without_creating_one(plugin, monkeypatch, tmp_path):
+    """A read that leaves state behind has changed the installation it consulted."""
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    with pytest.raises(plugin.client.BindingError, match="no installation ledger"):
+        plugin.client.bind(tmp_path / "homes" / "stranger")
+    assert not (instance / "installation.db").exists()
+
+
+def test_rebinding_to_an_unenrolled_home_stops_answering_from_the_old_one(
+        plugin, monkeypatch, tmp_path):
+    """The failure this prevents is a conversation quietly served by the previous
+    profile's archive."""
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "personal", profile="default",
+           data_dir=instance / "data")
+    bind(provider, tmp_path / "homes" / "personal")
+    provider.handle_tool_call("memory_remember", {"content": "Takes coffee black."})
+    assert "coffee black" in provider.prefetch("coffee", session_id="s")
+
+    bind(provider, tmp_path / "homes" / "stranger")
+    assert provider._activity is None
+    assert "could not be consulted" in provider.prefetch("coffee", session_id="s")
+    assert json.loads(provider.handle_tool_call("memory_recall",
+                                               {"query": "coffee"}))["ok"] is False
+    assert provider.backup_paths() == [str(instance / "data")]
+
+
+def test_a_route_without_an_enabled_budget_never_builds_a_client(
+        plugin, monkeypatch, tmp_path):
+    """A configured endpoint is not a permission to call it.
+
+    Formation needs the enable flag and a budget as well as a route; a client built
+    without them turns a capture-only installation into one that reaches the network
+    on the first prefetch.
+    """
+    provider, instance = unconfigured(
+        plugin, monkeypatch, tmp_path, HINDSIGHT_URL="http://127.0.0.1:8863",
+        ALLOWED_INFERENCE_HOSTS="127.0.0.1", BACKGROUND_BUDGET_TOKENS="0")
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(provider, tmp_path / "homes" / "work")
+    assert provider._activity.settings.hindsight_url == "http://127.0.0.1:8863"
+    assert provider._derived_client(provider._activity) is None
+    assert provider.prefetch("anything", session_id="s")
+
+
+def test_status_reports_the_delivery_decision_and_its_reason(provider, plugin):
+    report = json.loads(provider.handle_tool_call("memory_status", {}))
+    assert "disabled by default" in report["delivery"]
+
+    settings = provider._activity.settings
+    from dataclasses import replace
+
+    provider._activity.settings = replace(settings, delivery_enabled=True,
+                                          delivery_target="signal:owner-1234",
+                                          owner_principal="judge")
+    enabled = json.loads(provider.handle_tool_call("memory_status", {}))
+    assert enabled["delivery"] == "enabled for the approved destination"
+
+
+def test_status_of_an_unbound_provider_says_what_to_do(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    bind(provider, tmp_path / "stranger")
+    report = json.loads(provider.handle_tool_call("memory_status", {}))
+    assert report["bound"] is False and report["profile"] == "unbound"
+    assert "enroll" in report["activity_home"]
+    assert "no profile is bound" in report["delivery"]
+
+
+def test_post_setup_writes_its_own_file_and_nothing_else(plugin, monkeypatch, tmp_path):
+    """Activation belongs to Hermes. This writes the provider's configuration, and
+    the one line about what is left."""
+    home = tmp_path / "activity"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(tmp_path / "instance"))
+    result = plugin.post_setup(str(home), {"memory_settings": {
+        "data_dir": str(tmp_path / "instance" / "data"),
+        "hindsight_url": "http://127.0.0.1:8863"}})
+    written = sorted(path.name for path in home.iterdir())
+    assert written == ["hermes-memory.env"], written
+    assert "HERMES_MEMORY_HINDSIGHT_URL" in (home / "hermes-memory.env").read_text()
+    assert result["enrolled"] is False and "--actor" in result["next_command"]
+    ledger = tmp_path / "instance" / "installation.db"
+    assert not ledger.exists(), "setup may not create the ledger it is refused by"
