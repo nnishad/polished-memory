@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import io
 import json
+from pathlib import Path
 
 import pytest
 from hermes_memory.ids import timestamp
@@ -484,3 +485,114 @@ def test_a_run_delivers_this_profiles_artifacts_and_nobody_elses(
     assert untouched == [] and elsewhere["delivered"] == 0
     assert elsewhere["reason"] == "nothing is ready to send right now", \
         "the other profile's archive was not even opened"
+
+
+# -- the operator's hold on leaving the machine -------------------------------
+
+def ready_profile(plugin, instance, tmp_path, monkeypatch, *, name="work"):
+    """A profile with one artifact in its own outbox, waiting to be sent."""
+    settings = settings_for(plugin, instance, tmp_path, monkeypatch,
+                            DATA_DIR=instance / "data", INFERENCE_ENABLED="false",
+                            OWNER_PRINCIPAL=OWNER, DELIVERY_ENABLED="true",
+                            DELIVERY_TARGET="signal:owner-1234")
+    home = tmp_path / "homes" / name
+    enrolled(plugin, instance, home, profile=name)
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    activity = plugin.client.bind(home, settings=settings)
+    activity.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    profile_store, instance_store = activity.db_path, activity.instance_db_path
+    with EvidenceStore(profile_store) as store:
+        attention = AttentionPolicy(store, owner_principal=OWNER)
+        attention.configure(actor=OWNER, timezone_name=UTC, quiet_from="22:00",
+                            quiet_until="06:00", max_immediate_per_day=10,
+                            cooldown_minutes=0, shadow=False)
+        events = DueEventLog(store)
+        goals = GoalStore(store, events=events, owner_principal=OWNER)
+        subject = Outbox(store, policy=attention, owner_principal=OWNER,
+                         clock=lambda: EPOCH)
+        decision = attention.decide(topic="general", at=MORNING)
+        goal_id = goals.propose(title="Send the invoice", statement="Client waiting.",
+                                timezone_name=UTC, due=timestamp(MORNING),
+                                proposed_by=OWNER, proposed_kind="owner")["id"]
+        event_id = store.db.execute("SELECT id FROM due_events WHERE goal_id=?",
+                                    (goal_id,)).fetchone()[0]
+        claim = events.claim(event_id, holder="worker", at=EPOCH)
+        intent = events.ack(event_id=event_id, token=claim.token,
+                            decision="awaiting_analysis",
+                            policy_version=POLICY_VERSION)["intent"]
+        written = attention.record(decision, intent_id=intent, goal_id=goal_id, revision=1)
+        subject.prepare(decision_id=written["id"], kind="notify_owner", topic="general",
+                        payload="The invoice is still owed.")
+    activity.close()
+    return {"settings": settings, "home": home, "profile_store": profile_store,
+            "instance_store": instance_store}
+
+
+def test_the_owner_can_hold_delivery_without_turning_it_off(plugin, instance, tmp_path,
+                                                            monkeypatch):
+    """A hold and a switch are different decisions, and only one is config.
+
+    Turning delivery off would rewrite the owner's standing arrangement; holding it
+    leaves that in place and stops the outbox from draining while the hold is on - which
+    is what an upgrade or an away week needs.
+    """
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    prepared = ready_profile(plugin, instance, tmp_path, monkeypatch)
+    settings, home = prepared["settings"], prepared["home"]
+    with EvidenceStore(prepared["instance_store"]) as store:
+        store.set_control("global", "delivery", "paused", actor=OWNER,
+                          reason="the owner is away", policy_version="operator-pause")
+    held = plugin.delivery.deliver_for_home(home, settings=settings,
+                                            sink=lambda body: None, at=EPOCH)
+    assert held["delivered"] == 0 and "paused" in held["reason"]
+    assert held["reports"] == []
+    with EvidenceStore(prepared["profile_store"]) as store:
+        queued = store.db.execute("SELECT count(*) FROM outbox WHERE state='prepared'"
+                                  ).fetchone()[0]
+        assert queued == 1, "the artifact is still queued, not discarded"
+    with EvidenceStore(prepared["instance_store"]) as store:
+        store.set_control("global", "delivery", "active", actor=OWNER,
+                          reason="the owner is back", policy_version="operator-pause")
+    sent = []
+    resumed = plugin.delivery.deliver_for_home(home, settings=settings, sink=sent.append,
+                                               at=EPOCH)
+    assert resumed["delivered"] == 1 and "invoice" in sent[0]
+
+
+def test_a_hold_says_so_in_the_provider_status_as_well_as_in_the_outbox(plugin, instance,
+                                                                        tmp_path,
+                                                                        monkeypatch):
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    prepared = ready_profile(plugin, instance, tmp_path, monkeypatch)
+    settings, home = prepared["settings"], prepared["home"]
+    provider = plugin.provider.HermesMemoryProvider()
+    provider.initialize(session_id="s1", agent_identity="owner", hermes_home=str(home),
+                        platform="cli", settings=settings)
+    assert provider._delivery_state() == "enabled for the approved destination"
+    with EvidenceStore(prepared["instance_store"]) as store:
+        store.set_control("global", "delivery", "paused", actor=OWNER,
+                          reason="the owner is away", policy_version="operator-pause")
+    assert "paused" in provider._delivery_state()
+
+
+def test_a_hold_is_read_from_the_instance_store_without_creating_one(plugin, instance,
+                                                                    tmp_path, monkeypatch):
+    """Asking whether delivery is held must not be the thing that writes state.
+
+    An installation that has never run the operator's command has no instance store yet,
+    and a read that migrated one into being would have changed the thing it inspected.
+    """
+    settings = settings_for(plugin, instance, tmp_path, monkeypatch,
+                            DATA_DIR=instance / "data", INFERENCE_ENABLED="false",
+                            OWNER_PRINCIPAL=OWNER, DELIVERY_ENABLED="true",
+                            DELIVERY_TARGET="signal:owner-1234")
+    home = tmp_path / "homes" / "work"
+    enrolled(plugin, instance, home, profile="work")
+    activity = plugin.client.bind(home, settings=settings)
+    assert not Path(activity.instance_db_path).exists()
+    assert plugin.delivery.instance_hold(activity) is None
+    assert not Path(activity.instance_db_path).exists()
+    activity.close()

@@ -748,10 +748,12 @@ class HermesMemoryProvider(_MemoryProvider):
         """
         if self._activity is None:
             return "not authorised (no profile is bound)"
-        from .delivery import DeliveryPolicy
+        from .delivery import DeliveryPolicy, instance_hold
 
         blocked = DeliveryPolicy.from_settings(self._activity.settings).refusal()
-        return f"not authorised ({blocked})" if blocked else "enabled for the approved destination"
+        if blocked:
+            return f"not authorised ({blocked})"
+        return instance_hold(self._activity) or "enabled for the approved destination"
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         return [

@@ -11,7 +11,7 @@ import json
 import sys
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .config import SettingError, load_settings
 from .storage.evidence import EvidenceError, EvidenceStore, ReadOnlyStore
@@ -112,6 +112,24 @@ def main(argv: list[str] | None = None) -> int:
                          help="include payload and goal text, still redacted")
     explain.add_argument("--limit", type=int, default=20)
 
+    sub.add_parser("serve", help="run the admission endpoint the runtime unit expects")
+    services = sub.add_parser("services",
+                              help="show the owned user units; --install writes the plan "
+                                   "that was shown")
+    services.add_argument("--install", metavar="DIGEST",
+                          help="the digest of the plan to write")
+    services.add_argument("--actor")
+    sub.add_parser("start", help="start the owned services, gate before backend before worker")
+    stop = sub.add_parser("stop", help="persist the pause, then stop the owned services")
+    stop.add_argument("--actor")
+    stop.add_argument("--reason", default="the operator stopped the services")
+    pause = sub.add_parser("pause", help="hold a stage, and keep holding it across a restart")
+    pause.add_argument("--scope", required=True, choices=("inference", "delivery"))
+    pause.add_argument("--resume", action="store_true",
+                       help="lift a hold a previous pause set")
+    pause.add_argument("--actor")
+    pause.add_argument("--reason")
+
     args = parser.parse_args(argv)
 
     try:
@@ -136,6 +154,16 @@ def main(argv: list[str] | None = None) -> int:
         return _enroll_command(settings, args)
     if args.command == "retire":
         return _retire_command(settings, args)
+    if args.command == "serve":
+        return _serve_command(settings)
+    if args.command == "services":
+        return _services_command(settings, args)
+    if args.command == "start":
+        return _start_command(settings)
+    if args.command == "stop":
+        return _stop_command(settings, args)
+    if args.command == "pause":
+        return _pause_command(settings, args)
     return _explain_command(settings, args)
 
 
@@ -243,6 +271,150 @@ def _profile_name(hermes_home: str) -> str:
     """The home's own directory name, or ``default`` for a bare account home."""
     name = Path(hermes_home).expanduser().name.strip().lower()
     return name if name and name not in {"home", ".hermes", "hermes"} else "default"
+
+
+# -- the services and the fence ------------------------------------------------
+
+def _serve_command(settings) -> int:
+    """The process the runtime unit starts. It refuses before it binds.
+
+    A gate that cannot name its address, or that would bind somewhere other than
+    loopback, exits non-zero here rather than starting a service that quietly listens
+    on a network.
+    """
+    from .config import SettingError
+    from .service import serve
+
+    try:
+        return serve(settings)
+    except SettingError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
+def _services_command(settings, args) -> int:
+    from .install.profiles import InstallationError
+    from .install.services import apply, plan
+
+    proposal = plan(settings)
+    if not args.install:
+        return _emit({**proposal,
+                      "next": (f"hermes-memory services --install {proposal['review_digest']}"
+                               if proposal["would_change"] else
+                               "nothing to write: every owned unit already says this")})
+    try:
+        receipt = apply(settings, actor=args.actor or settings.owner_principal or "",
+                        review=args.install)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({**receipt,
+                  "next": "systemctl --user daemon-reload, then hermes-memory start"
+                          if receipt["reload_needed"] else "no reload needed"})
+
+
+def _controller(settings):
+    """The service controller, with whatever host command executor this process uses.
+
+    ``_SERVICE_RUNNER`` exists so the tests can watch the ordering claims instead of
+    running them: the alternative is a test suite that starts and stops real services.
+    """
+    from .install.services import Services
+
+    return Services(settings, runner=_SERVICE_RUNNER)
+
+
+_SERVICE_RUNNER: Callable[[Sequence[str]], tuple[int, str]] | None = None
+
+
+def _start_command(settings) -> int:
+    from .install.profiles import InstallationError
+    from .install.services import plan
+
+    stale = plan(settings)
+    if stale["blocked"]:
+        print("refused: these units exist but were not written by this installation, so "
+              f"they are not ours to start: {', '.join(stale['blocked'])}", file=sys.stderr)
+        return 2
+    try:
+        started = _controller(settings).start()
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "started": started,
+                  "note": "a pause the owner set is still in force; starting does not "
+                          "resume formation or delivery",
+                  "units_not_as_described": stale["would_change"]})
+
+
+def _stop_command(settings, args) -> int:
+    """Pause first, then stop. The order is the shutdown contract, not a preference.
+
+    A worker killed mid-retain with no recorded pause looks like an idle installation
+    to the next boot, which resumes exactly the formation the owner was trying to halt.
+    """
+    from .install.profiles import InstallationError
+    from .processing.resource_gate import ResourceGate
+    from .storage.evidence import EvidenceStore
+
+    actor = args.actor or settings.owner_principal
+    if not actor:
+        print("refused: stopping is the owner's decision and no owner principal is "
+              "configured", file=sys.stderr)
+        return 2
+    reason = args.reason
+    paused = []
+
+    def hold() -> None:
+        with EvidenceStore(settings.db_path) as store:
+            ResourceGate(store).pause(actor=actor, reason=reason)
+            store.set_control("global", "delivery", "paused", actor=actor, reason=reason,
+                              policy_version="operator-stop")
+        paused.extend(["inference", "delivery"])
+
+    try:
+        stopped = _controller(settings).stop(pause=hold)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "stopped": stopped, "paused": paused, "actor": actor,
+                  "resumes_with": "hermes-memory pause --scope inference --resume"
+                                  " (and --scope delivery --resume)"})
+
+
+def _pause_command(settings, args) -> int:
+    """A hold that outlives the process that set it.
+
+    Both scopes are recorded in the canonical store rather than in the unit, because a
+    restart is exactly the event that must not lift it — and an autostart that resumed
+    formation would be the machine deciding against its owner.
+    """
+    from .processing.resource_gate import ResourceGate
+    from .storage.evidence import EvidenceStore
+
+    actor = args.actor or settings.owner_principal
+    if not actor:
+        print("refused: a pause is attributed, and with no owner principal configured "
+              "there is nobody to attribute it to", file=sys.stderr)
+        return 2
+    reason = args.reason or ("the owner lifted the hold" if args.resume
+                             else "the owner held this stage")
+    state = "active" if args.resume else "paused"
+    with EvidenceStore(settings.db_path) as store:
+        gate = ResourceGate(store)
+        if args.scope == "inference":
+            if args.resume:
+                gate.resume(actor=actor, reason=reason)
+            else:
+                gate.pause(actor=actor, reason=reason)
+        else:
+            store.set_control("global", "delivery", state, actor=actor, reason=reason,
+                              policy_version="operator-pause")
+        held = {"inference": gate.paused,
+                "delivery": store.stage_is_paused("global", "delivery")}
+    return _emit({"ok": True, "scope": args.scope, "state": state, "actor": actor,
+                  "reason": reason, "held": held,
+                  "survives_a_restart": True})
 
 
 # -- the commands ------------------------------------------------------------

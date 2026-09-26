@@ -166,6 +166,24 @@ def deliver_once(outbox: Any, *, policy: DeliveryPolicy, sink: Callable[[str], A
             "correlation": correlation(artifact)}
 
 
+def instance_hold(activity) -> str | None:
+    """Whether the owner has held delivery for the whole installation.
+
+    A hold and a switch are different decisions: the switch is configuration and per
+    profile, the hold is an operator's temporary instruction that covers every outbox on
+    the machine. It is read from the store the operator's command wrote it to, and that
+    file is not created by asking - a refusal to deliver must not leave state behind.
+    """
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    path = Path(activity.instance_db_path)
+    if not path.is_file():
+        return None
+    with EvidenceStore(path) as store:
+        return ("delivery is paused for this installation by the owner"
+                if store.stage_is_paused("global", "delivery") else None)
+
+
 def deliver_for_home(hermes_home: str | Path, *, settings: Any = None,
                      sink: Callable[[str], Any] | None = None, limit: int = 1,
                      holder: str = "hermes-memory-delivery", out: TextIO | None = None,
@@ -194,6 +212,10 @@ def deliver_for_home(hermes_home: str | Path, *, settings: Any = None,
             return {"ok": True, "delivered": 0, "profile": activity.name, "reason": blocked,
                     "reports": []}
         reports = []
+        blocked = instance_hold(activity)
+        if blocked:
+            return {"ok": True, "delivered": 0, "profile": activity.name, "reason": blocked,
+                    "reports": []}
         with EvidenceStore(activity.db_path) as store:
             outbox = Outbox(store,
                             policy=AttentionPolicy(store,

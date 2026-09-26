@@ -313,17 +313,22 @@ class StatusReporter:
             "AND expires_at <= ?".format(",".join("?" * len(IN_FLIGHT))),
             [*IN_FLIGHT, now()]).fetchone()[0])
         paused = self._pauses("proactivity")
+        held = self.db.execute(
+            "SELECT 1 FROM runtime_controls WHERE scope='global' AND stage='delivery' "
+            "AND state='paused'").fetchone()
         # An artifact past its own expiry is not "in flight": it is a transport that
         # stopped coming, and the report says so rather than counting it as busy work.
         state = (DEGRADED if unproven or overdue else
-                 PAUSED if self._all_stopped("proactivity", paused) else
+                 PAUSED if held or self._all_stopped("proactivity", paused) else
                  OPERATIONAL if in_flight or counts.get("confirmed") else UNCONFIGURED)
         return StageReport(
             "delivery", state,
             f"{in_flight} artifact(s) waiting on the transport, {unproven} without a "
-            f"delivery proof, {counts.get('confirmed', 0)} confirmed",
+            f"delivery proof, {counts.get('confirmed', 0)} confirmed"
+            + (", and the owner is holding delivery for this installation" if held else ""),
             {"by_state": dict(counts), "in_flight": in_flight, "unproven": unproven,
              "past_expiry": overdue, "paused_sources": sorted(paused),
+             "instance_hold": bool(held),
              "owner_principal": getattr(self.settings, "owner_principal", None)})
 
     def backend(self) -> StageReport:

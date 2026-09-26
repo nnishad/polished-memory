@@ -741,3 +741,21 @@ def test_a_job_queued_by_the_real_queue_is_counted(store):
     report = StatusReporter(store).observations()
     assert report.state == OPERATIONAL
     assert report.evidence["queue"] == {"queued": 1}
+
+
+def test_an_operators_hold_stops_the_delivery_stage_without_a_single_paused_source(store):
+    """The fence is the whole installation's, and the headline has to say so.
+
+    The per-source pause answers "is this one pipeline narrowed"; this answers "is
+    anything leaving the machine at all", and it is the one the stop command sets.
+    """
+    store.set_control("global", "delivery", "paused", actor="owner",
+                      reason="the owner is away", policy_version="operator-pause")
+    report = StatusReporter(store).delivery()
+    assert report.state == PAUSED
+    assert "holding delivery" in report.detail
+    assert report.evidence["instance_hold"] is True
+    store.set_control("global", "delivery", "active", actor="owner",
+                      reason="the owner is back", policy_version="operator-pause")
+    after = StatusReporter(store).delivery()
+    assert after.state == UNCONFIGURED and after.evidence["instance_hold"] is False

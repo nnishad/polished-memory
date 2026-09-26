@@ -464,3 +464,154 @@ def test_a_clean_installation_reports_no_conflicts(home):
     (home / "hermes-memory.env").chmod(0o600)
     _, report = run("inventory")
     assert report["conflicts"] == [], report["conflicts"]
+
+
+# -- the services and the fence ------------------------------------------------
+
+@pytest.fixture()
+def service_home(home, tmp_path, monkeypatch):
+    """The same installation, with a config home these tests own.
+
+    Without this the unit directory is the real account's, and a test that writes a
+    unit file would leave it behind for the next boot to start.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    return home
+
+
+@pytest.fixture()
+def runner(monkeypatch):
+    """A systemctl stand-in, because a test must not start or stop anything real."""
+    calls = []
+
+    def execute(argv):
+        calls.append(list(argv))
+        return 0, ""
+
+    monkeypatch.setattr("hermes_memory.cli._SERVICE_RUNNER", execute)
+    return calls
+
+
+def test_services_prints_the_plan_and_writes_nothing(service_home):
+    code, report = run("services")
+    assert code == 0
+    assert [entry["state"] for entry in report["units"]] == \
+        ["written", "not-wanted", "not-wanted"]
+    assert report["would_change"] == ["hermes-memory.service"]
+    assert report["next"] == (
+        f"hermes-memory services --install {report['review_digest']}")
+    assert not Path(report["unit_dir"]).exists()
+
+
+def test_installing_a_service_needs_the_digest_that_was_shown(service_home):
+    code, message = errors("services", "--install", "0" * 64)
+    assert code == 2 and "does not match" in message
+    assert not (service_home.parent / "config" / "systemd" / "user"
+                / "hermes-memory.service").exists()
+
+
+def test_an_approved_plan_writes_the_owned_unit_and_then_has_nothing_to_change(service_home):
+    _, proposal = run("services")
+    code, receipt = run("services", "--install", proposal["review_digest"],
+                        "--actor", OWNER)
+    assert code == 0
+    assert receipt["units_written"] == ["hermes-memory.service"]
+    assert receipt["reload_needed"] is True
+    unit = Path(receipt["unit_dir"]) / "hermes-memory.service"
+    assert unit.is_file() and f"Environment=HERMES_MEMORY_HOME={service_home}" in \
+        unit.read_text(encoding="utf-8")
+    _, again = run("services")
+    assert again["would_change"] == []
+    assert "nothing to write" in again["next"]
+
+
+def test_a_unit_that_is_not_ours_stops_both_the_install_and_the_start(service_home, runner):
+    from hermes_memory.install.services import unit_directory
+
+    directory = unit_directory()
+    directory.mkdir(parents=True, mode=0o700)
+    (directory / "hermes-memory.service").write_text("[Service]\nExecStart=/opt/theirs\n",
+                                                     encoding="utf-8")
+    _, report = run("services")
+    assert report["blocked"] == ["hermes-memory.service"]
+    code, message = errors("start")
+    assert code == 2 and "not ours to start" in message
+    assert runner == []
+
+
+def test_start_goes_gate_then_backend_then_worker(service_home, runner):
+    (service_home / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={service_home.parent / 'data'}\n"
+        "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
+        "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+        "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n"
+        f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}\n", encoding="utf-8")
+    code, report = run("start")
+    assert code == 0
+    assert report["started"] == ["hermes-memory.service", "hermes-memory-hindsight.service",
+                                 "hermes-memory-worker.service"]
+    assert [call[2:] for call in runner] == [["start", name] for name in report["started"]]
+    # Nothing was installed by this test, so the units on disk are not what this
+    # installation would write - and a start that stayed quiet about that would let a
+    # half-configured machine look healthy.
+    assert report["units_not_as_described"] == report["started"]
+
+
+def test_stopping_holds_the_fence_first_and_the_hold_outlives_the_process(
+        service_home, runner):
+    run("init")
+    code, report = run("stop", "--actor", OWNER, "--reason", "overnight maintenance")
+    assert code == 0
+    assert report["paused"] == ["inference", "delivery"]
+    assert report["stopped"] == ["hermes-memory.service"]
+    assert runner == [["systemctl", "--user", "stop", "hermes-memory.service"]]
+    settings = load_settings()
+    with EvidenceStore(settings.db_path) as store:
+        assert store.stage_is_paused("global", "inference") is True
+        assert store.stage_is_paused("global", "delivery") is True
+
+
+def test_stopping_without_an_owner_touches_no_process(service_home, tmp_path, monkeypatch,
+                                                     runner):
+    other = tmp_path / "no-owner"
+    other.mkdir()
+    (other / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={other / 'data'}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(other))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(other / "config"))
+    code, message = errors("stop")
+    assert code == 2 and "owner" in message
+    assert runner == []
+
+
+def test_a_pause_is_recorded_with_the_actor_who_set_it_and_can_be_lifted(service_home):
+    run("init")
+    code, report = run("pause", "--scope", "delivery", "--actor", OWNER,
+                       "--reason", "the owner is away")
+    assert code == 0
+    assert report["held"] == {"inference": False, "delivery": True}
+    assert report["survives_a_restart"] is True
+    _, lifted = run("pause", "--scope", "delivery", "--resume", "--actor", OWNER)
+    assert lifted["held"] == {"inference": False, "delivery": False}
+
+    run("pause", "--scope", "inference", "--actor", OWNER, "--reason", "upgraded today")
+    _, both = run("pause", "--scope", "delivery", "--actor", OWNER)
+    assert both["held"] == {"inference": True, "delivery": True}, \
+        "the report says what is held now, not what this one command just did"
+    _, cleared = run("pause", "--scope", "inference", "--resume", "--actor", OWNER)
+    assert cleared["held"]["inference"] is False
+
+
+def test_a_pause_needs_somebody_to_be_answerable_for(service_home, tmp_path, monkeypatch):
+    other = tmp_path / "unowned"
+    other.mkdir()
+    (other / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={other / 'data'}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(other))
+    code, message = errors("pause", "--scope", "inference")
+    assert code == 2 and "owner" in message
+
+
+def test_serve_refuses_before_binding_when_it_has_no_address(service_home):
+    code, message = errors("serve")
+    assert code == 2 and "ADMISSION_URL" in message

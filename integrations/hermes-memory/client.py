@@ -73,6 +73,17 @@ class Activity:
         """The capture spool lives with the activity's own memory, not the gateway's."""
         return self.profile.data_dir / _SPOOL
 
+    @property
+    def instance_db_path(self) -> Path:
+        """The installation's own canonical store, where a machine-wide fence lives.
+
+        A hold on delivery or on inference is not one profile's business: it covers every
+        outbox on the machine, so it is read from the store the operator's command wrote
+        it to rather than from each profile's copy of the question.
+        """
+        home = getattr(self._registry, "default_home", None) if self._registry else None
+        return Path(home) / "canonical.db" if home else Path(self.settings.db_path)
+
     def secret(self, name: str | None) -> str | None:
         """This profile's credential, or None. Never another profile's."""
         return scoped_secret(self.settings, name)
