@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 
 from pathlib import Path
 
@@ -1118,3 +1119,78 @@ def test_status_reports_the_inference_hold_on_the_observations_too(forming):
                  if item["name"] == "observations")
     assert stage["state"] == "paused" and stage["instance_hold"] is True
     assert "holding inference" in stage["detail"]
+
+
+# -- whose memory is being asked about ---------------------------------------
+
+@pytest.fixture()
+def enrolled(forming, tmp_path):
+    """A second enrolled person on the same machine, whose archive is still empty."""
+    registry = ProfileRegistry.open(forming)
+    try:
+        home = tmp_path / "homes" / "work"
+        home.mkdir(parents=True)
+        proposal = registry.plan("work", home)
+        registry.enroll("work", home, actor=OWNER,
+                        review_digest=proposal["review_digest"])
+    finally:
+        registry.db.close()
+    data_dir = Path(proposal["data_dir"])
+    with EvidenceStore(data_dir / "canonical.db"):
+        pass
+    return SimpleNamespace(home=home, data_dir=data_dir, store=data_dir / "canonical.db")
+
+
+def test_status_answers_about_the_profile_the_owner_named(forming, enrolled):
+    _, default = run("status")
+    code, work = run("status", "--hermes-home", str(enrolled.home))
+    assert code == 0
+    assert default["profile"] == "default" and work["profile"] == "work"
+    assert work["stages"]["profile"] == "work", (
+        "the headline named one person and the stages answered for another")
+    assert work["database"] == str(enrolled.store), "the answer named the wrong archive"
+
+
+def test_asking_about_a_profile_never_brings_the_instance_ledger_into_being(forming,
+                                                                           tmp_path):
+    ledger = forming.home / "installation.db"
+    assert not ledger.exists()
+    stranger = tmp_path / "homes" / "nobody"
+    stranger.mkdir(parents=True)
+    assert errors("status", "--hermes-home", str(stranger))[0] == 2
+    assert not ledger.exists(), "a reading wrote the map it was consulting"
+
+
+def test_the_named_profile_is_the_one_a_pass_would_project(forming, enrolled):
+    """The default archive holds three records; the profile asked about holds none."""
+    assert run("form")[1]["selected"] != []
+    plan = run("form", "--hermes-home", str(enrolled.home))[1]
+    assert plan["profile"] == "work" and plan["selected"] == []
+    assert any("nothing is unprojected" in line for line in plan["blocking"])
+
+
+def test_doctor_examines_the_memory_that_belongs_to_that_home(forming, enrolled):
+    _, report = run("doctor", "--hermes-home", str(enrolled.home))
+    assert report["profile"] == "work"
+    dumped = json.dumps(report, sort_keys=True, default=str)
+    assert str(enrolled.data_dir) in dumped and str(forming.data_dir) not in dumped
+
+
+def test_an_unenrolled_home_is_refused_rather_than_answered_from_the_default(tmp_path,
+                                                                            forming):
+    stranger = tmp_path / "homes" / "stranger"
+    stranger.mkdir(parents=True)
+    code, message = errors("status", "--hermes-home", str(stranger))
+    assert code == 2 and "no profile is enrolled" in message
+    assert "hermes-memory enroll" in message, "the refusal says what to do instead"
+
+
+def test_a_retired_home_lost_the_answer_with_the_mapping(forming, enrolled):
+    registry = ProfileRegistry.open(forming)
+    try:
+        registry.retire("work", actor=OWNER, reason="the person left")
+    finally:
+        registry.db.close()
+    for command in ("status", "doctor", "form"):
+        code, message = errors(command, "--hermes-home", str(enrolled.home))
+        assert code == 2 and "retired" in message, command

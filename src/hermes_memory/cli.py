@@ -68,10 +68,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="owned env file (default: $HERMES_MEMORY_HOME/hermes-memory.env)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("status", help="print configuration and every stage's own account")
+    status = sub.add_parser("status",
+                            help="print configuration and every stage's own account")
+    status.add_argument("--hermes-home",
+                        help="report the memory enrolled for this Hermes profile home")
     init = sub.add_parser("init", help="create and migrate the canonical store")
     init.add_argument("--dry-run", action="store_true")
     doctor = sub.add_parser("doctor", help="read-only checks; performs no inference")
+    doctor.add_argument("--hermes-home",
+                        help="examine the memory enrolled for this Hermes profile home")
     doctor.add_argument("--probe", action="store_true",
                         help="ask the configured backend whether it is answering")
     doctor.add_argument("--synthetic-probe", action="store_true",
@@ -203,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
     form.add_argument("--max-jobs", type=int, default=None,
                       help="the most queued jobs to attempt in this invocation")
     form.add_argument("--actor")
+    form.add_argument("--hermes-home",
+                      help="form the memory enrolled for this Hermes profile home")
     form.add_argument("--review", metavar="DIGEST",
                       help="the digest of the list that was actually shown")
 
@@ -215,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "status":
-        return _status_command(settings)
+        return _status_command(settings, args)
     if args.command == "init":
         return _init_command(settings, args)
     if args.command == "doctor":
@@ -778,9 +785,15 @@ def _form_command(settings, args) -> int:
     is no ``--yes`` and no default: an unattended pass is a worker that has not been
     commissioned yet, not a flag on this command.
     """
+    from .install.profiles import InstallationError
     from .processing.formation import (DEFAULT_BATCH, MAX_JOBS, FormationError,
                                        formation_apply, formation_plan)
 
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     limit = DEFAULT_BATCH if args.limit is None else args.limit
     max_jobs = MAX_JOBS if args.max_jobs is None else args.max_jobs
     try:
@@ -814,13 +827,38 @@ def _export_readers() -> dict[str, Any]:
             "whatsapp": WhatsAppExport}
 
 
+def _memory_for_home(settings, hermes_home: str | None):
+    """One enrolled profile's configuration, or this installation's own when none is named.
+
+    The lookup is the ledger's, so an unenrolled or retired home is refused rather than
+    answered from the default profile. A report about one person that quietly came out of
+    another person's memory is the exact failure the profile map exists to prevent.
+    """
+    if not hermes_home:
+        return settings
+    from .install.profiles import ProfileRegistry
+
+    reading = ProfileRegistry.reading(settings)
+    try:
+        return reading.resolve(hermes_home).scoped(settings)
+    finally:
+        reading.db.close()
+
+
 # -- the commands ------------------------------------------------------------
 
-def _status_command(settings) -> int:
+def _status_command(settings, args) -> int:
+    from .install.profiles import InstallationError
     from .operations.status import StatusReporter
 
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     present = settings.db_path.exists()
     report = {**_configuration(settings),
+              "profile": settings.profile,
               "capabilities": _capabilities(settings, present),
               "stages": None}
     if not present:
@@ -828,7 +866,8 @@ def _status_command(settings) -> int:
         return _emit(report)
     try:
         with ReadOnlyStore(settings.db_path) as store:
-            report["stages"] = StatusReporter(store, settings=settings).report()
+            report["stages"] = StatusReporter(store, settings=settings).report(
+                profile=settings.profile)
     except EvidenceError as error:
         report["note"] = str(error)
         return _emit(report, 1)
@@ -848,8 +887,14 @@ def _init_command(settings, args) -> int:
 
 
 def _doctor_command(settings, args) -> int:
+    from .install.profiles import InstallationError
     from .operations.doctor import Doctor, unreachable_store_report
 
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     if not settings.db_path.exists():
         return _emit(unreachable_store_report(
             settings.db_path, "the canonical store does not exist yet"), 1)
@@ -857,7 +902,7 @@ def _doctor_command(settings, args) -> int:
         with ReadOnlyStore(settings.db_path) as store:
             report = Doctor(store, settings=settings).examine(
                 connectivity=args.probe, synthetic=args.synthetic_probe,
-                profile=str(settings.home))
+                profile=settings.profile)
     except EvidenceError as error:
         return _emit(unreachable_store_report(settings.db_path, str(error)), 1)
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
