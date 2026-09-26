@@ -31,8 +31,9 @@ The report also carries three things an operator reads next:
 - `awaiting_owner` — the identity candidates, candidate assertions and erasure intents that
   only a human may decide. When any exist, a note names the command that can decide them.
 - `queue` — the age of the oldest waiting job against the allowance, with
-  `"unattended": false` beside it. A queue that is not being drained by anything is said as
-  that: *only `hermes-memory form` works this queue — nothing drains it by itself*.
+  `"formation_unattended": false` beside it. A queue that is not being drained by anything
+  is said as that: *only `hermes-memory form` works this queue — nothing drains it by
+  itself*.
 
 Nothing here is a health check that calls a model. `backend` reads the projection ledger,
 which is true without a socket; asking whether the backend is answering is the probe below.

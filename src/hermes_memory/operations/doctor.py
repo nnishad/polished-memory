@@ -227,7 +227,10 @@ class Doctor:
                            f"the oldest waiting job has waited {age['oldest_seconds']}s",
                            "nothing drains this queue by itself: run `hermes-memory form` "
                            "to work it, or resume a stage an operator paused",
-                           {"queue": counts, "age": age, "unattended": True})
+                           # Named rather than called "unattended": the stage report uses
+                           # that word for the opposite claim, and two meanings in one key is
+                           # how a reader ends up certain of the wrong thing.
+                           {"queue": counts, "age": age, "operator_needed": True})
         return Finding("queue", _severity_for(observations.state), observations.detail,
                        evidence={"queue": counts, "age": age,
                                  "state": observations.state})

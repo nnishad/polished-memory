@@ -1455,7 +1455,7 @@ def test_status_says_that_nothing_drains_the_queue_on_its_own(forming, stubbed):
     assert report["capabilities"]["formation_unattended"] is False, \
         "an installation that can form is not one that forms by itself"
     stage = next(item for item in report["stages"]["stages"] if item["name"] == "observations")
-    assert stage["unattended"] is False and stage["instance_hold"] is False
+    assert stage["formation_unattended"] is False and stage["instance_hold"] is False
 
 
 def test_status_reports_the_inference_hold_on_the_observations_too(forming):

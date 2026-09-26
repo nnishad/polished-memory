@@ -308,7 +308,7 @@ def test_a_queue_nothing_is_consuming_names_the_command_that_empties_it(store):
     finding = Doctor(store).queue()
     assert finding.severity == WARN
     assert "hermes-memory form" in finding.remedy, "there is no worker to start"
-    assert finding.evidence["unattended"] is True
+    assert finding.evidence["operator_needed"] is True
 
 
 def test_capture_only_formation_is_a_supported_shape(store):

@@ -339,7 +339,7 @@ def test_formation_paused_everywhere_is_reported_as_paused(store, sync):
 def test_work_waiting_with_no_daemon_says_who_moves_it(store):
     a_job(store, state="queued")
     report = StatusReporter(store).observations()
-    assert report.evidence["unattended"] is False
+    assert report.evidence["formation_unattended"] is False
     assert "hermes-memory form" in report.detail, (
         "a busy queue is not a running stage unless something is running it")
 

@@ -249,7 +249,7 @@ class StatusReporter:
             "observations", state, detail,
             {"assertions": dict(counts), "queue": dict(queue), "stuck": stuck,
              "paused_sources": sorted(paused), "instance_hold": held,
-             "unattended": False, "draining": running,
+             "formation_unattended": False, "draining": running,
              "journal": self._journal()})
 
     def summaries(self) -> StageReport:
