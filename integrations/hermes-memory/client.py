@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_memory.config import load_settings, scoped_secret
-from hermes_memory.install.profiles import (STATE_FILENAME, InstallationError, Profile,
+from hermes_memory.install.profiles import (InstallationError, Profile,
                                             ProfileRegistry)
 
 __all__ = ["Activity", "bind", "BindingError", "unenrolled_reason"]
@@ -28,17 +28,19 @@ class BindingError(RuntimeError):
     """This activity's home is not enrolled, so it has no memory to be served from."""
 
 
-def unenrolled_reason(home: Any) -> str:
+def unenrolled_reason(home: Any, *, fresh: bool = False) -> str:
     """The operator-facing sentence, shared with the provider's availability check.
 
     Kept here rather than in the provider so that ``is_available()`` can explain a
     missing binding without a session to bind to.
     """
-    return (f"no memory profile is enrolled for {home}; run "
-            "`hermes-memory enroll --hermes-home <profile-home>` from the instance "
-            "home. The default profile is not used as a fallback: one gateway serves "
-            "many profiles and guessing which one is asking is how one person's "
-            "question gets answered out of another person's memory")
+    first_step = ("there is no installation ledger yet, so run setup first" if fresh
+                  else "run `hermes-memory enroll --hermes-home <profile-home>` from the "
+                       "instance home")
+    return (f"no memory profile is enrolled for {home}; {first_step}. The default "
+            "profile is not used as a fallback: one gateway serves many profiles and "
+            "guessing which one is asking is how one person's question gets answered "
+            "out of another person's memory")
 
 
 class Activity:
@@ -86,20 +88,16 @@ def bind(hermes_home: str | Path, *, settings: Any = None) -> Activity:
 
     Raises :class:`BindingError` when nothing is enrolled there. There is no argument
     that means "use the default": an activity that cannot say whose home it is in has
-    no business reading anybody's memory. And a lookup never creates the ledger it is
-    asking — a refused read that leaves state behind has changed the installation it
+    no business reading anybody's memory. And a lookup never brings the ledger into
+    being — a refused read that leaves state behind has changed the installation it
     was only supposed to consult.
     """
     base = settings if settings is not None else load_settings()
-    ledger_path = Path(base.home) / STATE_FILENAME
-    if not ledger_path.exists():
-        raise BindingError(f"nothing is enrolled for {hermes_home} yet: there is no "
-                           f"installation ledger at {ledger_path}. Run setup, then "
-                           "enroll this profile with the owner's approval")
-    ledger = ProfileRegistry.open(base)
+    ledger = ProfileRegistry.reading(base)
     try:
         profile = ledger.resolve(hermes_home)
     except InstallationError as error:
         ledger.db.close()
-        raise BindingError(unenrolled_reason(hermes_home)) from error
+        raise BindingError(unenrolled_reason(hermes_home,
+                                            fresh=ledger.detached)) from error
     return Activity(ledger, profile, profile.scoped(base))

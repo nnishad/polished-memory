@@ -10,6 +10,7 @@ import argparse
 import json
 import sys
 from importlib.util import find_spec
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import SettingError, load_settings
@@ -47,7 +48,10 @@ def _capabilities(settings, store_present: bool) -> dict[str, bool]:
         "local_recall": store_present,
         "formation": store_present and not settings.capture_only,
         "forgetting": store_present and bool(settings.owner_principal),
-        "delivery": store_present and bool(settings.owner_principal),
+        # Delivery is not a capability an installation has merely because somebody is
+        # named: it needs an owner, an explicit switch and one concrete destination.
+        "delivery": bool(store_present and settings.owner_principal
+                         and settings.delivery_enabled and settings.delivery_target),
     }
 
 
@@ -65,6 +69,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="ask the configured backend whether it is answering")
     doctor.add_argument("--synthetic-probe", action="store_true",
                         help="run one bounded, synthetic retain and recall round trip")
+
+    sub.add_parser("profiles", help="list the Hermes profiles this installation serves")
+    enroll = sub.add_parser("enroll",
+                            help="map one Hermes profile to its own memory; run without "
+                                 "--review to see what would change")
+    enroll.add_argument("--hermes-home", required=True,
+                        help="the profile home Hermes passes to an activity")
+    enroll.add_argument("--profile", help="short name; defaults to the home's directory")
+    enroll.add_argument("--actor", help="the owner principal approving this")
+    enroll.add_argument("--review", metavar="DIGEST",
+                        help="the digest of the plan that was actually shown")
+    retire = sub.add_parser("retire",
+                            help="unlink a profile; its evidence stays exactly where it is")
+    retire.add_argument("--profile", required=True)
+    retire.add_argument("--actor")
+    retire.add_argument("--reason", required=True)
 
     audit = sub.add_parser("audit", help="read the ledger of what has already happened")
     audit.add_argument("--action")
@@ -101,7 +121,102 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor_command(settings, args)
     if args.command == "audit":
         return _audit_command(settings, args)
+    if args.command == "profiles":
+        return _profiles_command(settings)
+    if args.command == "enroll":
+        return _enroll_command(settings, args)
+    if args.command == "retire":
+        return _retire_command(settings, args)
     return _explain_command(settings, args)
+
+
+# -- the profile map -----------------------------------------------------------
+
+def _registry(settings, *, create: bool = True):
+    """The instance ledger. A read never brings one into being."""
+    from .install.profiles import ProfileRegistry
+
+    return ProfileRegistry.open(settings) if create else ProfileRegistry.reading(settings)
+
+
+def _profiles_command(settings) -> int:
+    registry = _registry(settings, create=False)
+    try:
+        enrolled = [item.as_dict(private=True) for item in registry.profiles()]
+        retired = [item.as_dict(private=True) for item in registry.profiles(include_retired=True)
+                   if item.state != "enrolled"]
+        stores = {item.profile: item.db_path.exists() for item in registry.profiles()}
+    finally:
+        registry.db.close()
+    return _emit({"instance_home": str(settings.home), "profiles": enrolled,
+                  "retired": retired,
+                  "store_present": stores,
+                  "note": "each profile has its own store, bank and credential scope; "
+                          "nothing here is shared but the machine"})
+
+
+def _enroll_command(settings, args) -> int:
+    """Two steps, because an enrollment is a decision and not a side effect.
+
+    Without ``--review`` this prints what would change and nothing else. With it, the
+    digest has to be the one that was shown, and the actor has to be the owner the
+    configuration names — a caller that can name a directory does not thereby own it.
+    """
+    from .install.profiles import InstallationError
+
+    name = args.profile or _profile_name(args.hermes_home)
+    reading = _registry(settings, create=False)
+    try:
+        proposal = reading.plan(name, args.hermes_home)
+    finally:
+        reading.db.close()
+    if not args.review:
+        return _emit({**proposal,
+                      "next": f"hermes-memory enroll --profile {name} "
+                              f"--hermes-home {args.hermes_home} "
+                              f"--review {proposal['review_digest']}"})
+    registry = _registry(settings)
+    try:
+        actor = args.actor or settings.owner_principal
+        if not actor:
+            print("refused: no owner principal is configured, so nobody may approve an "
+                  "enrollment (set HERMES_MEMORY_OWNER_PRINCIPAL)", file=sys.stderr)
+            return 2
+        try:
+            result = registry.enroll(name, args.hermes_home, actor=actor,
+                                     review_digest=args.review)
+        except InstallationError as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
+        return _emit({**result,
+                      "store": str(Path(result["data_dir"]) / "canonical.db")})
+    finally:
+        registry.db.close()
+
+
+def _retire_command(settings, args) -> int:
+    from .install.profiles import InstallationError
+
+    actor = args.actor or settings.owner_principal
+    if not actor:
+        print("refused: retiring a profile is the owner's decision and no owner is "
+              "configured", file=sys.stderr)
+        return 2
+    registry = _registry(settings)
+    try:
+        try:
+            return _emit(registry.retire(args.profile, actor=actor, reason=args.reason))
+        except InstallationError as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
+    finally:
+        registry.db.close()
+
+
+def _profile_name(hermes_home: str) -> str:
+    """The home's own directory name, or ``default`` for a bare account home."""
+    name = Path(hermes_home).expanduser().name.strip().lower()
+    return name if name and name not in {"home", ".hermes", "hermes"} else "default"
 
 
 # -- the commands ------------------------------------------------------------

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_memory.install.profiles import (DEFAULT_PROFILE, InstallationError,
-                                            ProfileRegistry, open_installation)
+                                            ProfileRegistry)
 
 __all__ = ["plan", "enroll", "retire", "pending", "report", "enrollment_command",
            "registry", "UNTOUCHED"]
@@ -32,31 +32,34 @@ UNTOUCHED = (
 )
 
 
-def registry(instance_home: Any = None) -> ProfileRegistry:
+def registry(instance_home: Any = None, *, create: bool = True) -> ProfileRegistry:
     """The instance ledger, opened at the installation's own home.
 
     ``instance_home`` is the *installation's* home, not a profile's. Pointing this at a
     profile home would give that profile a private ledger nobody reviews — the same
     failure seen from the other side. With no argument the installation is the one the
-    environment names.
+    environment names. ``create=False`` reads: a plan or a status never brings state
+    into being just to describe it.
     """
     from hermes_memory.config import DEFAULT_ENV_FILENAME, load_settings
 
     if instance_home is None:
-        return ProfileRegistry.open(load_settings())
-    root = Path(instance_home).expanduser().resolve()
-    # That env file is the authority for two things: who may approve a change here,
-    # and where the default profile's memory lives.
-    settings = load_settings(root / DEFAULT_ENV_FILENAME)
-    return ProfileRegistry(open_installation(root / "installation.db"), root=root,
-                           owner_principal=settings.owner_principal,
-                           default_home=Path(settings.data_dir))
+        settings = load_settings()
+        root = Path(settings.home)
+    else:
+        root = Path(instance_home).expanduser().resolve()
+        # That env file is the authority for two things: who may approve a change here,
+        # and where the default profile's memory lives.
+        settings = load_settings(root / DEFAULT_ENV_FILENAME)
+    if create:
+        return ProfileRegistry.open(settings, home=root)
+    return ProfileRegistry.reading(settings, home=root)
 
 
 def plan(hermes_home: Any, *, profile: str | None = None,
          instance_home: Any = None) -> dict[str, Any]:
     """What enrolling this profile would change, and what it would leave alone."""
-    ledger = registry(instance_home)
+    ledger = registry(instance_home, create=False)
     try:
         proposal = ledger.plan(profile or _guess_profile(hermes_home), hermes_home)
     finally:
@@ -100,11 +103,7 @@ def pending(hermes_home: Any, *, instance_home: Any = None) -> dict[str, Any]:
     enrolled anything would otherwise acquire a ledger from a status call, and setup
     would end up having written the state it just said it had not.
     """
-    if not _has_ledger(instance_home):
-        return {"enrolled": False, "profile": _guess_profile(hermes_home),
-                "command": enrollment_command(hermes_home),
-                "reason": "there is no instance ledger yet, so no home is enrolled"}
-    ledger = registry(instance_home)
+    ledger = registry(instance_home, create=False)
     try:
         try:
             profile = ledger.resolve(hermes_home)
@@ -116,14 +115,6 @@ def pending(hermes_home: Any, *, instance_home: Any = None) -> dict[str, Any]:
                 "data_dir": str(profile.data_dir), "command": None, "reason": None}
     finally:
         ledger.db.close()
-
-
-def _has_ledger(instance_home: Any) -> bool:
-    if instance_home is None:
-        from hermes_memory.config import load_settings
-
-        return (Path(load_settings().home) / "installation.db").exists()
-    return (Path(instance_home).expanduser().resolve() / "installation.db").exists()
 
 
 def report(hermes_home: Any, *, instance_home: Any = None) -> dict[str, Any]:

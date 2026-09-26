@@ -172,18 +172,53 @@ class ProfileRegistry:
     """The instance's profile map, with enrollment as a reviewed transaction."""
 
     def __init__(self, db: sqlite3.Connection, *, root: Path, owner_principal: str | None,
-                 default_home: Path | None = None):
+                 default_home: Path | None = None, detached: bool = False):
         self.db = db
         self.root = Path(root)
         self.owner_principal = owner_principal
         self.default_home = default_home
+        # A detached ledger is a read of an installation that has no ledger yet. It
+        # holds nothing, so writing to it would report a success that never happened.
+        self.detached = detached
 
     @classmethod
-    def open(cls, settings) -> "ProfileRegistry":
-        root = Path(settings.home)
+    def open(cls, settings, *, home: str | Path | None = None) -> "ProfileRegistry":
+        root = Path(home or settings.home)
         return cls(open_installation(root / STATE_FILENAME), root=root,
                    owner_principal=settings.owner_principal,
                    default_home=Path(settings.data_dir))
+
+    @classmethod
+    def reading(cls, settings, *, home: str | Path | None = None) -> "ProfileRegistry":
+        """The ledger as it stands, for a call that has no business creating it.
+
+        An installation that has never enrolled anything has an empty map, not a
+        missing one, and a status or a plan that wrote a ledger into being would have
+        changed the installation it was only asked about.
+        """
+        root = Path(home or settings.home)
+        if (root / STATE_FILENAME).exists():
+            return cls.open(settings, home=root)
+        return cls.detached(root=root, owner_principal=settings.owner_principal,
+                            default_home=settings.data_dir)
+
+    @classmethod
+    def detached(cls, *, root: str | Path, owner_principal: str | None = None,
+                 default_home: str | Path | None = None) -> "ProfileRegistry":
+        """An empty ledger held in memory, carrying no rows and touching no disk."""
+        db = sqlite3.connect(":memory:", isolation_level=None)
+        db.row_factory = sqlite3.Row
+        apply_installation_migrations(db)
+        return cls(db, root=Path(root), owner_principal=owner_principal,
+                   default_home=Path(default_home) if default_home else None,
+                   detached=True)
+
+    def _writable(self) -> None:
+        if self.detached:
+            raise InstallationError(
+                "this installation has no ledger to write to yet; run "
+                "`hermes-memory init` or pass --env-file for the installation that owns "
+                f"{self.root}")
 
     # -- resolution ----------------------------------------------------------
 
@@ -273,6 +308,7 @@ class ProfileRegistry:
         enroll it.
         """
         self._owner(actor, "enroll a profile")
+        self._writable()
         proposal = self.plan(profile, hermes_home)
         if not isinstance(review_digest, str) or not review_digest.strip():
             raise InstallationError("enrollment needs the digest of the review that was "
@@ -319,6 +355,7 @@ class ProfileRegistry:
         a manifest of its own.
         """
         self._owner(actor, "retire a profile")
+        self._writable()
         name = _label(profile, "profile")
         _text(reason, "reason")
         existing = self.db.execute("SELECT * FROM profiles WHERE profile=?",

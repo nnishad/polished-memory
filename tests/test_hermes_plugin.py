@@ -819,8 +819,8 @@ def test_a_refused_bind_closes_the_ledger_it_opened(plugin, monkeypatch, tmp_pat
     opened = []
     real = ProfileRegistry.open
 
-    def spying(settings):
-        registry = real(settings)
+    def spying(settings, **arguments):
+        registry = real(settings, **arguments)
         opened.append(registry)
         return registry
 

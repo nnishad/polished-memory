@@ -4,10 +4,13 @@ from __future__ import annotations
 import json
 import os
 
+from pathlib import Path
+
 import pytest
 
 from hermes_memory.cli import main
 from hermes_memory.config import load_settings
+from hermes_memory.install.profiles import InstallationError, ProfileRegistry
 from hermes_memory.ids import now
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.storage.evidence import EvidenceStore
@@ -307,3 +310,128 @@ def _a_message(store, text="invoice 42 is paid", **overrides):
                "occurred_at": None, "occurred_precision": "unknown", "metadata": {}}
     payload.update({key: value for key, value in overrides.items() if key != "source_id"})
     return store.commit(payload)["id"]
+
+
+# -- the profile map -----------------------------------------------------------
+
+def test_listing_profiles_creates_no_ledger(home):
+    code, report = run("profiles")
+    assert code == 0 and report["profiles"] == []
+    assert not (home / "installation.db").exists(), \
+        "a listing that wrote the ledger it was reporting would change the installation"
+
+
+def test_a_plan_creates_no_ledger_either(home):
+    run("enroll", "--hermes-home", str(home / "profiles" / "work"))
+    assert not (home / "installation.db").exists()
+
+
+def test_an_approval_against_no_ledger_writes_to_none_of_it(home):
+    """A detached view is empty, and writing to an empty view must not look like a
+    success that evaporated with the process."""
+    plan = run("enroll", "--hermes-home", str(home / "profiles" / "work"))[1]
+    settings = load_settings()
+    registry = ProfileRegistry.detached(root=settings.home,
+                                       owner_principal=settings.owner_principal,
+                                       default_home=settings.data_dir)
+    with pytest.raises(InstallationError, match="no ledger to write to"):
+        registry.enroll("work", home / "profiles" / "work", actor="jugaadu",
+                        review_digest=plan["review_digest"])
+    registry.db.close()
+
+
+def test_enrollment_is_two_steps_and_the_first_writes_nothing(home):
+    code, plan = run("enroll", "--hermes-home", str(home / "profiles" / "work"))
+    assert code == 0
+    assert plan["profile"] == "work" and plan["data_dir"] == str(home / "profiles" / "work")
+    assert plan["bank_id"] == "hermes-work" and plan["credential_scope"] == "profile-work"
+    assert "--review" in plan["next"]
+    assert run("profiles")[1]["profiles"] == []
+
+    approved = run("enroll", "--hermes-home", str(home / "profiles" / "work"),
+                   "--review", plan["review_digest"])
+    assert approved[0] == 0 and approved[1]["changed"] is True
+    listed = run("profiles")[1]
+    assert [item["profile"] for item in listed["profiles"]] == ["work"]
+    assert listed["profiles"][0]["hermes_home"] == str(home / "profiles" / "work")
+    assert listed["store_present"] == {"work": False}, \
+        "enrollment maps a profile to memory; it does not create it"
+
+
+def test_an_approval_that_was_never_shown_is_refused(home):
+    run("enroll", "--hermes-home", str(home / "profiles" / "work"))
+    errors = _capture_stderr()
+    code = _capture_exit(["enroll", "--hermes-home", str(home / "profiles" / "work"),
+                          "--review", "0" * 64], errors)
+    assert code == 2
+    assert any("does not match" in line for line in errors)
+    assert run("profiles")[1]["profiles"] == []
+
+
+def test_an_agent_cannot_enroll_a_home_it_named(home):
+    errors = _capture_stderr()
+    code = _capture_exit(["enroll", "--hermes-home", str(home / "profiles" / "sneaky"),
+                          "--review", "0" * 64, "--actor", "agent"], errors)
+    assert code == 2 and any("only the owner" in line for line in errors)
+
+
+def test_no_owner_configured_means_no_one_can_approve(home):
+    env = home / "hermes-memory.env"
+    env.write_text(env.read_text(encoding="utf-8").replace("HERMES_MEMORY_OWNER_PRINCIPAL=jugaadu",
+                                                           "HERMES_MEMORY_OWNER_PRINCIPAL="),
+                   encoding="utf-8")
+    plan = run("enroll", "--hermes-home", str(home / "profiles" / "work"))[1]
+    errors = _capture_stderr()
+    code = _capture_exit(["enroll", "--hermes-home", str(home / "profiles" / "work"),
+                          "--review", plan["review_digest"]], errors)
+    assert code == 2 and any("no owner principal is configured" in line for line in errors)
+
+
+def test_retiring_a_profile_keeps_its_evidence_and_stops_serving_it(home, tmp_path):
+    plan = run("enroll", "--hermes-home", str(home / "profiles" / "work"))[1]
+    run("enroll", "--hermes-home", str(home / "profiles" / "work"),
+        "--review", plan["review_digest"])
+    store = Path(plan["data_dir"]) / "canonical.db"
+    store.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    store.write_text("private evidence", encoding="utf-8")
+
+    code, report = run("retire", "--profile", "work", "--reason", "machine retired")
+    assert code == 0 and report["changed"] is True
+    assert store.read_text(encoding="utf-8") == "private evidence"
+    listed = run("profiles")[1]
+    assert listed["profiles"] == []
+    assert [item["profile"] for item in listed["retired"]] == ["work"]
+
+    refused = _capture_stderr()
+    assert _capture_exit(["retire", "--profile", "ghost", "--reason", "nothing"],
+                         refused) == 2
+
+
+def test_a_default_home_enrolls_as_the_default_profile(home):
+    code, plan = run("enroll", "--hermes-home", str(home / "profiles" / "home"))
+    assert code == 0 and plan["profile"] == "default"
+    assert plan["data_dir"] == str(home.parent / "data"), \
+        "the default profile keeps the configured data directory"
+
+
+def test_status_reports_delivery_only_when_an_owner_chose_a_destination(home, monkeypatch):
+    assert run("status")[1]["capabilities"]["delivery"] is False
+    env = home / "hermes-memory.env"
+    env.write_text(env.read_text(encoding="utf-8")
+                   + "HERMES_MEMORY_DELIVERY_ENABLED=true\n"
+                   "HERMES_MEMORY_DELIVERY_TARGET=signal:owner-1234\n", encoding="utf-8")
+    run("init")
+    assert run("status")[1]["capabilities"]["delivery"] is True
+
+
+def _capture_stderr():
+    return []
+
+
+def _capture_exit(argv, errors):
+    capture = pytest.MonkeyPatch()
+    capture.setattr("sys.stderr.write", lambda text: errors.append(text))
+    try:
+        return main(list(argv))
+    finally:
+        capture.undo()
