@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -169,6 +170,10 @@ def test_an_unnamed_owner_makes_forgetting_unconfirmable(home, tmp_path):
     configuration = next(item for item in report["findings"]
                          if item["check"] == "configuration")
     assert "no owner principal" in configuration["detail"]
+    capabilities = run("status")[1]["capabilities"]
+    assert capabilities["capture"] is True, "capture does not need an owner"
+    assert capabilities["forgetting"] is False
+    assert capabilities["delivery"] is False
 
 
 def test_doctor_never_writes_to_an_existing_store(home):
@@ -195,6 +200,26 @@ def test_a_probe_is_only_run_when_it_is_named(home, monkeypatch):
     code, report = run("doctor")
     assert reached == [], "the default doctor must not open a socket"
     assert "backend-connectivity" not in [item["check"] for item in report["findings"]]
+
+
+def test_every_reading_works_on_a_store_that_cannot_be_written(home):
+    """A reading that needed write access would fail here, and that is the point.
+
+    Opening the store the way a component does applies pending migrations and sets
+    ``user_version``, both of which are writes. The readings must not do either.
+    """
+    run("init")
+    settings = load_settings()
+    with EvidenceStore(settings.db_path) as store:
+        record = _a_message(store)
+    os.chmod(settings.db_path, 0o444)
+    try:
+        assert run("status")[0] == 0
+        assert run("audit")[0] == 0
+        assert run("explain", "--record", record)[0] == 0
+        assert run("doctor")[0] == 0
+    finally:
+        os.chmod(settings.db_path, 0o644)
 
 
 # -- audit and explain -------------------------------------------------------

@@ -197,3 +197,47 @@ def test_an_unknown_id_is_not_visible_rather_than_an_error(store):
     """Callers legitimately hold ids an erasure or a stale cursor invalidated."""
     assert store.live_and_visible("rec_" + "0" * 32) is False
     assert store.get("rec_" + "0" * 32) is None
+
+
+# -- the read-only view ------------------------------------------------------
+
+def test_a_read_only_store_reads_what_the_writable_one_wrote(store, tmp_path):
+    from hermes_memory.storage.evidence import ReadOnlyStore
+
+    record = store.commit(envelope())["id"]
+    with ReadOnlyStore(tmp_path / "canonical.db") as reading:
+        assert reading.get(record).text == store.get(record).text
+        assert reading.epoch() == store.epoch()
+        assert reading.db.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert reading.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_a_read_only_store_refuses_every_write(store, tmp_path):
+    from hermes_memory.storage.evidence import ReadOnlyStore
+
+    record = store.commit(envelope())["id"]
+    with ReadOnlyStore(tmp_path / "canonical.db") as reading:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reading.db.execute("UPDATE records SET text='edited' WHERE id=?", (record,))
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reading.db.execute("INSERT INTO audit(action, object_id, created_at, metadata) "
+                               "VALUES('x','y','z','{}')")
+    assert store.get(record).text == envelope()["text"]
+
+
+def test_opening_a_missing_store_read_only_does_not_create_one(tmp_path):
+    from hermes_memory.storage.evidence import ReadOnlyStore
+
+    path = tmp_path / "never-existed.db"
+    with pytest.raises(EvidenceError, match="nothing to read"):
+        ReadOnlyStore(path)
+    assert not path.exists()
+
+
+def test_a_read_only_store_still_reports_the_controls_it_cannot_change(store, tmp_path):
+    from hermes_memory.storage.evidence import ReadOnlyStore
+
+    store.set_control("gmail", "capture", "paused", actor="owner", reason="review",
+                      policy_version="v1")
+    with ReadOnlyStore(tmp_path / "canonical.db") as reading:
+        assert reading.stage_is_paused("gmail", "capture") is True
