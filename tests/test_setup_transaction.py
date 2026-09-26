@@ -509,6 +509,29 @@ def test_a_capture_only_installation_is_checked_only_for_its_own_unit(tmp_path, 
     assert any("bin/hermes-memory is not staged" in line for line in gone["blocked"])
 
 
+def test_a_release_whose_compatibility_manifest_lies_is_not_installed(installation, tmp_path):
+    """Preflight asks the installation about itself, and one of its answers is a file.
+
+    The release tree's own ``deployment/compatibility.json`` names the backend this code was
+    composed against. Reading it is the only place in the transaction where a machine can
+    notice that the release it is holding is not the release it believes, and a lie there has
+    to stop the install rather than be logged and carried on.
+    """
+    from hermes_memory.install import compatibility
+
+    settings, environ = installation
+    home = activity(tmp_path)
+    pointer = Path(settings.home) / "runtime" / "current"
+    path = compatibility.write(path=pointer / "deployment" / "compatibility.json")
+    claims = json.loads(path.read_text(encoding="utf-8"))
+    claims["hindsight"]["engine_pinned"] = "0.9.0"
+    path.write_text(json.dumps(claims), encoding="utf-8")
+
+    executor = Heremes(home / "config.yaml")
+    with pytest.raises(SetupError, match="compatibility.json"):
+        approve(settings, home, environ, runner=executor, ref=REF)
+
+
 def test_an_unstaged_release_stops_before_anything_is_written(installation, tmp_path,
                                                              monkeypatch):
     settings, environ = installation

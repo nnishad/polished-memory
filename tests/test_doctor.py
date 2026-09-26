@@ -133,7 +133,8 @@ def test_a_bare_store_is_described_rather_than_condemned(store):
     report = Doctor(store, backend=tripwire).examine()
     assert [item["check"] for item in report["findings"]] == [
         "layout", "database", "schema", "configuration", "coverage", "queue",
-        "provenance", "erasure", "delivery", "gate", "credentials", "leases", "backend"]
+        "provenance", "erasure", "delivery", "gate", "credentials", "leases", "backend",
+        "release"]
     assert report["probes"] == {"connectivity": False, "synthetic": False}
     assert tripwire.reached == []
 
@@ -407,6 +408,58 @@ def test_an_operation_nobody_could_charge_points_at_the_revision_contract(store)
     assert finding.severity == FAIL
     assert "worker_launcher --check" in finding.remedy
     assert finding.evidence["operations"]["unattributed"] == 1
+
+
+def test_the_release_check_vouches_for_the_manifest_that_ships(store, tmp_path, monkeypatch):
+    """A release names itself by a digest; the doctor reads the file that carries it."""
+    import json
+
+    from hermes_memory.install import compatibility
+
+    release = tmp_path / "release"
+    (release / "deployment").mkdir(parents=True)
+    path = compatibility.write(path=release / "deployment" / "compatibility.json")
+    monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(release))
+    finding = Doctor(store).release()
+    assert finding.severity == OK
+    assert finding.evidence["pinned"] == compatibility.PINNED_VERSION
+    assert finding.evidence["manifest"] == str(path)
+
+
+def test_a_manifest_that_claims_another_engine_stops_the_installation(store, tmp_path,
+                                                                     monkeypatch):
+    """The one artefact that says "this release works with that backend" has to be true.
+
+    Read from a tampered manifest, every other check here would still pass: the code is
+    fine, the store is fine, and the release is a lie about what it was composed against.
+    """
+    import json
+
+    from hermes_memory.install import compatibility
+
+    release = tmp_path / "release"
+    (release / "deployment").mkdir(parents=True)
+    path = release / "deployment" / "compatibility.json"
+    compatibility.write(path=path)
+    facts = json.loads(path.read_text(encoding="utf-8"))
+    facts["hindsight"]["engine_pinned"] = "0.9.0"
+    path.write_text(json.dumps(facts), encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(release))
+
+    finding = Doctor(store).release()
+    assert finding.severity == FAIL
+    assert "0.9.0" in finding.detail and "0.10.1" in finding.detail
+    assert "compatibility.json" in finding.remedy
+
+
+def test_a_release_manifest_that_is_absent_is_a_failure_with_the_command_to_make_it(
+        store, tmp_path, monkeypatch):
+    from hermes_memory.install import compatibility
+
+    monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(tmp_path / "nowhere"))
+    monkeypatch.setattr(compatibility, "SHIP_AT", tmp_path / "missing.json")
+    finding = Doctor(store).release()
+    assert finding.severity == FAIL and finding.remedy
 
 
 # -- credentials and fences --------------------------------------------------

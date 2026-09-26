@@ -29,6 +29,20 @@ HERMES_MEMORY_RELEASE at it`, and the transaction stops before a byte is written
 `hindsight_client` is only demanded when a backend route is configured. A capture-only
 installation is a supported operating state and installs with nothing but the framework.
 
+Alongside those environments the release ships `deployment/compatibility.json`: the pinned
+engine version, the operations the capability table supports, the schema version this build
+carries, the plugin's host floor and checkpoint API version, and a digest over the framework
+sources. It is generated from the code that enforces each of those facts rather than typed in
+next to it, which is what lets `doctor` check the release against itself:
+
+```sh
+python -c 'from hermes_memory.install import compatibility; compatibility.write()'
+```
+
+A running installation compares only the compatibility claims, so editing a source file does
+not make `doctor` red; the packaging step compares the digests as well, so a patched plugin
+directory or a tree that was never cut as a release is caught where it matters.
+
 ## Configuration
 
 The runtime reads one owned file, `$HERMES_MEMORY_HOME/hermes-memory.env`, then the

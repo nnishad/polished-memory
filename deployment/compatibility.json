@@ -1,0 +1,150 @@
+{
+  "framework_digest": "0f2644ec4bda31367dc526ff14fd4161ac9a3911736f2877d85abd4f00b0da3d",
+  "hindsight": {
+    "client_floor": "hindsight-client>=0.6.1",
+    "engine_pinned": "0.10.1",
+    "operations": [
+      {
+        "method": "GET",
+        "name": "health",
+        "path": "/health",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "retain",
+        "path": "/v1/default/banks/{bank_id}/memories",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "retain_async_identity",
+        "path": "/v1/default/banks/{bank_id}/memories",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "recall",
+        "path": "/v1/default/banks/{bank_id}/memories/recall",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "list_memories",
+        "path": "/v1/default/banks/{bank_id}/memories/list",
+        "since": "0.10.1"
+      },
+      {
+        "method": "GET",
+        "name": "get_memory",
+        "path": "/v1/default/banks/{bank_id}/memories/{memory_id}",
+        "since": "0.10.1"
+      },
+      {
+        "method": "PUT",
+        "name": "update_memory",
+        "path": "/v1/default/banks/{bank_id}/memories/{memory_id}",
+        "since": "0.10.1"
+      },
+      {
+        "method": "DELETE",
+        "name": "delete_memories",
+        "path": "/v1/default/banks/{bank_id}/memories",
+        "since": "0.10.1"
+      },
+      {
+        "method": "GET",
+        "name": "list_operations",
+        "path": "/v1/default/banks/{bank_id}/operations",
+        "since": "0.10.1"
+      },
+      {
+        "method": "GET",
+        "name": "get_operation",
+        "path": "/v1/default/banks/{bank_id}/operations/{operation_id}",
+        "since": "0.10.1"
+      },
+      {
+        "method": "DELETE",
+        "name": "cancel_operation",
+        "path": "/v1/default/banks/{bank_id}/operations/{operation_id}",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "retry_operation",
+        "path": "/v1/default/banks/{bank_id}/operations/{operation_id}/retry",
+        "since": "0.10.1"
+      },
+      {
+        "method": "DELETE",
+        "name": "delete_operation",
+        "path": "/v1/default/banks/{bank_id}/operations/{operation_id}/delete",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "reflect",
+        "path": "/v1/default/banks/{bank_id}/reflect",
+        "since": "0.10.1"
+      },
+      {
+        "method": "GET",
+        "name": "bank_stats",
+        "path": "/v1/default/banks/{bank_id}/stats",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "dry_run_extract",
+        "path": "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+        "since": "0.10.1"
+      },
+      {
+        "method": "POST",
+        "name": "preview_prompts",
+        "path": "/v1/default/banks/{bank_id}/prompts/preview",
+        "since": "0.10.1"
+      },
+      {
+        "method": "GET",
+        "name": "list_banks",
+        "path": "/v1/default/banks",
+        "since": "0.10.1"
+      }
+    ]
+  },
+  "manifest_version": "compatibility-v1",
+  "not_claimed": [
+    "no live Hindsight request was made to build this",
+    "no model was called, and no route quality is asserted here",
+    "host compatibility is the plugin's own floor, not a tested list"
+  ],
+  "package": {
+    "package": "hermes-memory",
+    "requires_python": ">=3.11",
+    "version": "0.1.0"
+  },
+  "plugin": {
+    "checkpoint_api_version": 2,
+    "files": {
+      "__init__.py": "8931936a44bad9848d154532b2b1ac868d6a0c3c27a953f4bbe69d3fef2488ba",
+      "client.py": "c37f5472fe01d7fe1f4bb0fea46c4566865cb2e937dbef8ddc3c237ac6ace9ab",
+      "delivery.py": "0fa5477cca13be8760af4f7ce49738ae96e62a3a5853b1293a91df8d4db2e235",
+      "provider.py": "372eb64ff3887114b9d2d1769d6e28f93dcc271078201749925d9856dc22f0cd",
+      "setup.py": "cff5daa30cc556beb239fd94230e54f47636d7920930faca10eee4017a098454",
+      "spool.py": "121ec110eb8bb0fff0710ca1fbac088815d1429c6c09ffa158a5458591c48abf"
+    },
+    "kind": "exclusive",
+    "name": "hermes-memory",
+    "python_dependencies": [],
+    "requires_hermes": ">=0.21.4",
+    "version": "0.1.0"
+  },
+  "schema": {
+    "evidence_migrations": 12,
+    "evidence_newer": "refused",
+    "evidence_older": "migrated forward on open",
+    "gate_ledger_version": 2
+  }
+}

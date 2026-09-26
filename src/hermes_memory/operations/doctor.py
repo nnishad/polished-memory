@@ -82,7 +82,7 @@ class Doctor:
         checks = [self.layout, self.database, self.schema, self.configuration,
                   self.coverage, self.queue, self.provenance, self.erasure,
                   self.delivery, self.gate, self.credentials_in_records, self.leases,
-                  self.backend_ledger]
+                  self.backend_ledger, self.release]
         with snapshot(self.db):
             findings = [check() for check in checks]
         if connectivity or synthetic:
@@ -301,6 +301,34 @@ class Doctor:
                         "uncertain": report.evidence.get("uncertain"),
                         "operations": operations,
                         "state": report.state})
+
+    def release(self) -> Finding:
+        """Is this the release its own compatibility manifest describes?
+
+        The manifest is generated from the code that enforces each fact in it, so a
+        difference means one of two things: somebody edited the file to make a claim the code
+        does not support, or a tree was patched without a release being cut. Both are worth
+        saying out loud, and neither is visible from any other check here.
+        """
+        from ..install.compatibility import manifest_path, read_shipped, verify
+
+        checked = verify(settings=self.settings)
+        path = manifest_path(self.settings)
+        if checked["ok"]:
+            shipped = read_shipped(path=path)
+            return Finding("release", OK,
+                           f"{path.name} agrees with this build; framework "
+                           f"{shipped['framework_digest'][:12]} pinned to Hindsight "
+                           f"{shipped['hindsight']['engine_pinned']}",
+                           evidence={"manifest": str(path),
+                                     "framework_digest": shipped["framework_digest"],
+                                     "pinned": shipped["hindsight"]["engine_pinned"],
+                                     "schema": shipped["schema"]["evidence_migrations"]})
+        return Finding("release", FAIL,
+                       f"{path.name} no longer says what this build does: "
+                       + "; ".join(checked["differences"])[:300],
+                       checked["remedy"],
+                       {"manifest": str(path), "differences": checked["differences"]})
 
     def credentials_in_records(self) -> Finding:
         """A credential in a record is in every prompt built from it. Find it here."""

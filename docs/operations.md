@@ -46,13 +46,13 @@ hermes-memory doctor --probe             # one request: is anything answering
 hermes-memory doctor --synthetic-probe   # one bounded synthetic retain and recall
 ```
 
-Thirteen checks run by default: layout, database, schema, configuration, coverage, queue,
-provenance, erasure, delivery, gate, a credential scan over the newest records, leases, and
-the projection ledger. `--probe` adds a connectivity request and `--synthetic-probe` a
-bounded round trip in a bank of its own; the report says which probes ran, so a later reader
-can tell what was actually looked at. Exit is `0`, or `1` when a check reached `fail`;
-refusals (an unreadable configuration, an unenrolled profile) exit `2` with the reason on
-stderr.
+Fourteen checks run by default: layout, database, schema, configuration, coverage, queue,
+provenance, erasure, delivery, gate, a credential scan over the newest records, leases, the
+projection ledger, and the release manifest. `--probe` adds a connectivity request and
+`--synthetic-probe` a bounded round trip in a bank of its own; the report says which probes
+ran, so a later reader can tell what was actually looked at. Exit is `0`, or `1` when a check
+reached `fail`; refusals (an unreadable configuration, an unenrolled profile) exit `2` with
+the reason on stderr.
 
 Every finding carries a remedy where one exists. "degraded" is not an answer; "run
 `hermes-memory form` to work this queue, or resume a stage an operator paused" is.
