@@ -16,12 +16,15 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
-from ..ids import digest, interval_contains, intervals_overlap, now, timestamp
+from ..ids import digest, interval_contains, now, timestamp
+
+if TYPE_CHECKING:                                  # pragma: no cover
+    from .contradictions import Contradiction
 from ..storage.evidence import EvidenceError, EvidenceStore
 
-__all__ = ["AssertionStore", "Assertion", "Contradiction", "KINDS", "EVIDENCE_KINDS",
+__all__ = ["AssertionStore", "Assertion", "KINDS", "EVIDENCE_KINDS",
            "CANDIDATE", "CONFIRMED", "SUPERSEDED", "RETRACTED"]
 
 KINDS = ("belief", "preference", "fact", "measurement")
@@ -91,19 +94,6 @@ class Assertion:
                 "valid_to": self.valid_to, "status": self.status,
                 "confirmed_by": self.confirmed_by, "supersedes": self.supersedes,
                 "revision": self.revision}
-
-
-@dataclass(frozen=True)
-class Contradiction:
-    subject: str
-    predicate: str
-    at: str | None
-    assertions: tuple[Assertion, ...]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"subject": self.subject, "predicate": self.predicate, "at": self.at,
-                "values": sorted({item.value for item in self.assertions}),
-                "assertions": [item.id for item in self.assertions]}
 
 
 class AssertionStore:
@@ -300,35 +290,16 @@ class AssertionStore:
         return review
 
     def contradictions(self, *, subject: str | None = None,
-                       at: str | None = None) -> list[Contradiction]:
+                       at: str | None = None) -> list["Contradiction"]:
         """Supported claims that cannot all be true for one subject at one time.
 
-        Candidates are excluded on purpose: a hypothesis contradicts nothing, and
-        counting them would let an unverified guess drown the real disagreements.
+        The comparison itself lives in ``knowledge/contradictions.py``; what this method
+        contributes is the input, which is the part with the archive in it. Candidates
+        are already gone, because ``current`` returns what stands.
         """
-        groups: dict[tuple[str, str], list[Assertion]] = {}
-        for assertion in self.current(subject=subject, at=at):
-            if assertion.kind == "belief":
-                # Two beliefs can both be held at once. Calling that a
-                # contradiction would be a category error, not a finding.
-                continue
-            groups.setdefault((assertion.subject, assertion.predicate), []).append(assertion)
-        found = []
-        for (group_subject, predicate), items in sorted(groups.items()):
-            # Only a pair that is true at the same moment can disagree. Two
-            # claims about consecutive periods are a history, not a conflict.
-            clashing: set[str] = set()
-            for index, item in enumerate(items):
-                for other in items[index + 1:]:
-                    if (item.value.casefold() != other.value.casefold()
-                            and intervals_overlap(item.valid_from, item.valid_to,
-                                                  other.valid_from, other.valid_to)):
-                        clashing.update({item.id, other.id})
-            if clashing:
-                found.append(Contradiction(
-                    subject=group_subject, predicate=predicate, at=at,
-                    assertions=tuple(item for item in items if item.id in clashing)))
-        return found
+        from .contradictions import find
+
+        return find(self.current(subject=subject, at=at), at=at)
 
     def matching(self, query: str, *, limit: int = 10, at: str | None = None,
                 include_candidates: bool = False) -> list[Assertion]:
