@@ -465,6 +465,33 @@ def test_a_canary_that_cannot_be_found_is_a_failed_installation(installation, tm
         approve(settings, home, environ, runner=Heremes(home / "config.yaml"), ref=REF)
 
 
+def test_a_backend_unit_names_only_an_executable_that_was_staged(tmp_path, monkeypatch):
+    """A worker unit pointing at a binary nobody installed fails months later, quietly.
+
+    The units ExecStart two programs from the backend environment. Checking only the API
+    would let the transaction write a unit whose start always fails on a machine the
+    owner believed was working.
+    """
+    home = tmp_path / "instance"
+    home.mkdir()
+    release = host(home, HINDSIGHT_URL="http://127.0.0.1:8123",
+                   ALLOWED_INFERENCE_HOSTS="127.0.0.1")
+    (release / "hindsight" / "bin").mkdir(parents=True)
+    (release / "hindsight" / "bin" / "hindsight-api").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.delenv("HERMES_MEMORY_RELEASE", raising=False)
+    settings = load_settings()
+    arguments = {"hermes_home": activity(tmp_path),
+                 "environ": {"HERMES_MEMORY_RELEASE": str(release)}}
+    proposal = plan(settings, **arguments)
+    assert any("hindsight-worker is not staged" in line for line in proposal["blocked"])
+    assert not any("hindsight-api is not staged" in line for line in proposal["blocked"])
+    (release / "hindsight" / "bin" / "hindsight-worker").write_text("#!/bin/sh\n",
+                                                                   encoding="utf-8")
+    staged = plan(settings, **arguments)
+    assert not any("hindsight-worker" in line for line in staged["blocked"])
+
+
 def test_an_unstaged_release_stops_before_anything_is_written(installation, tmp_path,
                                                              monkeypatch):
     settings, environ = installation

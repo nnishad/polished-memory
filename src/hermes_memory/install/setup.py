@@ -224,7 +224,11 @@ def _stage(ctx: Context, *, apply: bool) -> dict[str, Any]:
     backend_configured = bool(ctx.settings.hindsight_url)
     wanted = [release / "bin" / "hermes-memory"]
     if backend_configured:
-        wanted.append(release / "hindsight" / "bin" / "hindsight-api")
+        # Both executables the owned units ExecStart. Checking only the API would write a
+        # worker unit pointing at a binary nobody staged, and the failure would surface
+        # as a start error months later on a machine that was expected to be quiet.
+        wanted += [release / "hindsight" / "bin" / name
+                   for name in ("hindsight-api", "hindsight-worker")]
     missing = [str(path) for path in wanted if not path.is_file()]
     importable = {"hermes_memory": _import_util.find_spec("hermes_memory") is not None,
                   "hindsight_client": _import_util.find_spec("hindsight_client") is not None}

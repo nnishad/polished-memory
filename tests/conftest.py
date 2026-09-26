@@ -14,6 +14,7 @@ from hermes_memory.storage.evidence import EvidenceStore
 
 SOURCE = "gmail"
 OBSERVED = "2026-09-25T12:00:00+00:00"
+__all__ = ["SOURCE", "OBSERVED", "envelope"]
 
 
 def envelope(**overrides) -> dict:

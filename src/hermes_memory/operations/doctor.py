@@ -225,8 +225,9 @@ class Doctor:
         if age.get("stale"):
             return Finding("queue", WARN,
                            f"the oldest waiting job has waited {age['oldest_seconds']}s",
-                           "is a worker running? start it, or resume a paused stage",
-                           {"queue": counts, "age": age})
+                           "nothing drains this queue by itself: run `hermes-memory form` "
+                           "to work it, or resume a stage an operator paused",
+                           {"queue": counts, "age": age, "unattended": True})
         return Finding("queue", _severity_for(observations.state), observations.detail,
                        evidence={"queue": counts, "age": age,
                                  "state": observations.state})

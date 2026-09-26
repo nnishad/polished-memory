@@ -106,13 +106,19 @@ class DocumentMap:
 
     def _set(self, record_id: str, revision: str, state: str, *, error: str | None,
              operation_id: str | None = None) -> None:
+        # Confirming is a statement about the epoch that is current *now*. A row that
+        # kept the epoch it was queued under would go on reporting superseded coverage
+        # as though the reset before it had never happened.
+        epoch = self.store.epoch() if state == VERIFIED else None
         self.db.execute("BEGIN IMMEDIATE")
         try:
             cursor = self.db.execute(
                 "UPDATE backend_documents SET state=?, error=?, "
+                "desired_epoch=COALESCE(?, desired_epoch), "
                 "operation_id=COALESCE(?, operation_id), confirmed_at=? "
                 "WHERE record_id=? AND revision=? AND backend=? AND bank_id=?",
-                (state, error, operation_id, now() if state == VERIFIED else None,
+                (state, error, epoch, operation_id,
+                 now() if state == VERIFIED else None,
                  record_id, revision, self.backend, self.bank_id))
             if not cursor.rowcount:
                 raise EvidenceError(f"no mapping for {record_id}@{revision}")

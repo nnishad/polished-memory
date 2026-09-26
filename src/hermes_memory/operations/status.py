@@ -54,6 +54,10 @@ UNPROVEN = ("uncertain", "accepted_unverified")
 # queue is not merely slow but stuck.
 BUSY_JOBS = ("queued", "leased", "submitting", "running", "retry_wait")
 STUCK_JOBS = ("uncertain", "quarantined")
+# The two halves of ``BUSY_JOBS``, kept apart because they say different things: a lease
+# has a worker's name on it, and an unclaimed row only has a place in line.
+RUNNING_JOBS = ("leased", "submitting", "running")
+WAITING_JOBS = ("queued", "retry_wait")
 
 
 @dataclass(frozen=True)
@@ -214,17 +218,38 @@ class StatusReporter:
                                {"reason": "capture-only", "assertions": dict(counts),
                                 "queue": dict(queue), "journal": self._journal()})
         paused = self._pauses("formation")
+        # The hold on a *physical* model is not a per-source policy: it is the owner's
+        # decision over hardware every profile shares, and it lives in the instance
+        # admission ledger. Nothing can be formed while it stands, whatever the
+        # connector-level fences and the queue say.
+        held = bool(self.gate is not None and self.gate.paused)
         stuck = {state: int(queue.get(state, 0)) for state in STUCK_JOBS
                  if queue.get(state)}
+        # Two different things a queue can say. ``running`` means a lease has a name on
+        # it, so work is happening now; ``waiting`` means rows exist that nobody has
+        # claimed, which is a stage that is set up rather than one that is operating.
+        # Calling the second one operational is the false readiness this report exists to
+        # avoid, because nothing in this installation claims a job by itself.
+        waiting = _any(queue, WAITING_JOBS) and not _any(queue, RUNNING_JOBS)
+        running = _any(queue, RUNNING_JOBS)
         state = (DEGRADED if stuck else
-                 PAUSED if self._all_stopped("formation", paused) else
-                 OPERATIONAL if counts or _any(queue, BUSY_JOBS) else UNCONFIGURED)
+                 PAUSED if held or self._all_stopped("formation", paused) else
+                 OPERATIONAL if counts or running else
+                 CONFIGURED if waiting else UNCONFIGURED)
+        detail = (f"{counts.get('confirmed', 0)} confirmed / "
+                  f"{counts.get('candidate', 0)} candidate assertion(s); "
+                  f"queue {_flatten(queue)}")
+        if held:
+            detail += ", and the owner is holding inference for this installation"
+        elif waiting:
+            detail += ("; only `hermes-memory form` works this queue — nothing drains it "
+                       "by itself")
         return StageReport(
-            "observations", state,
-            f"{counts.get('confirmed', 0)} confirmed / "
-            f"{counts.get('candidate', 0)} candidate assertion(s); queue {_flatten(queue)}",
+            "observations", state, detail,
             {"assertions": dict(counts), "queue": dict(queue), "stuck": stuck,
-             "paused_sources": sorted(paused), "journal": self._journal()})
+             "paused_sources": sorted(paused), "instance_hold": held,
+             "unattended": False, "draining": running,
+             "journal": self._journal()})
 
     def summaries(self) -> StageReport:
         rows = self.db.execute(

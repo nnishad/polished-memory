@@ -303,11 +303,12 @@ def test_a_quarantined_job_names_the_work_that_will_not_retry_itself(store):
     assert "quarantined" in json.dumps(finding.evidence["stuck"])
 
 
-def test_a_queue_nothing_is_consuming_is_a_warning_about_the_worker(store):
+def test_a_queue_nothing_is_consuming_names_the_command_that_empties_it(store):
     _job(store, state="queued", created_at="2000-01-01T00:00:00+00:00")
     finding = Doctor(store).queue()
     assert finding.severity == WARN
-    assert "is a worker running" in finding.remedy
+    assert "hermes-memory form" in finding.remedy, "there is no worker to start"
+    assert finding.evidence["unattended"] is True
 
 
 def test_capture_only_formation_is_a_supported_shape(store):

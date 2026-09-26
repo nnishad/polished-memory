@@ -48,6 +48,12 @@ def _capabilities(settings, store_present: bool) -> dict[str, bool]:
         "capture": store_present,
         "local_recall": store_present,
         "formation": store_present and not settings.capture_only,
+        # Nothing in this installation drains the queue on its own. Formation is a
+        # bounded pass an operator runs (`hermes-memory form`), so a store that *can*
+        # form observations still forms none until somebody asks and approves the list.
+        # §8.2 keeps the always-on worker behind that decision rather than pretending it
+        # is already running.
+        "formation_unattended": False,
         "forgetting": store_present and bool(settings.owner_principal),
         # Delivery is not a capability an installation has merely because somebody is
         # named: it needs an owner, an explicit switch and one concrete destination.
@@ -189,6 +195,17 @@ def main(argv: list[str] | None = None) -> int:
     importing.add_argument("--dry-run", action="store_true",
                            help="ask whether the export can be read, and read nothing else")
 
+    form = sub.add_parser("form",
+                          help="project evidence into the derived backend; run without "
+                               "--review to see the bounded list and perform nothing")
+    form.add_argument("--limit", type=int, default=None,
+                      help="the most records one pass may select")
+    form.add_argument("--max-jobs", type=int, default=None,
+                      help="the most queued jobs to attempt in this invocation")
+    form.add_argument("--actor")
+    form.add_argument("--review", metavar="DIGEST",
+                      help="the digest of the list that was actually shown")
+
     args = parser.parse_args(argv)
 
     try:
@@ -235,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
         return _sources_command(settings, args)
     if args.command == "import":
         return _import_command(settings, args)
+    if args.command == "form":
+        return _form_command(settings, args)
     return _explain_command(settings, args)
 
 
@@ -748,6 +767,39 @@ def _import_command(settings, args) -> int:
                   "profile": scoped.profile, "reachable": adapter.check(),
                   "note": "nothing was read; run the same command without --dry-run to "
                           "record what is in the export"})
+
+
+def _form_command(settings, args) -> int:
+    """The one place memory-originated inference is dispatched from a shell.
+
+    Planning is a reading. Performing is a write to the queue, a slot in a device the
+    whole machine shares, and a spend from a daily budget, so it requires the digest of
+    the list that was actually shown and the name of the person who authorised it. There
+    is no ``--yes`` and no default: an unattended pass is a worker that has not been
+    commissioned yet, not a flag on this command.
+    """
+    from .processing.formation import (DEFAULT_BATCH, MAX_JOBS, FormationError,
+                                       formation_apply, formation_plan)
+
+    limit = DEFAULT_BATCH if args.limit is None else args.limit
+    max_jobs = MAX_JOBS if args.max_jobs is None else args.max_jobs
+    try:
+        proposal = formation_plan(settings, limit=limit)
+    except FormationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not args.review:
+        return _emit({**proposal, "next": "nothing left this process. Approve this exact "
+                                          "list with --review <digest> and an --actor; a "
+                                          "pass that costs tokens names who authorised it"})
+    try:
+        return _emit(formation_apply(
+            settings, review=args.review,
+            actor=args.actor or settings.owner_principal or "",
+            limit=limit, max_jobs=max_jobs))
+    except FormationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
 
 
 # The file readers only. A live mailbox, an MCP server or the host's own event spool

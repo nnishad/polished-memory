@@ -17,6 +17,8 @@ from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
                                                    gate_path, instance_gate)
 from hermes_memory.storage.evidence import EvidenceStore
 
+from conftest import envelope
+
 SOURCE = "gmail"
 OWNER = "jugaadu"
 
@@ -976,3 +978,143 @@ def test_an_import_refuses_to_invent_a_connector(home, exports):
 def test_an_import_will_not_create_the_store_it_writes_into(home, exports):
     code, message = errors("import", "--source", "files", "--path", str(exports))
     assert code == 2 and "init" in message
+
+
+# -- formation ---------------------------------------------------------------
+
+# A machine that can afford inference: a route, an allowlist that admits it, a budget
+# that is not zero, and one credential per route that has to exist.
+INFERENCE_ENV = {
+    "INFERENCE_ENABLED": "true",
+    "BACKGROUND_BUDGET_TOKENS": "200000",
+    "HINDSIGHT_URL": "http://127.0.0.1:8123",
+    "ALLOWED_INFERENCE_HOSTS": "127.0.0.1",
+    "TEXT_BASE_URL": "http://127.0.0.1:11434/v1",
+    "EMBEDDINGS_BASE_URL": "http://127.0.0.1:11435/v1",
+    "ROUTE_CREDENTIAL_RETAIN": "cred-retain",
+    "ROUTE_CREDENTIAL_EMBEDDINGS": "cred-embed",
+    "ROUTE_CREDENTIAL_CONSOLIDATE": "cred-consolidate",
+    "ROUTE_CREDENTIAL_REFLECT": "cred-reflect",
+    "ROUTE_CREDENTIAL_FOREGROUND": "cred-foreground",
+}
+
+
+@pytest.fixture()
+def forming(tmp_path, monkeypatch):
+    """An inference-enabled installation holding three records nothing has projected."""
+    root = tmp_path / "forming"
+    (root / "data").mkdir(parents=True)
+    lines = [f"HERMES_MEMORY_DATA_DIR={root / 'data'}",
+             f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}"]
+    lines += [f"HERMES_MEMORY_{key}={value}" for key, value in INFERENCE_ENV.items()]
+    (root / "hermes-memory.env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(root))
+    for key, value in INFERENCE_ENV.items():
+        monkeypatch.delenv(f"HERMES_MEMORY_{key}", raising=False)
+    settings = load_settings()
+    with EvidenceStore(settings.db_path) as store:
+        for index in range(3):
+            store.commit(envelope(source_id=f"msg-{index}", text=f"note {index}"))
+    return settings
+
+
+class Answers:
+    """The backend, stubbed: this suite must never reach for a model."""
+
+    def __init__(self):
+        self.retain_calls = []
+
+    def retain(self, **kwargs):
+        self.retain_calls.append(kwargs)
+        return {"ok": True, "usage": {"total_tokens": 321}}
+
+
+@pytest.fixture()
+def stubbed(monkeypatch):
+    """Point the one socket-opening seam in formation at a stub."""
+    from hermes_memory.processing import formation
+
+    backend = Answers()
+    monkeypatch.setattr(formation, "backend_client", lambda settings: backend)
+    return backend
+
+
+def test_form_prints_the_list_and_performs_nothing(forming):
+    code, plan = run("form")
+    assert code == 0
+    assert plan["ok"] is True and plan["planned_jobs"] == 3
+    assert plan["note"].startswith("planning only")
+    assert not gate_path(forming).exists(), "the list was read, not spent"
+
+
+def test_a_capture_only_installation_refuses_before_naming_any_work(home):
+    run("init")
+    code, plan = run("form")
+    assert code == 0 and plan["ok"] is False
+    assert any("inference is switched off" in line for line in plan["blocking"])
+    assert plan["selected"] == []
+
+
+def test_form_approves_only_the_list_that_was_shown(forming):
+    plan = run("form")[1]
+    code, message = errors("form", "--review", "not-the-digest", "--actor", OWNER)
+    assert code == 2 and "does not match what would happen now" in message
+    assert plan["review_digest"]
+
+
+def test_an_approved_pass_names_its_actor_and_charges_the_shared_ledger(forming, stubbed):
+    plan = run("form")[1]
+    code, receipt = run("form", "--review", plan["review_digest"], "--actor", OWNER)
+    assert code == 0
+    assert receipt["actor"] == OWNER and receipt["queued"]["created"] == 3
+    assert receipt["drain"]["counts"] == {"succeeded": 3}
+    assert len(stubbed.retain_calls) == 3
+    with GateStore(gate_path(forming)) as ledger:
+        assert ledger.db.execute("SELECT sum(tokens) FROM budget_usage").fetchone()[0] == 963
+
+
+def test_a_pass_asks_for_an_actor_because_it_spends_a_shared_device(forming, tmp_path,
+                                                                   monkeypatch, stubbed):
+    env_file = forming.home / "hermes-memory.env"
+    env_file.write_text("".join(
+        line + "\n" for line in env_file.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("HERMES_MEMORY_OWNER_PRINCIPAL")), encoding="utf-8")
+    plan = run("form")[1]
+    code, message = errors("form", "--review", plan["review_digest"])
+    assert code == 2 and "actor must be named" in message
+    assert stubbed.retain_calls == []
+
+
+def test_the_command_takes_a_bound_because_it_is_a_pass_not_a_drain(forming):
+    code, plan = run("form", "--limit", "1")
+    assert code == 0 and plan["planned_jobs"] == 1 and len(plan["selected"]) == 1
+    assert errors("form", "--limit", "0")[0] == 2
+
+
+def test_an_operator_hold_stops_the_pass_that_was_approved_before_it(forming, stubbed):
+    plan = run("form")[1]
+    assert run("pause", "--scope", "inference", "--reason", "holding", "--actor", OWNER)[0] == 0
+    code, message = errors("form", "--review", plan["review_digest"], "--actor", OWNER)
+    assert code == 2 and "does not match" in message
+    assert stubbed.retain_calls == []
+
+
+def test_status_says_that_nothing_drains_the_queue_on_its_own(forming, stubbed):
+    plan = run("form")[1]
+    assert run("form", "--review", plan["review_digest"], "--actor", OWNER)[0] == 0
+    code, report = run("status")
+    assert code == 0
+    assert report["capabilities"]["formation"] is True
+    assert report["capabilities"]["formation_unattended"] is False, \
+        "an installation that can form is not one that forms by itself"
+    stage = next(item for item in report["stages"]["stages"] if item["name"] == "observations")
+    assert stage["unattended"] is False and stage["instance_hold"] is False
+
+
+def test_status_reports_the_inference_hold_on_the_observations_too(forming):
+    assert run("pause", "--scope", "inference", "--reason", "the models are moving",
+               "--actor", OWNER)[0] == 0
+    stage = next(item for item in run("status")[1]["stages"]["stages"]
+                 if item["name"] == "observations")
+    assert stage["state"] == "paused" and stage["instance_hold"] is True
+    assert "holding inference" in stage["detail"]

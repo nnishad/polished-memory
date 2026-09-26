@@ -18,6 +18,7 @@ from hermes_memory.operations.status import (CONFIGURED, DEGRADED, DISABLED, OPE
                                              PAUSED, REPORTED_STAGES, UNCONFIGURED,
                                              StageReport, StatusReporter)
 from hermes_memory.processing.jobs import JobQueue
+from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import Route
 from hermes_memory.storage.evidence import EvidenceError
 
@@ -301,9 +302,26 @@ def test_an_uncertain_job_stays_a_debt_until_someone_answers_for_it(store):
     assert StatusReporter(store).observations().state == DEGRADED
 
 
-def test_work_waiting_in_the_queue_is_the_stage_running(store):
+def test_work_nobody_has_claimed_yet_is_configured_rather_than_running(store):
     a_job(store, state="queued")
-    assert StatusReporter(store).observations().state == OPERATIONAL
+    report = StatusReporter(store).observations()
+    assert report.state == CONFIGURED, "a place in a line is not somebody standing in it"
+    assert report.evidence["draining"] is False
+
+
+def test_a_leased_job_is_the_formation_stage_actually_running(store):
+    a_job(store, state="leased")
+    report = StatusReporter(store).observations()
+    assert report.state == OPERATIONAL and report.evidence["draining"] is True
+    assert "hermes-memory form" not in report.detail, (
+        "work is being done; the note would say the opposite")
+
+
+def test_a_waiting_job_and_a_leased_one_is_still_a_running_stage(store):
+    a_job(store, job_id="job-waiting", state="queued")
+    a_job(store, job_id="job-in-flight", state="submitting")
+    report = StatusReporter(store).observations()
+    assert report.state == OPERATIONAL and report.evidence["draining"] is True
 
 
 def test_a_finished_queue_with_nothing_in_it_has_never_run(store):
@@ -315,6 +333,27 @@ def test_formation_paused_everywhere_is_reported_as_paused(store, sync):
     connector(store, sync)
     sync.pause("gmail", actor="owner", reason="not now", policy_version="v1",
                stages=("formation",))
+    assert StatusReporter(store).observations().state == PAUSED
+
+
+def test_work_waiting_with_no_daemon_says_who_moves_it(store):
+    a_job(store, state="queued")
+    report = StatusReporter(store).observations()
+    assert report.evidence["unattended"] is False
+    assert "hermes-memory form" in report.detail, (
+        "a busy queue is not a running stage unless something is running it")
+
+
+def test_a_hold_on_the_shared_models_pauses_formation_for_the_whole_machine(store):
+    ResourceGate(store).pause(actor="owner", reason="the models are being moved")
+    report = StatusReporter(store).observations()
+    assert report.state == PAUSED and report.evidence["instance_hold"] is True
+    assert "holding inference" in report.detail
+
+
+def test_an_owners_hold_outranks_a_queue_that_looks_busy(store):
+    a_job(store, state="queued")
+    ResourceGate(store).pause(actor="owner", reason="held")
     assert StatusReporter(store).observations().state == PAUSED
 
 
@@ -743,8 +782,8 @@ def test_a_job_queued_by_the_real_queue_is_counted(store):
     JobQueue(store).enqueue(kind="retain", inputs=["rec-1"], input_revision="1",
                             route=RETAIN, processor_fingerprint="extractor-v3")
     report = StatusReporter(store).observations()
-    assert report.state == OPERATIONAL
     assert report.evidence["queue"] == {"queued": 1}
+    assert report.state == CONFIGURED, "the queue holds work; nothing is performing it"
 
 
 def test_an_operators_hold_stops_the_delivery_stage_without_a_single_paused_source(store):
