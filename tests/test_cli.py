@@ -435,3 +435,32 @@ def _capture_exit(argv, errors):
         return main(list(argv))
     finally:
         capture.undo()
+
+
+# -- inventory -----------------------------------------------------------------
+
+def test_inventory_reports_the_installation_without_changing_it(home):
+    code, report = run("inventory", "--hermes-home", str(home / ".." / "hermes"))
+    assert code == 0
+    assert report["installation"]["home"] == str(home)
+    assert report["installation"]["capture_only"] is True
+    assert report["installation"]["store_present"] is False
+    assert report["endpoints"]["probed"] is False
+    assert report["host"]["guarded_delivery_supported"] is False
+    assert report["unknowns"], "an inventory that admits nothing it could not read is guessing"
+    assert not (home / "installation.db").exists()
+
+
+def test_the_conflicts_view_is_the_one_a_script_gates_on(home):
+    code, report = run("inventory")
+    assert code == 0 and report["conflicts"]
+    errors = _capture_stderr()
+    assert _capture_exit(["inventory", "--conflicts"], errors) == 1, \
+        "a blocking fact must be visible in the exit status"
+
+
+def test_a_clean_installation_reports_no_conflicts(home):
+    run("init")
+    (home / "hermes-memory.env").chmod(0o600)
+    _, report = run("inventory")
+    assert report["conflicts"] == [], report["conflicts"]

@@ -71,6 +71,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="run one bounded, synthetic retain and recall round trip")
 
     sub.add_parser("profiles", help="list the Hermes profiles this installation serves")
+    inventory = sub.add_parser("inventory",
+                               help="read what is already here; opens no socket and runs "
+                                    "no model")
+    inventory.add_argument("--hermes-home",
+                           help="the Hermes profile home to report the host facts of")
+    inventory.add_argument("--conflicts", action="store_true",
+                           help="print only the reasons a setup run would be a bad idea")
     enroll = sub.add_parser("enroll",
                             help="map one Hermes profile to its own memory; run without "
                                  "--review to see what would change")
@@ -123,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         return _audit_command(settings, args)
     if args.command == "profiles":
         return _profiles_command(settings)
+    if args.command == "inventory":
+        return _inventory_command(settings, args)
     if args.command == "enroll":
         return _enroll_command(settings, args)
     if args.command == "retire":
@@ -211,6 +220,23 @@ def _retire_command(settings, args) -> int:
             return 2
     finally:
         registry.db.close()
+
+
+def _inventory_command(settings, args) -> int:
+    """What is on this machine, read without changing it.
+
+    ``--conflicts`` exists because the useful question is not everything an inventory
+    can see but whether any of it should stop an install, and a script that gates on it
+    should not have to re-derive the answer from a 60-key report.
+    """
+    from .install.inventory import conflicts, survey
+
+    report = survey(settings, hermes_home=args.hermes_home)
+    if args.conflicts:
+        blocking = conflicts(report)
+        print(json.dumps(blocking, indent=2, sort_keys=True))
+        return 1 if blocking else 0
+    return _emit({**report, "conflicts": conflicts(report)})
 
 
 def _profile_name(hermes_home: str) -> str:

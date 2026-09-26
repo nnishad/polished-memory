@@ -15,7 +15,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 __all__ = ["Settings", "SettingError", "load_settings", "validate_inference_route",
-           "scoped_settings", "scoped_secret", "DEFAULT_PROFILE", "DEFAULT_BANK"]
+           "scoped_settings", "scoped_secret", "env_file_values", "DEFAULT_PROFILE",
+           "DEFAULT_BANK"]
 
 
 class SettingError(RuntimeError):
@@ -50,6 +51,15 @@ def _deadline(value: str | None) -> float:
             "deadline at or above that is never honoured, only truncated by the host"
         )
     return seconds
+
+
+def env_file_values(path: str | os.PathLike[str]) -> dict[str, str]:
+    """The values an owned env file holds, without evaluating anything.
+
+    Public because the installer needs to see the same raw view ``load_settings`` sees,
+    and a second parser would eventually disagree with the first about quoting.
+    """
+    return _read_env_file(Path(path))
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
