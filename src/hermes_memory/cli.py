@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .config import SettingError, load_settings
+from .install.services import Services, subprocess_runner
 from .storage.evidence import EvidenceError, EvidenceStore, ReadOnlyStore
 
 __all__ = ["main"]
@@ -69,6 +70,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="ask the configured backend whether it is answering")
     doctor.add_argument("--synthetic-probe", action="store_true",
                         help="run one bounded, synthetic retain and recall round trip")
+
+    setup = sub.add_parser("setup",
+                           help="the installation transaction; run without --review to "
+                                "see every step first")
+    setup.add_argument("--hermes-home", required=True,
+                       help="the Hermes profile home to set this memory up for")
+    setup.add_argument("--profile", help="short name; defaults to the home's directory")
+    setup.add_argument("--ref", help="the 40-character release commit to pin the plugin to")
+    setup.add_argument("--actor")
+    setup.add_argument("--review", metavar="DIGEST",
+                       help="the digest of the plan that was actually shown")
+    setup.add_argument("--start", action="store_true",
+                       help="start the owned services once the units are installed")
 
     sub.add_parser("profiles", help="list the Hermes profiles this installation serves")
     inventory = sub.add_parser("inventory",
@@ -150,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
         return _profiles_command(settings)
     if args.command == "inventory":
         return _inventory_command(settings, args)
+    if args.command == "setup":
+        return _setup_command(settings, args)
     if args.command == "enroll":
         return _enroll_command(settings, args)
     if args.command == "retire":
@@ -250,6 +266,41 @@ def _retire_command(settings, args) -> int:
         registry.db.close()
 
 
+def _setup_command(settings, args) -> int:
+    """The transaction, from the operator's chair.
+
+    Without ``--review`` this only reads: the eleven steps, their actions, and the host
+    commands any of them would run. With it, the digest must be the one that was shown,
+    the actor must be the owner the configuration names, and the host commands go through
+    the one executor this process uses.
+    """
+    from .install.profiles import InstallationError
+    from .install.setup import SetupError, plan
+
+    arguments = {"hermes_home": args.hermes_home, "profile": args.profile, "ref": args.ref,
+                 "runner": _HOST_RUNNER, "actor": args.actor, "start_services": args.start}
+    try:
+        proposal = plan(settings, **arguments)
+    except (SetupError, InstallationError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not args.review:
+        return _emit({**proposal,
+                      "next": f"hermes-memory setup --hermes-home {args.hermes_home} "
+                              f"--ref {args.ref or '<tested-release-commit>'} "
+                              f"--review {proposal['review_digest']}"})
+    from .install.setup import run as apply_transaction
+
+    try:
+        return _emit(apply_transaction(settings, review=args.review,
+                                       **{**arguments,
+                                          "actor": args.actor
+                                          or settings.owner_principal or ""}))
+    except (SetupError, InstallationError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
 def _inventory_command(settings, args) -> int:
     """What is on this machine, read without changing it.
 
@@ -313,18 +364,15 @@ def _services_command(settings, args) -> int:
                           if receipt["reload_needed"] else "no reload needed"})
 
 
-def _controller(settings):
-    """The service controller, with whatever host command executor this process uses.
-
-    ``_SERVICE_RUNNER`` exists so the tests can watch the ordering claims instead of
-    running them: the alternative is a test suite that starts and stops real services.
-    """
-    from .install.services import Services
-
-    return Services(settings, runner=_SERVICE_RUNNER)
+def _controller(settings) -> Services:
+    """The service controller, with whatever host command executor this process uses."""
+    return Services(settings, runner=_HOST_RUNNER)
 
 
-_SERVICE_RUNNER: Callable[[Sequence[str]], tuple[int, str]] | None = None
+# Every command that reaches outside this process - systemctl, the host's plugin and
+# configuration writers - goes through one executor, so a test can watch the ordering
+# and refusal claims instead of starting real services on the machine running them.
+_HOST_RUNNER: Callable[[Sequence[str]], tuple[int, str]] = subprocess_runner
 
 
 def _start_command(settings) -> int:

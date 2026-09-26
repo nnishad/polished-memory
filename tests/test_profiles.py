@@ -83,8 +83,9 @@ def test_a_ledger_from_a_newer_build_is_not_read_by_this_one(home):
                ("0199_time_travel", "2026-01-01T00:00:00+00:00"))
     with pytest.raises(InstallationError, match="upgrade the framework"):
         apply_installation_migrations(db)
-    assert db.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 3, \
-        "the refusal leaves the ledger exactly as it was"
+    assert db.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == \
+        len(INSTALLATION_MIGRATIONS) + 1, \
+        "the refusal leaves the ledger exactly as it was, foreign row included"
 
 
 def test_two_profiles_can_never_share_a_bank(home):
@@ -458,7 +459,8 @@ def test_the_registry_holds_no_evidence_of_its_own(registry, home):
     enroll(registry, "work", home / "homes" / "work")
     tables = {row[0] for row in registry.db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert tables == {"schema_migrations", "profiles", "enrollment_receipts"}
+    assert tables == {"schema_migrations", "profiles", "enrollment_receipts",
+                      "setup_steps"}
 
 
 def test_scoping_a_configuration_takes_its_paths_from_the_ledger(home, tmp_path,

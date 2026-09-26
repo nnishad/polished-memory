@@ -488,7 +488,7 @@ def runner(monkeypatch):
         calls.append(list(argv))
         return 0, ""
 
-    monkeypatch.setattr("hermes_memory.cli._SERVICE_RUNNER", execute)
+    monkeypatch.setattr("hermes_memory.cli._HOST_RUNNER", execute)
     return calls
 
 
@@ -615,3 +615,90 @@ def test_a_pause_needs_somebody_to_be_answerable_for(service_home, tmp_path, mon
 def test_serve_refuses_before_binding_when_it_has_no_address(service_home):
     code, message = errors("serve")
     assert code == 2 and "ADMISSION_URL" in message
+
+
+# -- the setup transaction ------------------------------------------------------
+
+@pytest.fixture()
+def staged(home, tmp_path, monkeypatch):
+    """The same installation with a release actually staged where the units point."""
+    release = home / "runtime" / "current"
+    (release / "bin").mkdir(parents=True)
+    (release / "bin" / "hermes-memory").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    activity = tmp_path / "homes" / "work"
+    activity.mkdir(parents=True)
+    (activity / "config.yaml").write_text(
+        "model:\n  provider: openai\n  model: deepseek-chat\n\n"
+        "memory:\n  memory_enabled: true\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def execute(argv):
+        calls.append(list(argv))
+        if argv[1:3] == ["config", "set"]:
+            (activity / "config.yaml").write_text(
+                (activity / "config.yaml").read_text(encoding="utf-8")
+                + "memory:\n  provider: hermes-memory\n", encoding="utf-8")
+        return 0, ""
+
+    monkeypatch.setattr("hermes_memory.cli._HOST_RUNNER", execute)
+    return activity, calls
+
+
+def test_setup_prints_the_eleven_steps_and_writes_nothing(home, staged):
+    activity, calls = staged
+    code, report = run("setup", "--hermes-home", str(activity))
+    assert code == 0
+    assert [item["step"] for item in report["steps"]][:3] == ["inventory", "plan", "stage"]
+    assert len(report["steps"]) == 11
+    assert report["next"].endswith(report["review_digest"])
+    assert calls == []
+    assert not (home / "installation.db").exists()
+
+
+def test_setup_needs_a_home_to_be_named(home, tmp_path):
+    """argparse refuses before the installation is read at all."""
+    code, message = errors("setup")
+    assert code == 2 and "hermes-home" in message
+
+
+def test_setup_refuses_an_approval_that_is_not_the_plan_now(home, staged):
+    activity, _ = staged
+    code, message = errors("setup", "--hermes-home", str(activity), "--review", "0" * 64)
+    assert code == 2 and "does not match" in message
+    assert not (home / "installation.db").exists()
+
+
+def test_the_operator_cli_can_act_on_the_machine_it_runs_on():
+    """The default executor is the real one, and saying so is a testable claim.
+
+    Every other test hands in a recorder; if the production default were "nobody", a
+    setup run from a shell would quietly refuse to finish and nothing here would notice.
+    """
+    from hermes_memory.cli import _HOST_RUNNER
+    from hermes_memory.install.services import subprocess_runner
+
+    assert _HOST_RUNNER is subprocess_runner
+
+
+def test_a_home_that_cannot_be_resolved_is_refused_before_anything_is_read(home, staged,
+                                                                          monkeypatch):
+    monkeypatch.setattr("hermes_memory.cli._HOST_RUNNER", lambda argv: (0, ""))
+    code, message = errors("setup", "--hermes-home", "homes/work")
+    assert code == 2 and "absolute" in message
+
+
+def test_an_approved_setup_enrolls_the_profile_and_selects_the_provider(home, staged):
+    activity, calls = staged
+    _, proposal = run("setup", "--hermes-home", str(activity),
+                      "--ref", "a" * 40)
+    code, receipt = run("setup", "--hermes-home", str(activity), "--ref", "a" * 40,
+                        "--review", proposal["review_digest"])
+    assert code == 0, receipt
+    assert receipt["done"][0] == "inventory" and receipt["done"][-1] == "finish"
+    assert [call[1:3] for call in calls] == [["plugins", "install"], ["plugins", "enable"],
+                                             ["config", "set"], ["--user", "daemon-reload"]]
+    assert "provider: hermes-memory" in (activity / "config.yaml").read_text(encoding="utf-8")
+    assert "model: deepseek-chat" in (activity / "config.yaml").read_text(encoding="utf-8")
+    _, profiles = run("profiles")
+    assert [item["profile"] for item in profiles["profiles"]] == ["work"]

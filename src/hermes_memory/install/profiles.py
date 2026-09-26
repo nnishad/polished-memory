@@ -81,6 +81,22 @@ INSTALLATION_MIGRATIONS: Sequence[Migration] = (
         at TEXT NOT NULL
     )""",
      "CREATE INDEX enrollment_receipts_profile ON enrollment_receipts(profile, at)")),
+    Migration("0003_setup_steps", ("""
+    -- Setup is a transaction of eleven steps that may be interrupted at any one of
+    -- them, so each completion is recorded against the digest of the inputs that
+    -- produced it. A rerun resumes the steps whose inputs have not moved and re-plans
+    -- the ones that have, which is the difference between finishing an installation and
+    -- doing half of it twice.
+    CREATE TABLE setup_steps(
+        profile TEXT NOT NULL,
+        step TEXT NOT NULL,
+        inputs_digest TEXT NOT NULL,
+        actions TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        review_digest TEXT NOT NULL,
+        at TEXT NOT NULL,
+        PRIMARY KEY(profile, step)
+    )""",)),
 )
 
 
@@ -212,6 +228,12 @@ class ProfileRegistry:
         return cls(db, root=Path(root), owner_principal=owner_principal,
                    default_home=Path(default_home) if default_home else None,
                    detached=True)
+
+    def __enter__(self) -> "ProfileRegistry":
+        return self
+
+    def __exit__(self, *excinfo) -> None:
+        self.db.close()
 
     def _writable(self) -> None:
         if self.detached:
