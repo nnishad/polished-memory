@@ -143,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
                                    "that was shown")
     services.add_argument("--install", metavar="DIGEST",
                           help="the digest of the plan to write")
+    services.add_argument("--autostart", choices=("enable", "disable"),
+                          help="decide whether these units start at login; a separate "
+                               "decision from starting them now")
     services.add_argument("--actor")
     sub.add_parser("start", help="start the owned services, gate before backend before worker")
     stop = sub.add_parser("stop", help="persist the pause, then stop the owned services")
@@ -163,6 +166,16 @@ def main(argv: list[str] | None = None) -> int:
     backup.add_argument("--actor")
     backup.add_argument("--list", action="store_true",
                         help="report the backups that exist and take none")
+
+    restore = sub.add_parser(
+        "restore", help="take one profile's store back to a snapshot that verifies, "
+                        "keeping every decision made since; run without --review to see "
+                        "the snapshot's own facts first")
+    restore.add_argument("--snapshot", required=True)
+    restore.add_argument("--profile", help="whose store; required once one is enrolled")
+    restore.add_argument("--actor")
+    restore.add_argument("--review", metavar="DIGEST",
+                         help="the digest of the restore that was actually shown")
 
     upgrade = sub.add_parser("upgrade",
                              help="plan a switch to a staged release. It is read only: "
@@ -251,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         return _pause_command(settings, args)
     if args.command == "backup":
         return _backup_command(settings, args)
+    if args.command == "restore":
+        return _restore_command(settings, args)
     if args.command == "upgrade":
         return _upgrade_command(settings, args)
     if args.command == "uninstall":
@@ -429,6 +444,18 @@ def _services_command(settings, args) -> int:
     from .install.services import apply, plan
 
     proposal = plan(settings)
+    if args.autostart:
+        # A separate verb, because "start it now" and "start it at every login" are
+        # different decisions and only one of them is reversible by a reboot.
+        try:
+            units = _controller(settings).autostart(
+                enable=args.autostart == "enable")
+        except InstallationError as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
+        return _emit({"autostart": args.autostart, "units": units,
+                      "note": "a start never lifts a pause, so an enabled unit that finds "
+                              "inference or delivery held comes up holding it"})
     if not args.install:
         return _emit({**proposal,
                       "next": (f"hermes-memory services --install {proposal['review_digest']}"
@@ -625,8 +652,80 @@ def _backup_command(settings, args) -> int:
         return _emit({"listing": True, "profiles": present})
     return _emit({"ok": True, "actor": actor, "backups": taken, "skipped": present,
                   "note": "a snapshot is one consistent copy of one store, taken while "
-                          "the store stayed open; restoring it is `hermes-memory` recovery "
-                          "work, not this command"})
+                          "the store stayed open; take it back with `hermes-memory restore`"})
+
+
+# The facts a restore is approved against. The live epoch is in it on purpose: a store
+# another process is still writing has moved since the operator read it, and the answer to
+# that is a refusal and `hermes-memory stop`, never a rollback of a store nobody looked at.
+RESTORE_PLAN_VERSION = "restore-plan-v1"
+
+
+def _restore_command(settings, args) -> int:
+    """Show the snapshot's own facts, then take back the store that was shown.
+
+    A restore destroys every record written after the snapshot, so it is the one command
+    here that a digest has to gate: the operator sees which snapshot, what it holds, and
+    how many forgetting decisions the ledger will re-apply, and approves exactly that
+    reading. The carried rows are counted rather than printed — a plan that dumped record
+    IDs would put private evidence in the shell's scrollback.
+    """
+    from .ids import digest
+    from .install.profiles import InstallationError
+    from .lifecycle.recovery import Recovery
+    from .lifecycle.snapshots import Snapshots
+
+    try:
+        targets = _archive_targets(settings, args.profile)
+    except (InstallationError, EvidenceError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not args.profile and len(targets) != 1:
+        print(f"refused: a restore takes back one store and {len(targets)} profiles are "
+              "enrolled; name one with --profile", file=sys.stderr)
+        return 2
+    scoped = targets[0]
+    actor = args.actor or scoped.owner_principal
+    if not actor:
+        print("refused: a restore is confirmed by the owner principal and none is "
+              "configured, so nothing here could be sure who asked", file=sys.stderr)
+        return 2
+    if not scoped.db_path.is_file():
+        print(f"refused: no store at {scoped.db_path} to take back", file=sys.stderr)
+        return 2
+    try:
+        with EvidenceStore(scoped.db_path) as store:
+            snapshots = Snapshots(store, directory=Path(scoped.data_dir) / "snapshots")
+            checked = snapshots.verify(args.snapshot)
+            if not checked["ok"]:
+                print("refused: " + "; ".join(checked["problems"]), file=sys.stderr)
+                return 2
+            snapshot = snapshots.resolve(args.snapshot)
+            carried = Recovery(store, snapshots=snapshots,
+                               owner_principal=scoped.owner_principal).carry()
+            proposal = {"profile": scoped.profile, "store": str(scoped.db_path),
+                        "snapshot": snapshot.as_dict(), "notes": checked["notes"],
+                        "live_epoch": store.epoch(),
+                        "decisions_kept": {name: len(rows)
+                                           for name, rows in carried.tables.items()}}
+            review = digest([RESTORE_PLAN_VERSION, proposal])
+            if args.review is None:
+                return _emit({**proposal, "review_digest": review,
+                              "next": f"hermes-memory restore --snapshot {snapshot.id} "
+                                      f"--profile {scoped.profile} --actor {actor} "
+                                      f"--review {review}"})
+            if args.review != review:
+                print("refused: the store has moved since that plan was shown, so what "
+                      "would be destroyed is not what was approved. This is the reading "
+                      f"now: {review}", file=sys.stderr)
+                return 2
+            report = Recovery(store, snapshots=snapshots,
+                              owner_principal=scoped.owner_principal).restore(
+                                  args.snapshot, actor=actor)
+    except (EvidenceError, InstallationError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "profile": scoped.profile, **report})
 
 
 def _archive_targets(settings, profile: str | None) -> list:

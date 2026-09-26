@@ -16,7 +16,7 @@ from hermes_memory.ids import now
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
                                                    gate_path, instance_gate)
-from hermes_memory.storage.evidence import EvidenceStore
+from hermes_memory.storage.evidence import EvidenceStore, ReadOnlyStore
 
 from conftest import envelope
 
@@ -530,6 +530,47 @@ def test_an_approved_plan_writes_the_owned_unit_and_then_has_nothing_to_change(s
     assert "nothing to write" in again["next"]
 
 
+def test_autostart_is_asked_for_by_name_and_a_start_never_decides_it(service_home, runner):
+    """Enabling at login and starting now are two verbs, and only one is repeated forever.
+
+    A start that also enabled would turn one operator's one-off reboot into a permanent
+    autostart, and §10.4 keeps the two decisions apart for that reason. The receipt names
+    every unit the manager was told about, in the order it was told them, because "I
+    enabled your services" that turned out to mean one of three is the worst kind of yes.
+    """
+    (service_home / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={service_home.parent / 'data'}\n"
+        "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
+        "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+        "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n"
+        f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}\n", encoding="utf-8")
+    expected = ["hermes-memory.service", "hermes-memory-hindsight.service",
+                "hermes-memory-worker.service"]
+    _, enabled = run("services", "--autostart", "enable")
+    assert enabled["units"] == expected
+    assert [call[2:] for call in runner] == [["enable", name] for name in expected]
+    runner.clear()
+    run("start")
+    assert [call[2] for call in runner] == ["start"] * 3
+    runner.clear()
+    _, off = run("services", "--autostart", "disable")
+    assert off["units"] == list(reversed(expected))
+    assert [call[2:] for call in runner] == [["disable", name] for name in off["units"]]
+    # Asking about autostart writes no unit file: the plan was never approved here.
+    assert not (service_home.parent / "config" / "systemd" / "user"
+                / "hermes-memory.service").exists()
+
+
+def test_an_autostart_the_manager_refuses_says_which_command_failed(service_home,
+                                                                    monkeypatch):
+    """`enable` for a unit that was never installed is a real and common mistake."""
+    monkeypatch.setattr("hermes_memory.cli._HOST_RUNNER",
+                        lambda argv: (1, "Unit hermes-memory.service not loaded."))
+    code, message = errors("services", "--autostart", "enable")
+    assert code == 2
+    assert "not loaded" in message and "systemctl --user enable" in message
+
+
 def test_a_unit_that_is_not_ours_stops_both_the_install_and_the_start(service_home, runner):
     from hermes_memory.install.services import unit_directory
 
@@ -811,6 +852,116 @@ def test_a_backup_can_be_read_back_without_taking_another_one(home):
     assert [item["id"] for item in listing["profiles"][0]["snapshots"]] == \
         [made["backups"][0]["snapshot"]["id"]]
     assert len(listing["profiles"][0]["snapshots"]) == 1, "listing took nothing"
+
+
+def _snapshot_of(home, text):
+    """One record, one snapshot, then whatever the caller does next."""
+    run("init")
+    with EvidenceStore(load_settings().db_path) as store:
+        _a_message(store, text, source_id="snap-1")
+        store.bump_epoch(reason="test", actor=OWNER)
+    _, made = run("backup", "--reason", "before the mistake")
+    return made["backups"][0]["snapshot"]["id"]
+
+
+def test_a_restore_shows_what_it_would_destroy_and_destroys_nothing(home, tmp_path):
+    """The first invocation is a reading, and the reading names the live epoch.
+
+    A rollback's whole cost is the writes after the snapshot, so those have to be visible
+    before anybody approves — and the store must still be exactly as it was afterwards.
+    """
+    snapshot_id = _snapshot_of(home, "the lease ends in March")
+    with EvidenceStore(load_settings().db_path) as store:
+        later = _a_message(store, "written after the snapshot", source_id="later-1")
+        store.bump_epoch(reason="later write", actor=OWNER)
+    code, proposal = run("restore", "--snapshot", snapshot_id)
+    assert code == 0
+    assert proposal["snapshot"]["id"] == snapshot_id
+    assert proposal["live_epoch"] > proposal["snapshot"]["epoch"]
+    assert proposal["review_digest"] in proposal["next"]
+    assert "--review" in proposal["next"]
+    assert proposal["decisions_kept"], "the ledger the restore re-applies is not counted"
+    # A plan goes to a terminal, and often into a log. It counts the rows it will
+    # re-apply; it does not print the record IDs, source IDs or texts inside them.
+    assert all(isinstance(kept, int) for kept in proposal["decisions_kept"].values())
+    printed = json.dumps(proposal)
+    assert "snap-1" not in printed and "lease" not in printed
+    with EvidenceStore(load_settings().db_path) as store:
+        assert [item.id for item in store.search("written after the snapshot")] == [later]
+
+
+def test_an_approved_restore_takes_the_store_back(home):
+    snapshot_id = _snapshot_of(home, "the lease ends in March")
+    with EvidenceStore(load_settings().db_path) as store:
+        _a_message(store, "written after the snapshot", source_id="later-1")
+        store.bump_epoch(reason="later write", actor=OWNER)
+    _, proposal = run("restore", "--snapshot", snapshot_id)
+    code, report = run("restore", "--snapshot", snapshot_id,
+                       "--review", proposal["review_digest"], "--actor", OWNER)
+    assert code == 0
+    assert report["restored"] == snapshot_id
+    assert report["pre_restore_backup"].endswith(".db")
+    with ReadOnlyStore(load_settings().db_path) as store:
+        assert [item.text for item in store.search("lease")]
+        assert store.search("written after the snapshot") == []
+
+
+def test_an_approval_of_a_store_that_has_moved_since_is_refused(home):
+    """The digest covers the live epoch, so a concurrent capture invalidates it.
+
+    Approving a plan and then having the ground move under it is how a rollback destroys
+    records nobody ever looked at; the answer here is a refusal and a new reading.
+    """
+    snapshot_id = _snapshot_of(home, "the lease ends in March")
+    _, proposal = run("restore", "--snapshot", snapshot_id)
+    with EvidenceStore(load_settings().db_path) as store:
+        _a_message(store, "a write that arrived after the plan was shown",
+                   source_id="moved-1")
+        store.bump_epoch(reason="the ground moved", actor=OWNER)
+    code, message = errors("restore", "--snapshot", snapshot_id,
+                           "--review", proposal["review_digest"], "--actor", OWNER)
+    assert code == 2 and "has moved" in message
+    with ReadOnlyStore(load_settings().db_path) as store:
+        assert store.search("arrived after the plan")
+
+
+def test_a_restore_names_the_profile_when_more_than_one_store_is_enrolled(home):
+    run("init")
+    registry = ProfileRegistry.open(load_settings())
+    try:
+        for name in ("work", "personal"):
+            profile_home = home / "profiles" / name
+            profile_home.mkdir(parents=True)
+            proposal = registry.plan(name, profile_home)
+            registry.enroll(name, profile_home, actor=OWNER,
+                            review_digest=proposal["review_digest"])
+    finally:
+        registry.db.close()
+    code, message = errors("restore", "--snapshot", "anything")
+    assert code == 2 and "name one with --profile" in message
+
+
+def test_a_snapshot_that_does_not_verify_is_not_a_thing_to_restore(home, monkeypatch):
+    from hermes_memory.lifecycle.snapshots import Snapshots
+
+    snapshot_id = _snapshot_of(home, "the lease ends in March")
+    monkeypatch.setattr(Snapshots, "verify", lambda self, sid: {
+        "id": sid, "ok": False, "problems": ["the file no longer matches the digest"],
+        "notes": []})
+    code, message = errors("restore", "--snapshot", snapshot_id)
+    assert code == 2 and "no longer matches the digest" in message
+
+
+def test_an_unowned_installation_cannot_confirm_its_own_restore(tmp_path, monkeypatch):
+    root = tmp_path / "unowned"
+    (root / "data").mkdir(parents=True)
+    (root / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={root / 'data'}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(root))
+    monkeypatch.delenv("HERMES_MEMORY_DATA_DIR", raising=False)
+    run("init")
+    code, message = errors("restore", "--snapshot", "anything")
+    assert code == 2 and "owner principal" in message
 
 
 def test_an_upgrade_plan_is_read_only_even_though_it_is_called_upgrade(home, staged):
