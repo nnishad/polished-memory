@@ -275,8 +275,11 @@ def test_explain_never_prints_evidence_text_unasked(home):
     run("init")
     settings = load_settings()
     with EvidenceStore(settings.db_path) as store:
-        record = _a_message(store, text="my invoice number is 4471")
-    assert "4471" not in json.dumps(run("explain", "--record", record)[1])
+        # A marker that cannot occur by accident in the paths this report prints: the
+        # store path carries pytest's run number, and a plain digit sequence would
+        # eventually collide with it.
+        record = _a_message(store, text="my invoice number is qz4471km")
+    assert "qz4471km" not in json.dumps(run("explain", "--record", record)[1])
 
 
 def test_an_unknown_id_is_a_refusal_with_an_exit_code(home):
