@@ -630,6 +630,13 @@ def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
     if waiting["identity_candidates"]:
         notes.append(f"identity: {waiting['identity_candidates']} candidate(s) awaiting the "
                      "owner; no agent may confirm them")
+    deciding = (waiting["identity_candidates"] + waiting["candidate_assertions"]
+                + waiting["erasure_intents"])
+    if deciding:
+        # Named as a command, because a count with no door behind it is how a queue of
+        # decisions ends up waited on by nobody.
+        notes.append(f"owner: {deciding} decision(s) are yours alone; "
+                     "`hermes-memory owner --list` shows them")
     delivery = next((stage for stage in stages if stage.name == "delivery"), None)
     if delivery is not None and delivery.evidence.get("in_flight"):
         notes.append("delivery: the framework prepared artifacts that the host transport "

@@ -201,6 +201,34 @@ class ErasureManager:
             """, (_bounded(limit),)).fetchall()
         return [dict(row) for row in rows]
 
+    def awaiting(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Intents somebody opened a preview for and nobody has confirmed yet.
+
+        Counted rather than quoted. The owner has to see how big the blast radius is and
+        which digest they would be signing; a listing that printed the record IDs or text
+        would move private evidence into a terminal's scrollback, which is not where a
+        confirmation is meant to be read.
+        """
+        rows = self.db.execute(
+            "SELECT id, source, requested_at, requested_by, requester_kind, reason, "
+            "preview, preview_digest, epoch FROM erasure_ledger WHERE state=? "
+            "ORDER BY requested_at, id LIMIT ?", (AWAITING, _bounded(limit))).fetchall()
+        found = []
+        for row in rows:
+            payload = json.loads(row["preview"])
+            found.append({
+                "intent_id": row["id"], "sources": row["source"],
+                "requested_at": row["requested_at"], "requested_by": row["requested_by"],
+                "requester_kind": row["requester_kind"], "reason": row["reason"],
+                "preview_digest": row["preview_digest"], "epoch": row["epoch"],
+                "records": len(payload.get("records", [])),
+                "dependent_artifacts": len(payload.get("dependents", [])),
+                "derived_products": len(payload.get("artifacts", {})),
+                "obligations": len(payload.get("obligations", [])),
+                "confirmable_by": self.owner_principal,
+            })
+        return found
+
     def verify(self, *, intent_id: str, kind: str, reference: str) -> dict[str, Any]:
         """Mark one obligation verified. The intent completes only when all do."""
         self.db.execute("BEGIN IMMEDIATE")

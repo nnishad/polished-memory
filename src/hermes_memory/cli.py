@@ -177,6 +177,32 @@ def main(argv: list[str] | None = None) -> int:
     restore.add_argument("--review", metavar="DIGEST",
                          help="the digest of the restore that was actually shown")
 
+    owner = sub.add_parser(
+        "owner", help="the decisions this installation reserves to a human: what awaits "
+                      "confirmation, and the confirmation itself")
+    owner.add_argument("--list", action="store_true",
+                       help="the intents and candidates awaiting a decision, counted "
+                            "rather than quoted")
+    owner.add_argument("--confirm-forgetting", metavar="INTENT",
+                       help="apply the fence an earlier preview described")
+    owner.add_argument("--confirm-identity", metavar="CANDIDATE",
+                       help="say these two accounts are the same person")
+    owner.add_argument("--reject-identity", metavar="CANDIDATE",
+                       help="say they are not, durably")
+    owner.add_argument("--revoke-edge", metavar="EDGE",
+                       help="withdraw an identity that was confirmed and no longer holds")
+    owner.add_argument("--confirm-assertion", metavar="ASSERTION",
+                       help="let the archive stand behind a claim a pattern produced")
+    owner.add_argument("--retract-assertion", metavar="ASSERTION",
+                       help="stop asserting a claim that no longer holds")
+    owner.add_argument("--digest", metavar="PREVIEW_DIGEST",
+                       help="the digest of the forgetting preview being confirmed")
+    owner.add_argument("--reason")
+    owner.add_argument("--valid-from")
+    owner.add_argument("--valid-until")
+    owner.add_argument("--profile", help="whose memory; required once one is enrolled")
+    owner.add_argument("--actor")
+
     upgrade = sub.add_parser("upgrade",
                              help="plan a switch to a staged release. It is read only: "
                                   "there is no flag here that performs one")
@@ -266,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
         return _backup_command(settings, args)
     if args.command == "restore":
         return _restore_command(settings, args)
+    if args.command == "owner":
+        return _owner_command(settings, args)
     if args.command == "upgrade":
         return _upgrade_command(settings, args)
     if args.command == "uninstall":
@@ -728,8 +756,144 @@ def _restore_command(settings, args) -> int:
     return _emit({"ok": True, "profile": scoped.profile, **report})
 
 
+def _owner_command(settings, args) -> int:
+    """The decisions that are not an agent's to make, reachable by the owner.
+
+    Every other command here proposes, plans or reports. These are the ones §6.6 reserves
+    to a human: a forgetting, an identity, and the withdrawal of one. The library behind
+    each already refuses a caller who is not the named owner principal — what was missing
+    was a door, and a list of what is standing behind it waiting for somebody with one.
+    """
+    from .install.profiles import InstallationError
+    from .knowledge.assertions import AssertionStore
+    from .lifecycle.erasure import ErasureManager
+    from .storage.identity import IdentityStore
+
+    decisions = {"forgetting": args.confirm_forgetting,
+                 "identity": args.confirm_identity,
+                 "identity-rejection": args.reject_identity,
+                 "edge-revocation": args.revoke_edge,
+                 "assertion": args.confirm_assertion,
+                 "assertion-retraction": args.retract_assertion}
+    chosen = [name for name, value in decisions.items() if value]
+    if args.list and chosen:
+        print("refused: --list reads and a decision writes; ask for one or the other",
+              file=sys.stderr)
+        return 2
+    if not args.list and not chosen:
+        print("refused: nothing was asked. `hermes-memory owner --list` shows what awaits "
+              "a decision", file=sys.stderr)
+        return 2
+    try:
+        targets = _archive_targets(settings, args.profile)
+    except (InstallationError, EvidenceError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if chosen and not args.profile and len(targets) != 1:
+        print(f"refused: a decision belongs to one memory, and {len(targets)} profiles "
+              "are enrolled; name one with --profile", file=sys.stderr)
+        return 2
+    if args.list:
+        return _emit({"awaiting": _awaiting(targets)})
+    name = chosen[0]
+    scoped = targets[0]
+    if not scoped.db_path.is_file():
+        print(f"refused: no store at {scoped.db_path}", file=sys.stderr)
+        return 2
+    actor = args.actor or scoped.owner_principal
+    if not actor:
+        print("refused: no owner principal is configured, so this decision could not be "
+              "attributed to anybody; set HERMES_MEMORY_OWNER_PRINCIPAL", file=sys.stderr)
+        return 2
+    if name == "forgetting" and not args.digest:
+        print("refused: a forgetting is confirmed against the digest of the preview that "
+              "was shown; `owner --list` prints it", file=sys.stderr)
+        return 2
+    if name != "forgetting" and not (args.reason or "").strip():
+        print("refused: a decision that changes what the archive stands behind has to say "
+              "why, because it outlives this conversation", file=sys.stderr)
+        return 2
+    chosen_id = {"forgetting": args.confirm_forgetting, "identity": args.confirm_identity,
+                 "identity-rejection": args.reject_identity,
+                 "edge-revocation": args.revoke_edge,
+                 "assertion": args.confirm_assertion,
+                 "assertion-retraction": args.retract_assertion}[name]
+    try:
+        with EvidenceStore(scoped.db_path) as store:
+            if name == "forgetting":
+                outcome = ErasureManager(store, owner_principal=scoped.owner_principal)\
+                    .confirm(intent_id=chosen_id, preview_digest=args.digest, actor=actor)
+            elif name.startswith("assertion"):
+                claims = AssertionStore(store, owner_principal=scoped.owner_principal)
+                decide = claims.confirm if name == "assertion" else claims.retract
+                outcome = decide(assertion_id=chosen_id, actor=actor, reason=args.reason)
+            else:
+                identities = IdentityStore(store, owner_principal=scoped.owner_principal)
+                if name == "identity":
+                    outcome = identities.confirm(candidate_id=chosen_id, actor=actor,
+                                                 reason=args.reason,
+                                                 valid_from=args.valid_from,
+                                                 valid_until=args.valid_until)
+                elif name == "identity-rejection":
+                    outcome = identities.reject(candidate_id=chosen_id, actor=actor,
+                                                reason=args.reason)
+                else:
+                    outcome = identities.revoke(edge_id=chosen_id, actor=actor,
+                                                reason=args.reason)
+    except (EvidenceError, InstallationError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "decision": name, "profile": scoped.profile,
+                  "actor": actor, **outcome})
+
+
+def _awaiting(targets) -> list[dict[str, Any]]:
+    """What each enrolled memory is waiting on, counted rather than quoted.
+
+    A record ID or an account's identifiers are private evidence; a listing that dumped
+    them would put them in the scrollback of whatever terminal the owner was reading in.
+    The claim, the cost and the digest are what a decision actually needs — the record
+    behind it is read with `explain`, by somebody who is allowed to look.
+    """
+    from .knowledge.assertions import AssertionStore
+    from .lifecycle.erasure import ErasureManager
+    from .storage.identity import IdentityStore
+
+    found = []
+    for scoped in targets:
+        entry = {"profile": scoped.profile, "store": str(scoped.db_path),
+                 "awaiting_forgetting": [], "identity_candidates": [],
+                 "candidate_assertions": [], "confirmed_identities": 0}
+        found.append(entry)
+        if not scoped.db_path.is_file():
+            entry["reason"] = "no store yet"
+            continue
+        with ReadOnlyStore(scoped.db_path) as store:
+            manager = ErasureManager(store, owner_principal=scoped.owner_principal)
+            entry["awaiting_forgetting"] = manager.awaiting()
+            identities = IdentityStore(store, owner_principal=scoped.owner_principal)
+            entry["identity_candidates"] = [
+                {"candidate_id": row["id"], "rule": row["rule"], "basis": row["basis"],
+                 "proposed_by": row["proposed_by"], "proposed_kind": row["proposed_kind"],
+                 "accounts": [row["account_a"], row["account_b"]],
+                 "proposed_at": row["proposed_at"]}
+                for row in identities.pending()]
+            entry["confirmed_identities"] = int(store.db.execute(
+                "SELECT count(*) FROM identity_edges WHERE state='active'").fetchone()[0])
+            claims = AssertionStore(store, owner_principal=scoped.owner_principal)
+            entry["candidate_assertions"] = [
+                {"assertion_id": item.id, "subject": item.subject,
+                 "predicate": item.predicate, "value": item.value, "kind": item.kind,
+                 "unit": item.unit, "valid_from": item.valid_from,
+                 "valid_to": item.valid_to}
+                for item in claims.current(include_candidates=True)
+                if item.status == "candidate"]
+    return found
+
+
 def _archive_targets(settings, profile: str | None) -> list:
     """The configurations whose stores a backup covers."""
+
     from .install.profiles import InstallationError, ProfileRegistry
 
     if not (Path(settings.home) / "installation.db").is_file():

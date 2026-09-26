@@ -348,6 +348,7 @@ def test_an_erasure_awaiting_its_owner_is_not_a_software_failure(store):
     finding = Doctor(store).erasure()
     assert finding.severity == WARN
     assert "an agent cannot confirm an erasure" in finding.remedy
+    assert "--confirm-forgetting" in finding.remedy
 
 
 def test_an_unproven_send_is_a_failure(store):

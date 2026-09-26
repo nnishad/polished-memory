@@ -256,7 +256,9 @@ class Doctor:
             return Finding("erasure", WARN,
                            f"{backlog['awaiting_owner']} intent(s) await the owner's "
                            "confirmation",
-                           "an agent cannot confirm an erasure; the owner must", backlog)
+                           "an agent cannot confirm an erasure: `hermes-memory owner --list` "
+                           "shows the digest, and `owner --confirm-forgetting` applies it",
+                           backlog)
         return Finding("erasure", OK, "nothing is half-forgotten", evidence=backlog)
 
     def delivery(self) -> Finding:

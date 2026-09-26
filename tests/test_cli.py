@@ -12,11 +12,13 @@ import pytest
 from hermes_memory.cli import main
 from hermes_memory.config import load_settings
 from hermes_memory.install.profiles import InstallationError, ProfileRegistry
+from hermes_memory.knowledge.assertions import AssertionStore
 from hermes_memory.ids import now
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
                                                    gate_path, instance_gate)
 from hermes_memory.storage.evidence import EvidenceStore, ReadOnlyStore
+from hermes_memory.storage.identity import IdentityStore
 
 from conftest import envelope
 
@@ -781,6 +783,199 @@ def test_an_approved_setup_enrolls_the_profile_and_selects_the_provider(home, st
     assert "model: deepseek-chat" in (activity / "config.yaml").read_text(encoding="utf-8")
     _, profiles = run("profiles")
     assert [item["profile"] for item in profiles["profiles"]] == ["work"]
+
+
+# -- the owner's own decisions -------------------------------------------------
+
+def _preview_an_erasure():
+    """An agent opens a forgetting request, which is as far as an agent gets."""
+    run("init")
+    with EvidenceStore(load_settings().db_path) as store:
+        record = _a_message(store, "the invoice I am withdrawing")
+        preview = ErasureManager(store, owner_principal=OWNER).preview(
+            record_ids=[record], actor="agent:session-1", actor_kind="agent",
+            reason="asked for in chat")
+    return preview, record
+
+
+def test_the_owner_list_shows_the_digest_an_approval_has_to_carry(home):
+    """A decision the owner cannot see the shape of is a decision they cannot make.
+
+    The listing names who asked, what it would cost and which digest signs it — and not
+    the record itself, because a listing lands in a terminal's scrollback.
+    """
+    preview, record = _preview_an_erasure()
+    code, report = run("owner", "--list")
+    assert code == 0
+    awaiting = report["awaiting"][0]["awaiting_forgetting"]
+    assert [item["intent_id"] for item in awaiting] == [preview["intent_id"]]
+    assert awaiting[0]["preview_digest"] == preview["preview_digest"]
+    assert awaiting[0]["requested_by"] == "agent:session-1"
+    assert awaiting[0]["requester_kind"] == "agent"
+    assert awaiting[0]["confirmable_by"] == OWNER
+    assert awaiting[0]["records"] == 1
+    assert record not in json.dumps(report)
+
+
+def test_an_agent_s_opened_forgetting_is_closed_by_the_owner_alone(home):
+    preview, record = _preview_an_erasure()
+    intent, digest_value = preview["intent_id"], preview["preview_digest"]
+    code, message = errors("owner", "--confirm-forgetting", intent)
+    assert code == 2 and "digest of the preview" in message
+    code, message = errors("owner", "--confirm-forgetting", intent, "--digest", "0" * 64,
+                           "--actor", OWNER)
+    assert code == 2 and "does not match" in message
+    code, message = errors("owner", "--confirm-forgetting", intent, "--digest", digest_value,
+                           "--actor", "agent:session-1")
+    assert code == 2 and "owner principal" in message
+    with ReadOnlyStore(load_settings().db_path) as store:
+        assert store.live_and_visible(record), "a refused confirmation changed nothing"
+    code, outcome = run("owner", "--confirm-forgetting", intent,
+                        "--digest", digest_value, "--actor", OWNER)
+    assert code == 0
+    assert outcome["state"] in ("erasure_pending", "complete")
+    with ReadOnlyStore(load_settings().db_path) as store:
+        assert not store.live_and_visible(record)
+    _, after = run("owner", "--list")
+    assert after["awaiting"][0]["awaiting_forgetting"] == [], \
+        "a forgetting that has already happened is still asking for a decision"
+
+
+def test_a_candidate_claim_is_confirmed_and_retracted_by_the_owner_only(home):
+    """A pattern somebody noticed is not something the archive asserts on its own.
+
+    `status` counts these as awaiting the owner, so the door has to reach them too —
+    otherwise the report says somebody should decide and nobody can.
+    """
+    run("init")
+    with EvidenceStore(load_settings().db_path) as store:
+        record = _a_message(store, "Sam always pays the invoice in full")
+        proposed = AssertionStore(store, owner_principal=OWNER).propose(
+            subject="person:sam", predicate="reliability", value="pays in full",
+            kind="belief", evidence_kind="observed_pattern", record_id=record,
+            quote="pays the invoice in full", proposed_by="agent:session-1")
+    assert proposed["status"] == "candidate"
+    code, report = run("owner", "--list")
+    listed = report["awaiting"][0]["candidate_assertions"]
+    assert [item["assertion_id"] for item in listed] == [proposed["id"]]
+    assert listed[0]["value"] == "pays in full"
+    code, message = errors("owner", "--confirm-assertion", proposed["id"], "--actor", OWNER)
+    assert code == 2 and "say why" in message
+    code, message = errors("owner", "--confirm-assertion", proposed["id"], "--actor",
+                           "agent:session-1", "--reason", "my own pattern")
+    assert code == 2 and "belongs to the owner" in message
+    code, decision = run("owner", "--confirm-assertion", proposed["id"], "--actor", OWNER,
+                         "--reason", "the owner recognises the pattern")
+    assert code == 0 and decision["status"] == "confirmed" and decision["changed"] is True
+    _, asked = run("owner", "--list")
+    assert asked["awaiting"][0]["candidate_assertions"] == [], \
+        "a claim the archive already stands behind is not still asking for a decision"
+    code, retracted = run("owner", "--retract-assertion", proposed["id"], "--actor", OWNER,
+                          "--reason", "one late invoice is enough to stop asserting it")
+    assert code == 0 and retracted["status"] == "retracted"
+    _, after = run("owner", "--list")
+    assert after["awaiting"][0]["candidate_assertions"] == []
+
+
+def test_an_identity_is_confirmed_rejected_and_revoked_by_the_owner_only(home):
+    run("init")
+    with EvidenceStore(load_settings().db_path) as store:
+        record = _a_message(store, "written by Sam")
+        identities = IdentityStore(store, owner_principal=OWNER)
+        first = identities.account("email", "sam@example.com")
+        second = identities.account("email", "samuel@example.com")
+        candidate = identities.propose(
+            account_a=first, account_b=second, rule="email-normalized-equal",
+            basis="one mailbox, two spellings", evidence=[record],
+            proposed_by="agent:session-1")["candidate_id"]
+    code, message = errors("owner", "--confirm-identity", candidate, "--actor", OWNER)
+    assert code == 2 and "say why" in message
+    code, message = errors("owner", "--confirm-identity", candidate, "--actor", "agent:one",
+                           "--reason", "not my call to make")
+    assert code == 2 and "owner principal" in message
+    code, decision = run("owner", "--confirm-identity", candidate, "--actor", OWNER,
+                         "--reason", "the owner recognised both addresses")
+    assert code == 0 and decision["state"] == "confirmed"
+    code, revoked = run("owner", "--revoke-edge", decision["edge_id"], "--actor", OWNER,
+                        "--reason", "the second address belongs to a colleague")
+    assert code == 0 and revoked["state"] == "revoked"
+
+
+def test_a_rejection_is_durable_and_says_so(home):
+    run("init")
+    with EvidenceStore(load_settings().db_path) as store:
+        record = _a_message(store, "written by Sam")
+        identities = IdentityStore(store, owner_principal=OWNER)
+        first = identities.account("email", "sam@example.com")
+        second = identities.account("email", "samuel@example.com")
+        candidate = identities.propose(
+            account_a=first, account_b=second, rule="email-normalized-equal",
+            basis="one mailbox, two spellings", evidence=[record],
+            proposed_by="agent:session-1")["candidate_id"]
+    code, rejected = run("owner", "--reject-identity", candidate, "--actor", OWNER,
+                         "--reason", "they are two people")
+    assert code == 0 and rejected["state"] == "rejected"
+    code, message = errors("owner", "--confirm-identity", candidate, "--actor", OWNER,
+                           "--reason", "changed my mind")
+    assert code == 2 and "re-proposing" in message
+
+
+def test_a_decision_belongs_to_one_memory(home):
+    run("init")
+    registry = ProfileRegistry.open(load_settings())
+    try:
+        for name in ("work", "personal"):
+            profile_home = home / "profiles" / name
+            profile_home.mkdir(parents=True)
+            proposal = registry.plan(name, profile_home)
+            registry.enroll(name, profile_home, actor=OWNER,
+                            review_digest=proposal["review_digest"])
+    finally:
+        registry.db.close()
+    code, message = errors("owner", "--confirm-identity", "idc_1", "--actor", OWNER,
+                           "--reason", "which memory?")
+    assert code == 2 and "name one with --profile" in message
+    code, report = run("owner", "--list")
+    assert code == 0 and len(report["awaiting"]) == 2
+
+
+def test_an_unowned_installation_can_list_but_not_decide(tmp_path, monkeypatch):
+    root = tmp_path / "unowned"
+    (root / "data").mkdir(parents=True)
+    (root / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={root / 'data'}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(root))
+    monkeypatch.delenv("HERMES_MEMORY_DATA_DIR", raising=False)
+    run("init")
+    code, report = run("owner", "--list")
+    assert code == 0 and report["awaiting"][0]["awaiting_forgetting"] == []
+    code, message = errors("owner", "--confirm-forgetting", "erase_1", "--digest", "0" * 64)
+    assert code == 2 and "HERMES_MEMORY_OWNER_PRINCIPAL" in message
+
+
+def test_a_listing_never_opens_a_store_it_could_change(home, monkeypatch):
+    """`--list` makes no decision, so it must not hold the handle that could make one.
+
+    The writable store applies migrations on open; a reading that quietly upgraded a
+    database would be a write the owner never approved, in a command they run to look.
+    """
+    run("init")
+
+    def refusing(*args, **kwargs):
+        raise AssertionError("a listing opened the store for writing")
+
+    monkeypatch.setattr("hermes_memory.cli.EvidenceStore", refusing)
+    code, report = run("owner", "--list")
+    assert code == 0 and report["awaiting"]
+
+
+def test_a_listing_and_a_decision_are_not_asked_for_in_one_breath(home):
+    run("init")
+    code, message = errors("owner", "--list", "--confirm-identity", "idc_1",
+                           "--actor", OWNER, "--reason", "both at once")
+    assert code == 2 and "one or the other" in message
+    code, message = errors("owner")
+    assert code == 2 and "nothing was asked" in message
 
 
 # -- the archive, the release and the sources ---------------------------------

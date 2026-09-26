@@ -678,7 +678,10 @@ def test_an_awaiting_confirmation_erasure_is_named_as_the_owners_to_decide(store
            preview="{}", preview_digest="d" * 16, state="awaiting_confirmation", epoch=1)
     waiting = StatusReporter(store).pending_confirmations()
     assert waiting["erasure_intents"] == 1
-    assert StatusReporter(store).report()["erasure_backlog"]["awaiting_owner"] == 1
+    report = StatusReporter(store).report()
+    assert report["erasure_backlog"]["awaiting_owner"] == 1
+    # A count with no door behind it is how a decision ends up waited on by nobody.
+    assert any("owner --list" in note for note in report["notes"])
 
 
 def test_an_identity_candidate_waits_for_the_owner_and_for_nobody_else(store):
