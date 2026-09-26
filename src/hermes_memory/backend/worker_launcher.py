@@ -562,3 +562,11 @@ def _accepts(factory: Any, arguments: Mapping[str, Any], *, what: str) -> None:
         raise LauncherRefused(
             f"{what} no longer accepts {', '.join(unexpected)}; this launcher is pinned to "
             f"hindsight-api-slim {PINNED_VERSION} and will not guess at a newer signature")
+
+
+if __name__ == "__main__":
+    # The unit's ExecStart is `python -m hermes_memory.backend.worker_launcher`, so this
+    # guard is not a convenience: without it the module imports, runs nothing, and exits 0
+    # — which `Restart=on-failure` reads as a service that stopped cleanly, on a machine
+    # whose owner believes the worker is draining.
+    raise SystemExit(main())

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -391,6 +394,24 @@ def test_launching_refuses_before_touching_a_model_here(capsys, tmp_path, monkey
     assert main([]) == 2
     captured = capsys.readouterr()
     assert "refused" in captured.err and captured.out == ""
+
+
+def test_the_unit_verb_runs_the_module_the_unit_names(tmp_path):
+    """``ExecStart`` is ``python -m hermes_memory.backend.worker_launcher``, in a process.
+
+    Every other test here calls ``main()`` directly, which cannot see the difference between
+    a module with an entry point and one without: the latter imports, runs nothing and exits
+    ``0``, and a unit with ``Restart=on-failure`` reads that as a service that stopped
+    cleanly. The worker would be dead, the journal quiet, and the archive unprojected.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-m", "hermes_memory.backend.worker_launcher", "--check"],
+        env={**os.environ, "HERMES_MEMORY_HOME": str(tmp_path)},
+        capture_output=True, text=True)
+    verdict = json.loads(completed.stdout)
+    assert verdict["launcher_version"] == LAUNCHER_VERSION
+    assert completed.returncode == (0 if verdict["ok"] else 2)
+    assert "postgresql://" not in completed.stdout + completed.stderr
 
 
 def test_a_present_backend_missing_a_pinned_symbol_is_refused_by_name(monkeypatch):
