@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import pytest
 from hermes_memory.install.profiles import ProfileRegistry, open_installation
@@ -108,6 +109,46 @@ def test_is_available_never_touches_the_network(plugin, tmp_path, monkeypatch):
     instance = plugin.HermesMemoryProvider()
     assert instance.is_available() is True  # capture-only is a valid operating state
     assert "hindsight" not in instance.unavailable_reason().lower()
+
+
+def test_a_missing_runtime_names_the_runtime_rather_than_the_configuration(plugin,
+                                                                          monkeypatch):
+    """"configuration refused" would send an operator to an env file that is fine.
+
+    §10.2 wants the hook to stop with the setup instruction instead of bootstrapping a
+    runtime from inside a conversation, so the sentence has to say what is absent and what
+    to run — and must not promise to install anything.
+    """
+    monkeypatch.setitem(sys.modules, "hermes_memory", None)
+    monkeypatch.setitem(sys.modules, "hermes_memory.config", None)
+    instance = plugin.HermesMemoryProvider()
+    assert instance.is_available() is False
+    reason = instance.unavailable_reason()
+    assert "runtime is not importable" in reason
+    assert "hermes-memory setup" in reason
+    assert "configuration refused" not in reason
+    assert "never installs it" in reason
+
+
+def test_a_missing_dependency_of_our_own_is_named_and_not_blamed_on_the_config(plugin,
+                                                                              monkeypatch):
+    """The runtime is here; something it needs is not. Say which.
+
+    Both branches read as "it will not start", and only one of them is fixed by installing
+    hermes-memory. An operator sent to the release tree when a data package is missing
+    reinstalls the wrong thing and arrives at the same sentence.
+    """
+    import hermes_memory.config as config_layer
+
+    def missing(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'zoneinfo_data'", name="zoneinfo_data")
+
+    monkeypatch.setattr(config_layer, "load_settings", missing)
+    instance = plugin.HermesMemoryProvider()
+    assert instance.is_available() is False
+    reason = instance.unavailable_reason()
+    assert "cannot start without zoneinfo_data" in reason
+    assert "configuration refused" not in reason
 
 
 def test_refused_route_reports_a_reason_instead_of_crashing(plugin, tmp_path, monkeypatch):

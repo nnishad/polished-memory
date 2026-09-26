@@ -193,6 +193,20 @@ class HermesMemoryProvider(_MemoryProvider):
             from hermes_memory.config import load_settings
 
             self._settings = load_settings()
+        except ModuleNotFoundError as error:
+            name = error.name or ""
+            if name != "hermes_memory" and not name.startswith("hermes_memory."):
+                # Something else the runtime needs is missing. Naming that module is the
+                # useful half of the sentence; "configuration refused" would send the
+                # operator to a file that has nothing wrong with it.
+                self._unavailable = f"the runtime cannot start without {name}: {error}"
+                return False
+            self._unavailable = (
+                "the hermes-memory runtime is not importable from the process that is "
+                "starting Hermes. Install the framework release into that environment and "
+                "run `hermes-memory setup --hermes-home <profile home>`; a conversation "
+                "never installs it, and no package is fetched on the way past")
+            return False
         except Exception as error:  # a refused route must not crash the agent
             self._unavailable = f"configuration refused: {error}"
             return False
