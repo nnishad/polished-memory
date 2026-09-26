@@ -740,6 +740,21 @@ class HermesMemoryProvider(_MemoryProvider):
         except sqlite3.Error:
             pass
 
+    def _delivery_state(self) -> str:
+        """Whether anything may leave this machine, and why not if it may not.
+
+        Reported from the bound profile's own configuration: two profiles on one
+        installation can have different decisions here, and a status line that said
+        "delivery is on" because one of them enabled it would be a lie about the
+        other.
+        """
+        if self._activity is None:
+            return "not authorised (no profile is bound)"
+        from .delivery import DeliveryPolicy
+
+        blocked = DeliveryPolicy.from_settings(self._activity.settings).refusal()
+        return f"not authorised ({blocked})" if blocked else "enabled for the approved destination"
+
     def get_config_schema(self) -> list[dict[str, Any]]:
         return [
             {"key": "data_dir", "description": "Directory for canonical memory data",
@@ -776,7 +791,7 @@ class HermesMemoryProvider(_MemoryProvider):
             # A disabled semantic layer is reported, never presented as healthy.
             "formation": "paused (capture-only)" if capture_only else "enabled",
             "observations": "not started" if capture_only else "see backend coverage",
-            "delivery": "not authorised",
+            "delivery": self._delivery_state(),
             "agent_context": self._agent_context,
             "writes_enabled": self._capturing,
             "model_config_untouched": True,
@@ -809,20 +824,26 @@ def _namespace_of(value: str) -> str:
     return "handle"
 
 
-def post_setup(hermes_home: str, config: dict[str, Any]) -> None:
-    """Profile enrollment only.
+def post_setup(hermes_home: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Profile configuration only, and one command left to run.
 
     Hermes calls this from ``hermes memory setup <provider>`` and hands over
-    configuration, testing and activation. It must NOT re-enter the full
-    framework wizard, or the two entry points recurse into each other; runtime
-    and plugin installation have already happened by this point.
+    configuration, testing and activation. It must NOT re-enter the framework wizard —
+    the two entry points would recurse — and it must not enroll the profile either:
+    enrollment decides whose memory a conversation is answered from, and that is an
+    owner action with its own reviewed diff, so this returns the plan and the exact
+    command instead of applying it.
     """
     home = Path(hermes_home)
     provider = HermesMemoryProvider()
     if not provider.is_available():
         raise RuntimeError(f"memory provider unavailable: {provider.unavailable_reason()}")
-    config.setdefault("memory", {})["provider"] = PROVIDER_NAME
-    provider.save_config(dict(config.get("memory_settings") or {}), str(home))
+    settings = dict(config.get("memory_settings") or {})
+    provider.save_config(settings, str(home))
+    from .setup import report
+
+    return report(home, instance_home=provider._settings.home)
 
 
-__all__ = ["PROVIDER_NAME", "HermesMemoryProvider", "post_setup", "write_env_file"]
+__all__ = ["PROVIDER_NAME", "HermesMemoryProvider", "post_setup", "write_env_file",
+           "CHECKPOINT_API_VERSION"]
