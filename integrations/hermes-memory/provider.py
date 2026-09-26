@@ -22,9 +22,18 @@ from typing import Any
 # ``RecallStatus`` has to carry the same *fields*: the host reads attributes off
 # it, so a shape that only works against a stub is a shape that fails in place.
 try:  # pragma: no cover - exercised by whichever path the interpreter has
-    from agent.memory_provider import MemoryProvider as _MemoryProvider, RecallStatus
+    from agent.memory_provider import (MemoryProvider as _MemoryProvider, RecallStatus,
+                                        spawn_context_thread)
 except Exception:  # pragma: no cover
+    import threading
     from dataclasses import dataclass
+
+    def spawn_context_thread(target, *, name, daemon=True, args=(), kwargs=None):
+        """Stand-in for the host helper: the real one rebinds the spawner's
+        contextvars, which is how a background job stays on the profile that
+        started it."""
+        return threading.Thread(target=target, args=args,
+                                kwargs=kwargs or {}, name=name, daemon=daemon)
 
     @dataclass(frozen=True)
     class RecallStatus:  # type: ignore[no-redef]
@@ -49,9 +58,21 @@ except Exception:  # pragma: no cover
             raise NotImplementedError
 
 
+from .client import BindingError, bind, unenrolled_reason
 from .spool import CaptureSpool
 
 PROVIDER_NAME = "hermes-memory"
+
+# The checkpoint contract this plugin has actually been tested against, written as
+# a literal rather than imported from the host: if Hermes ever raises the version,
+# this provider must fail the host's compatibility check and say so, not inherit an
+# upgraded claim it was never exercised under.
+CHECKPOINT_API_VERSION = 2
+
+# A write, in the sense Hermes means it: something a cron pass or a delegated
+# subagent must not do to the owner's memory on its own initiative.
+_WRITING_TOOLS = frozenset({"memory_remember", "memory_identity_candidate",
+                            "memory_forget_request"})
 
 # A prefetch rides along with every turn, so it stays small enough that memory
 # never becomes the bulk of the context window.
@@ -135,18 +156,25 @@ _TOOLS = [
 class HermesMemoryProvider(_MemoryProvider):
     """Thin transport: durable local capture, bounded reads, no embedded backend."""
 
-    # Advertised only once the pre-compress checkpoint is genuinely durable.
-    pre_compress_checkpoint_api_version = 1
+    # Advertised only because every accepted spool append is committed with
+    # synchronous=FULL, and a required checkpoint raises rather than returning empty.
+    pre_compress_checkpoint_api_version = CHECKPOINT_API_VERSION
 
     def __init__(self) -> None:
         self._home: Path | None = None
         self._spool: CaptureSpool | None = None
         self._settings: Any = None
+        self._activity: Any = None
+        self._binding_error = ""
         self._session_id = ""
+        self._agent_context = "primary"
         self._last_injected = 0
         self._unavailable = ""
         self._context: Any = None
         self._store: Any = None
+        # One warmed packet per session, keyed to the question it answers.
+        self._queued: dict[str, tuple[str, int, str, int]] = {}
+        self._generation = 0
 
     # -- required ------------------------------------------------------------
 
@@ -155,7 +183,12 @@ class HermesMemoryProvider(_MemoryProvider):
         return PROVIDER_NAME
 
     def is_available(self) -> bool:
-        """Config and dependencies only. Never the network, never a model call."""
+        """Config and dependencies only. Never the network, never a model call.
+
+        Profile binding is checked at ``initialize``, which is where the host first
+        names the home: there is nothing to look up before that, and looking up the
+        default profile to guess at it is the failure this whole module refuses.
+        """
         try:
             from hermes_memory.config import load_settings
 
@@ -167,19 +200,52 @@ class HermesMemoryProvider(_MemoryProvider):
         return True
 
     def unavailable_reason(self) -> str:
-        return self._unavailable
+        return self._unavailable or self._binding_error
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        """Bind to the profile this activity is running in, or bind to nothing.
+
+        ``hermes_home`` is always supplied by the host and is never guessed: one
+        gateway serves many profiles, so the home cached from the first caller would
+        answer later conversations out of the wrong archive.
+        """
         self._session_id = session_id
-        # hermes_home is always supplied by the host; never hardcode ~/.hermes,
-        # because one gateway process serves many profiles.
-        home = kwargs.get("hermes_home")
-        base = Path(home) if home else (self._settings.data_dir if self._settings else Path.home())
-        self._home = base
-        # Whichever store it was built against, a new session must not inherit
-        # the previous one's connection or its packet cache.
+        # A subagent, cron run or flush pass is not a conversation with this
+        # profile's owner, so it captures nothing of its own.
+        self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._close_context()
-        self._spool = CaptureSpool(Path(base) / "hermes-memory" / "capture-spool.db")
+        self._close_spool()
+        self._queued.clear()
+        home = kwargs.get("hermes_home")
+        if not home:
+            self._activity = None
+            self._binding_error = unenrolled_reason("<no hermes_home from the host>")
+            return
+        try:
+            self._activity = bind(home, settings=self._settings)
+        except BindingError as error:
+            self._activity = None
+            self._binding_error = str(error)
+            return
+        self._binding_error = ""
+        self._home = self._activity.hermes_home
+        self._activity.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self._spool = CaptureSpool(self._activity.spool_path)
+
+    @property
+    def _capturing(self) -> bool:
+        """Whether this context is a conversation whose turns we may record.
+
+        Private on purpose: the host's hook surface is fixed, and a public member
+        it does not know is a member that will never be called.
+        """
+        return self._agent_context == "primary"
+
+    def _bound(self):
+        if self._activity is None:
+            raise BindingError(self._binding_error
+                               or "the provider has not been initialised for any profile")
+        return self._activity
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [dict(tool) for tool in _TOOLS]
@@ -202,7 +268,7 @@ class HermesMemoryProvider(_MemoryProvider):
         raising, the turn is fsynced locally. Projection to the derived backend
         happens later and separately.
         """
-        if self._spool is None:
+        if self._spool is None or not self._capturing:
             return
         event_id = f"turn:{session_id or self._session_id}:{len(messages or [])}"
         self._spool.append(
@@ -230,6 +296,13 @@ class HermesMemoryProvider(_MemoryProvider):
             return self._status()
         if tool_name == "memory_recall":
             return self._recall(str(args.get("query", "")), int(args.get("limit") or 10))
+        if tool_name in _WRITING_TOOLS and not self._capturing:
+            # Hermes says a non-primary context writes nothing, and a candidate, a
+            # forgetting intent and a remembered statement are all writes: a cron run
+            # or a subagent may report, but it does not get to edit the owner's memory.
+            raise ValueError(
+                f"{tool_name} is not accepted from a {self._agent_context} context; "
+                "ask in the conversation itself")
         if tool_name == "memory_remember":
             return self._remember(args)
         if tool_name == "memory_identity_candidate":
@@ -249,8 +322,9 @@ class HermesMemoryProvider(_MemoryProvider):
         evidence = args.get("evidence") or []
         if not isinstance(evidence, list) or not evidence:
             raise ValueError("evidence must be a nonempty list of canonical record ids")
+        settings = self._bound().settings
         with self._open_store() as store:
-            identity = IdentityStore(store, owner_principal=self._settings.owner_principal)
+            identity = IdentityStore(store, owner_principal=settings.owner_principal)
             first = identity.account(_namespace_of(account_a), account_a)
             second = identity.account(_namespace_of(account_b), account_b)
             outcome = identity.propose(
@@ -287,7 +361,7 @@ class HermesMemoryProvider(_MemoryProvider):
             if not matches:
                 return {"ok": True, "erased": False, "matched": 0,
                         "note": "no live evidence matched; nothing to preview"}
-            settings = self._settings
+            settings = self._bound().settings
             manager = ErasureManager(store, owner_principal=settings.owner_principal)
             preview = manager.preview(
                 record_ids=[item.id for item in matches],
@@ -310,12 +384,17 @@ class HermesMemoryProvider(_MemoryProvider):
             }
 
     def _open_store(self):
+        """The canonical store of the profile this activity was bound to.
+
+        Deliberately not the instance configuration's own: a gateway that resolved
+        its home once at startup would keep serving the first profile's archive to
+        every later conversation.
+        """
         from hermes_memory.storage.evidence import EvidenceStore
 
-        if self._settings is None:
-            raise RuntimeError("provider is not configured")
-        self._settings.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        return EvidenceStore(self._settings.db_path)
+        settings = self._bound().settings
+        settings.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        return EvidenceStore(settings.db_path)
 
     def _recall(self, query: str, limit: int) -> dict[str, Any]:
         """One packet, assembled by the same broker prefetch() uses.
@@ -335,33 +414,51 @@ class HermesMemoryProvider(_MemoryProvider):
     def _broker(self):
         """One broker per provider instance: a cache only pays off across turns.
 
-        The derived channel is deliberately absent. There is no profile-to-bank
-        mapping until the installer writes one, and guessing a bank would read as
-        a working semantic channel while answering out of nobody's data.
+        The derived channel is the *profile's* bank, named by the instance ledger.
+        Until a profile was resolvable there was no honest value to pass: a guessed
+        bank reads exactly like a working semantic channel while answering out of
+        nobody's data, and a shared bank answers out of somebody else's.
         """
         if self._context is None:
-            if self._settings is None:
-                raise RuntimeError("provider is not configured")
+            activity = self._bound()
+            settings = activity.settings
             from hermes_memory.context import ContextBroker
             from hermes_memory.knowledge.assertions import AssertionStore
 
             self._store = self._open_store()
             self._context = ContextBroker(
-                self._store, client=None, budget_tokens=_PREFETCH_TOKENS,
-                assertions=AssertionStore(
-                    self._store, owner_principal=self._settings.owner_principal),
-                derived_timeout_s=self._settings.foreground_deadline_s)
+                self._store, client=self._derived_client(activity),
+                budget_tokens=_PREFETCH_TOKENS,
+                assertions=AssertionStore(self._store,
+                                          owner_principal=settings.owner_principal),
+                derived_timeout_s=settings.foreground_deadline_s)
         return self._context
+
+    def _derived_client(self, activity):
+        """A configured backend for this profile, or None. Never a network probe."""
+        settings = activity.settings
+        if settings.capture_only or not settings.hindsight_url:
+            return None
+        from hermes_memory.backend.hindsight_client import HindsightClient
+
+        return HindsightClient(base_url=settings.hindsight_url, bank_id=activity.bank_id,
+                               api_key=activity.secret(settings.hindsight_api_key_env),
+                               timeout=settings.foreground_deadline_s)
 
     def _remember(self, args: dict[str, Any]) -> dict[str, Any]:
         content = str(args.get("content", "")).strip()
         if not content:
             raise ValueError("content must not be empty")
+        from hermes_memory.ids import digest
+
         with self._open_store() as store:
             revision = str(store.epoch())
             committed = store.commit({
                 "source": "hermes",
-                "source_id": f"explicit:{hash(content) & 0xFFFFFFFF:08x}",
+                # Not ``hash()``: Python salts string hashes per process, so an
+                # id built from it would differ after every restart and the same
+                # statement would be remembered twice.
+                "source_id": f"explicit:{digest(content)[:16]}",
                 "revision": revision,
                 "kind": "explicit_remember",
                 "text": content,
@@ -369,7 +466,8 @@ class HermesMemoryProvider(_MemoryProvider):
                 "occurred_at": None,
                 "occurred_precision": "unknown",
                 "metadata": {"context": str(args.get("context", "user preference"))[:200],
-                             "session_id": self._session_id},
+                             "session_id": self._session_id,
+                             "profile": self._bound().name},
             })
             return {"ok": True, "id": committed["id"], "captured": True, "formed": False}
 
@@ -389,11 +487,21 @@ class HermesMemoryProvider(_MemoryProvider):
         Hermes abandons an external prefetch after 8 seconds; the configured
         foreground deadline is validated to stay below that, and a derived
         channel that misses it is dropped rather than making the turn late.
+
+        A packet warmed by :meth:`queue_prefetch` is used only when it answers
+        *this* question for *this* session; anything else is discarded rather than
+        injected, because last turn's recollection is how a turn goes confidently
+        wrong.
         """
         if not query or not query.strip():
             return ""
+        wanted = query.strip()
+        warmed = self._consume_queued(wanted, session_id)
+        if warmed is not None:
+            self._last_injected = warmed[1]
+            return warmed[0]
         try:
-            packet = self._broker().assemble(query, limit=8)
+            packet = self._broker().assemble(wanted, limit=8)
         except Exception as error:
             # A store we cannot read is not an empty archive, and the difference
             # is the whole reason the packet carries its channels.
@@ -402,6 +510,47 @@ class HermesMemoryProvider(_MemoryProvider):
                     "Treat this as retrieval failure, not as absence.)")
         self._last_injected = len(packet.items)
         return packet.render()
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Warm next turn's packet in the background; :meth:`prefetch` consumes it.
+
+        A purely local answer is assembled inline: a thread that adds nothing but
+        scheduling noise to a millisecond of FTS is not what the hook is for. The
+        background path is for the derived channel, which is the only part that can
+        be slow — and it runs on the host's context-preserving spawner, because a
+        worker started with an empty context lands on the default profile.
+        """
+        if not query or not query.strip():
+            return
+        wanted = query.strip()
+        key = session_id or self._session_id
+        generation = self._generation
+
+        def _warm() -> None:
+            try:
+                packet = self._broker().assemble(wanted, limit=8)
+            except Exception:
+                return  # a failed warm leaves nothing queued, and prefetch() will try
+            if self._generation != generation:
+                return  # rebound since; this answer belongs to no live session
+            self._queued[key] = (wanted, generation, packet.render(), len(packet.items))
+
+        try:
+            derived = self._bound().settings
+        except BindingError:
+            return
+        if derived.hindsight_url and not derived.capture_only:
+            spawn_context_thread(_warm, name=f"memory-prefetch-{PROVIDER_NAME}").start()
+            return
+        _warm()
+
+    def _consume_queued(self, query: str, session_id: str) -> tuple[str, int] | None:
+        """The warmed packet for exactly this session and question, or None."""
+        key = session_id or self._session_id
+        entry = self._queued.pop(key, None)
+        if entry is None or entry[0] != query or entry[1] != self._generation:
+            return None
+        return entry[2], entry[3]
 
     def recall_status(self) -> RecallStatus | None:
         """Reflect only the last injection, never a stale count."""
@@ -412,27 +561,119 @@ class HermesMemoryProvider(_MemoryProvider):
 
     # -- lifecycle -----------------------------------------------------------
 
+    def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
+                          reset: bool = False, rewound: bool = False, **kwargs) -> None:
+        """Rebind per-session state; the identity of the *profile* does not move.
+
+        ``/resume``, ``/branch``, ``/reset`` and compression all reassign the session
+        id without tearing the provider down. What has to be dropped is anything
+        cached against the old id, so a later write cannot land in the wrong
+        transcript. A rewind truncates the conversation the model sees; it is not a
+        request to forget, and nothing here deletes captured evidence.
+        """
+        previous = self._session_id
+        self._session_id = new_session_id or previous
+        # Anything warmed under the previous binding answers a question that is
+        # no longer the upcoming one.
+        self._generation += 1
+        self._queued.pop(previous, None)
+        self._queued.pop(self._session_id, None)
+        self._close_context()
+        if reset:
+            self._checkpoint_spool()
+
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+        """Final capture at a real session boundary, then a bounded local flush.
+
+        Deduplicated by a digest of the transcript, so a replayed boundary is one
+        event rather than two. The flush is to the *spool*: waiting for every
+        Hindsight job at the end of a conversation would make an outage hold the
+        session open, which is exactly the coupling this spool exists to break.
+        """
+        if self._spool is None or not self._capturing:
+            return
+        from hermes_memory.ids import digest
+
+        bodies = [(str(message.get("role") or ""), str(message.get("content") or ""))
+                  for message in messages or []]
+        transcript = [(role, text) for role, text in bodies
+                      if text.strip() and role in {"user", "assistant"}]
+        self._spool.append(
+            event_id=f"session-end:{self._session_id}:{digest(transcript)[:24]}",
+            session_id=self._session_id,
+            created_at=_utc_now(),
+            payload={"kind": "session_end", "turns": len(transcript),
+                     "messages": [{"role": role, "text": text[:4000]}
+                                  for role, text in transcript][-_MAX_ITEMS:]},
+        )
+        self._checkpoint_spool()
+
+    def on_delegation(self, task: str, result: str, *, child_session_id: str = "",
+                      **kwargs) -> None:
+        """Parent-side provenance for a finished delegation.
+
+        The subagent has no provider session and its transcript is not ours to read,
+        so what is captured is the task, the returned result and the child's id —
+        enough to attribute where an answer came from, not a way to inherit its
+        memory scope.
+        """
+        if self._spool is None or not self._capturing:
+            return
+        if not (task or "").strip() and not (result or "").strip():
+            return
+        from hermes_memory.ids import digest
+
+        self._spool.append(
+            event_id=f"delegation:{self._session_id}:{digest([child_session_id, task,
+                                                              result])[:24]}",
+            session_id=self._session_id,
+            created_at=_utc_now(),
+            payload={"kind": "delegation", "task": str(task)[:4000],
+                     "result": str(result)[:4000], "child_session_id": child_session_id,
+                     "scope": "parent-side observation only; the child transcript "
+                              "was not read"},
+        )
+
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: dict[str, Any] | None = None) -> None:
         """Mirror a successful native Hermes memory write as evidence.
 
         Mirroring is not replacing: the native store remains authoritative for
         curated notes, and a note change never deletes original evidence.
+        ``metadata['previous_content']`` is carried through, so a replace says
+        what it replaced rather than merely what it became.
         """
-        if self._spool is None or action not in {"add", "replace", "remove"}:
+        if (self._spool is None or not self._capturing
+                or action not in {"add", "replace", "remove"}):
             return
+        from hermes_memory.ids import digest
+
+        provenance = metadata or {}
         self._spool.append(
-            event_id=f"native:{target}:{action}:{hash(content) & 0xFFFFFFFF:08x}",
-            session_id=str((metadata or {}).get("session_id", self._session_id)),
+            event_id=f"native:{target}:{action}:{digest([content,
+                                                         provenance.get('previous_content')])[:16]}",
+            session_id=str(provenance.get("session_id", self._session_id)),
             created_at=_utc_now(),
             payload={"kind": "native_memory_write", "action": action, "target": target,
-                     "content": content, "metadata": metadata or {}},
+                     "content": content, "metadata": provenance},
         )
 
-    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
-        """Checkpoint the transcript to the spool before it is compacted away."""
-        if self._spool is None:
+    def on_pre_compress(self, messages: list[dict[str, Any]], *,
+                        require_checkpoint: bool = False) -> str:
+        """Checkpoint the transcript to the spool before it is compacted away.
+
+        The event id carries the message digest as well as the index: after a rewind
+        the same index can hold different words, and an id that names only the
+        position would let the first version win and the later one be dropped in
+        silence. With ``require_checkpoint`` the host is asking for a guarantee
+        rather than a courtesy, so a failed write is raised, not swallowed.
+        """
+        if self._spool is None or not self._capturing:
+            if require_checkpoint:
+                raise RuntimeError("no durable capture spool is bound to this session")
             return ""
+        from hermes_memory.ids import digest
+
         for index, message in enumerate(messages):
             if message.get("role") not in {"user", "assistant"}:
                 continue
@@ -440,11 +681,12 @@ class HermesMemoryProvider(_MemoryProvider):
             if not isinstance(body, str) or not body.strip():
                 continue
             self._spool.append(
-                event_id=f"precompress:{self._session_id}:{index}",
+                event_id=f"precompress:{self._session_id}:{index}:{digest(body)[:12]}",
                 session_id=self._session_id,
                 created_at=_utc_now(),
                 payload={"kind": "pre_compress", "role": message["role"], "text": body},
             )
+        self._checkpoint_spool()
         return ""
 
     def backup_paths(self) -> list[str]:
@@ -452,22 +694,21 @@ class HermesMemoryProvider(_MemoryProvider):
         paths: list[str] = []
         if self._spool is not None:
             paths.append(str(self._spool.path))
-        if self._settings is not None:
+        if self._activity is not None:
+            paths.append(str(self._activity.data_dir))
+        elif self._settings is not None:
+            # Unbound: the instance directory is still this installation's own state,
+            # and naming it is the difference between a backup and a surprise.
             paths.append(str(self._settings.data_dir))
         return paths
 
     def shutdown(self) -> None:
         self._close_context()
-        if self._spool is not None:
-            try:
-                self._spool.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            self._spool.close()
-            self._spool = None
+        self._close_spool()
 
     def _close_context(self) -> None:
         """Release the read connection and the packet cache with it."""
+        self._queued.clear()
         if self._context is not None:
             self._context.close()
             self._context = None
@@ -478,6 +719,26 @@ class HermesMemoryProvider(_MemoryProvider):
                 pass
             self._store.close()
             self._store = None
+
+    def _close_spool(self) -> None:
+        if self._spool is not None:
+            self._checkpoint_spool()
+            self._spool.close()
+            self._spool = None
+
+    def _checkpoint_spool(self) -> None:
+        """Fold the write-ahead log into the spool file. Local, bounded, no backend.
+
+        This is the whole of what a session end can promise: accepted events are in
+        one file that survives a crash, not scattered across a WAL that the next
+        process has to guess about.
+        """
+        if self._spool is None:
+            return
+        try:
+            self._spool.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         return [
@@ -495,18 +756,29 @@ class HermesMemoryProvider(_MemoryProvider):
         write_env_file(Path(hermes_home), values)
 
     def _status(self) -> dict[str, Any]:
-        settings = self._settings
+        activity = self._activity
+        settings = activity.settings if activity is not None else self._settings
         spool_counts = self._spool.counts() if self._spool else {}
         capture_only = bool(settings.capture_only) if settings else True
         return {
             "provider": PROVIDER_NAME,
             "configured": settings is not None,
+            # Whose memory this is, and whether the answer was looked up rather
+            # than assumed. An unbound provider reports itself as such instead of
+            # quietly answering out of the default profile.
+            "bound": activity is not None,
+            "profile": activity.name if activity is not None else "unbound",
+            "bank_id": activity.bank_id if activity is not None else "unknown",
+            "activity_home": str(activity.hermes_home) if activity is not None
+            else self._binding_error or "not bound",
             "capture": "operational" if self._spool is not None else "not initialised",
             "capture_backlog": spool_counts.get("pending", 0),
             # A disabled semantic layer is reported, never presented as healthy.
             "formation": "paused (capture-only)" if capture_only else "enabled",
             "observations": "not started" if capture_only else "see backend coverage",
             "delivery": "not authorised",
+            "agent_context": self._agent_context,
+            "writes_enabled": self._capturing,
             "model_config_untouched": True,
         }
 

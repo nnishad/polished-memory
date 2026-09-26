@@ -459,3 +459,29 @@ def test_the_registry_holds_no_evidence_of_its_own(registry, home):
     tables = {row[0] for row in registry.db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == {"schema_migrations", "profiles", "enrollment_receipts"}
+
+
+def test_scoping_a_configuration_takes_its_paths_from_the_ledger(home, tmp_path,
+                                                                monkeypatch):
+    """An env file cannot point a profile at somebody else's store.
+
+    The ledger decides data_dir, bank and credential scope; the configuration decides
+    everything else. Reordering that would let a stray HERMES_MEMORY_DATA_DIR in one
+    profile's file merge two profiles into one archive.
+    """
+    from hermes_memory.config import load_settings
+
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.setenv("HERMES_MEMORY_OWNER_PRINCIPAL", OWNER)
+    monkeypatch.setenv("HERMES_MEMORY_DATA_DIR", str(tmp_path / "somewhere-else"))
+    settings = load_settings()
+    registry = ProfileRegistry.open(settings)
+    enroll(registry, "work", home / "homes" / "work")
+    scoped = registry.profile("work").scoped(settings)
+    assert scoped.data_dir == home / "profiles" / "work"
+    assert scoped.db_path == home / "profiles" / "work" / "canonical.db"
+    assert scoped.bank_id == "hermes-work"
+    assert scoped.profile == "work"
+    assert scoped.background_budget_tokens == settings.background_budget_tokens
+    assert settings.data_dir == tmp_path / "somewhere-else", \
+        "the instance configuration itself is untouched"

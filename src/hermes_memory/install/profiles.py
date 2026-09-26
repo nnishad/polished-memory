@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from ..config import scoped_settings
 from ..ids import digest, now
 from ..storage.migrations import MIGRATION_LEDGER, Migration, connect
 
@@ -148,6 +149,15 @@ class Profile:
     @property
     def blob_dir(self) -> Path:
         return self.data_dir / "blobs"
+
+    def scoped(self, settings):
+        """The instance configuration as this profile's memory.
+
+        Paths, bank and credential scope come from the ledger row; everything the
+        operator set about routes and budgets stays as it is.
+        """
+        return scoped_settings(settings, profile=self.profile, data_dir=self.data_dir,
+                               bank_id=self.bank_id, credential_scope=self.credential_scope)
 
     def as_dict(self, *, private: bool = False) -> dict[str, Any]:
         out = {"profile": self.profile, "bank_id": self.bank_id, "state": self.state,

@@ -335,9 +335,11 @@ class Doctor:
         if settings is None or not settings.hindsight_url:
             return None
         from ..backend.hindsight_client import HindsightClient
+        from ..config import scoped_secret
 
-        key = (os.environ.get(settings.hindsight_api_key_env or "") or None
-               if settings.hindsight_api_key_env else None)
+        # Scoped through the profile ledger: a doctor run for one profile must not
+        # sign its probe with another profile's key.
+        key = scoped_secret(settings, settings.hindsight_api_key_env)
         return HindsightClient(base_url=settings.hindsight_url, bank_id=self.probe_bank,
                                api_key=key)
 

@@ -15,7 +15,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
-__all__ = ["Migration", "MIGRATIONS", "apply_migrations", "current_version", "connect"]
+__all__ = ["Migration", "MIGRATIONS", "MIGRATION_LEDGER", "apply_migrations",
+           "current_version", "connect"]
 
 MIGRATION_LEDGER = "CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
 

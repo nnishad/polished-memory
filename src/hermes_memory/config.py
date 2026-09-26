@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import ipaddress
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
-__all__ = ["Settings", "SettingError", "load_settings", "validate_inference_route"]
+__all__ = ["Settings", "SettingError", "load_settings", "validate_inference_route",
+           "scoped_settings", "scoped_secret", "DEFAULT_PROFILE", "DEFAULT_BANK"]
 
 
 class SettingError(RuntimeError):
@@ -22,6 +23,11 @@ class SettingError(RuntimeError):
 
 
 DEFAULT_ENV_FILENAME = "hermes-memory.env"
+
+# The name the single-profile installation has always used, so an installation that
+# never enrolled a profile keeps its existing bank and secret variable names.
+DEFAULT_PROFILE = "default"
+DEFAULT_BANK = "hermes"
 
 # Hermes abandons an external prefetch after this many seconds. A foreground
 # deadline at or above it is a number the host will never honour, so it is
@@ -145,6 +151,11 @@ class Settings:
     max_output_tokens: OutputCaps = field(default_factory=OutputCaps)
     route_credentials: dict[str, str] = field(default_factory=dict)
     gate_token: str | None = None
+    # Which enrolled profile these paths belong to. A configuration with no profile
+    # name is the installation's own default; a resolved activity always carries one.
+    profile: str = DEFAULT_PROFILE
+    bank_id: str = DEFAULT_BANK
+    credential_scope: str = "profile-default"
 
     @property
     def capture_only(self) -> bool:
@@ -233,6 +244,51 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         route_credentials=_credentials(values),
         gate_token=(get("GATE_TOKEN") or "").strip() or None,
     )
+
+
+def scoped_settings(settings: Settings, *, profile: str, data_dir: str | os.PathLike[str],
+                    bank_id: str, credential_scope: str) -> Settings:
+    """The instance configuration, pointed at one enrolled profile's memory.
+
+    Only the paths and the scope change. Routes, budgets and the allowlist stay as the
+    operator set them, because another profile is another *person's* memory rather than
+    another policy — and because the ledger, not an env file, decides where a profile's
+    evidence lives, so a profile's own file cannot point two profiles at one store.
+    """
+    for name, value in (("profile", profile), ("bank_id", bank_id),
+                        ("credential_scope", credential_scope)):
+        if not isinstance(value, str) or not value.strip():
+            raise SettingError(f"{name} must be nonempty text to scope a configuration")
+    directory = Path(data_dir)
+    if not directory.is_absolute():
+        raise SettingError(f"profile {profile!r} data_dir must be absolute, got {directory}")
+    return replace(settings, profile=profile.strip(), data_dir=directory,
+                   db_path=directory / "canonical.db", blob_dir=directory / "blobs",
+                   bank_id=bank_id.strip(), credential_scope=credential_scope.strip())
+
+
+def scoped_secret(settings: Settings, name: str | None) -> str | None:
+    """Read one credential *for this profile's scope*, with no fallback for the others.
+
+    A single gateway process carries every profile's environment, so an unscoped lookup
+    would let the second profile sign its requests with the first one's key. The scope is
+    part of the variable name; a profile without its own scoped secret has none, and its
+    route stays unavailable rather than borrowing. Only the default profile — the one
+    installation that never had a scope to distinguish — may use the bare name.
+    """
+    if not name or not isinstance(name, str):
+        return None
+    wanted = name.strip()
+    if not wanted:
+        return None
+    prefix = settings.credential_scope.strip().upper().replace("-", "_")
+    scoped = os.environ.get(f"{prefix}_{wanted}") if prefix else None
+    if scoped and scoped.strip():
+        return scoped.strip()
+    if settings.profile != DEFAULT_PROFILE:
+        return None
+    bare = os.environ.get(wanted)
+    return bare.strip() if bare and bare.strip() else None
 
 
 def _route(get, allowed: frozenset[str], key: str, *, default_resource: str):

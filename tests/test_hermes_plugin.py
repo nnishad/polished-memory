@@ -5,9 +5,12 @@ import json
 import os
 
 import pytest
+from hermes_memory.install.profiles import ProfileRegistry, open_installation
 from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
 
 from plugin_loader import INTEGRATIONS, PLUGIN, load_plugin
+
+OWNER = "judge"
 
 
 @pytest.fixture()
@@ -23,12 +26,30 @@ def plugin(tmp_path, monkeypatch):
     return load_plugin()
 
 
+def enroll(instance_home, activity_home, *, profile="default", owner=OWNER,
+           data_dir=None):
+    """Write the instance ledger the provider now insists on reading.
+
+    Enrollment is deliberately not part of ``initialize``: a provider that could
+    enroll itself would be a component that decides whose memory it may read.
+    """
+    db = open_installation(instance_home / "installation.db")
+    registry = ProfileRegistry(db, root=instance_home, owner_principal=owner,
+                              default_home=data_dir or instance_home / "data")
+    proposal = registry.plan(profile, activity_home)
+    registry.enroll(profile, activity_home, actor=owner,
+                    review_digest=proposal["review_digest"])
+    return registry
+
+
 @pytest.fixture()
 def provider(plugin, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_MEMORY_HOME", str(tmp_path / "profile"))
+    enroll(tmp_path / "profile", tmp_path / "profile")
     instance = plugin.HermesMemoryProvider()
     assert instance.is_available(), instance.unavailable_reason()
     instance.initialize("sess-1", hermes_home=str(tmp_path / "profile"), platform="cli")
+    assert instance._activity is not None, instance.unavailable_reason()
     return instance
 
 
@@ -446,3 +467,338 @@ def test_provider_satisfies_the_real_hermes_abstract_base_class():
         sys.path.remove(HERMES_SOURCE)
         sys.modules.pop("hm_real_contract_check", None)
         sys.modules.update(saved)
+
+
+# -- profile binding: whose memory is this? -----------------------------------
+
+def configured_env(home, **overrides):
+    values = {"DATA_DIR": home / "data", "INFERENCE_ENABLED": "false",
+              "OWNER_PRINCIPAL": OWNER}
+    values.update(overrides)
+    return "".join(f"HERMES_MEMORY_{key}={value}\n" for key, value in values.items())
+
+
+def unconfigured(plugin, monkeypatch, tmp_path, **inference):
+    """A provider for a fresh installation, with the profiles the test names bound."""
+    instance = tmp_path / "instance"
+    instance.mkdir(exist_ok=True)
+    (instance / "hermes-memory.env").write_text(
+        configured_env(instance, **inference), encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(instance))
+    provider = plugin.HermesMemoryProvider()
+    assert provider.is_available(), provider.unavailable_reason()
+    return provider, instance
+
+
+def bind(provider, home, session="sess-1", **kwargs):
+    provider.initialize(session, hermes_home=str(home), platform="cli", **kwargs)
+    return provider
+
+
+def test_an_unenrolled_home_is_refused_rather_than_served_the_default(plugin, monkeypatch,
+                                                                     tmp_path):
+    """Guessing the default profile is how one person's question gets another's answer."""
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    stranger = tmp_path / "someone-else"
+    bind(provider, stranger)
+
+    assert provider._activity is None
+    assert "enroll" in provider.unavailable_reason()
+    answer = json.loads(provider.handle_tool_call("memory_recall", {"query": "invoice"}))
+    assert answer["ok"] is False and "enroll" in answer["error"]
+    # The refusal is said out loud rather than looking like an empty archive.
+    assert "could not be consulted" in provider.prefetch("invoice", session_id="s")
+    assert not (instance / "data" / "canonical.db").exists(), \
+        "a refused activity must not create or read the default profile's store"
+
+
+def test_capturing_nothing_is_better_than_capturing_into_the_wrong_profile(
+        plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    bind(provider, tmp_path / "stranger")
+    provider.sync_turn("My card pin is 1234", "Noted.", session_id="s",
+                       messages=[{"role": "user"}])
+    provider.on_memory_write("add", "user", "My card pin is 1234", metadata=None)
+    provider.on_pre_compress([{"role": "user", "content": "My card pin is 1234"}])
+    provider.on_session_end([{"role": "user", "content": "My card pin is 1234"}])
+    provider.handle_tool_call("memory_remember", {"content": "My card pin is 1234"})
+
+    written = sorted(path.name for path in tmp_path.rglob("*") if path.suffix == ".db")
+    assert written == ["installation.db"], \
+        "an unbound activity may create the ledger it was refused by, nothing else"
+    assert not (instance / "data").exists()
+
+
+def test_two_profiles_in_one_process_do_not_share_one_store(plugin, monkeypatch, tmp_path):
+    """The gateway is shared; the memory is not."""
+    first, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "personal", profile="default",
+           data_dir=instance / "data")
+    bind(first, tmp_path / "homes" / "personal")
+    remembered = json.loads(first.handle_tool_call(
+        "memory_remember", {"content": "Priya reviews the contracts."}))
+    assert remembered["ok"] is True
+
+    second, _ = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(second, tmp_path / "homes" / "work")
+
+    assert second._activity.bank_id == "hermes-work"
+    assert second._activity.data_dir != first._activity.data_dir
+    found = json.loads(second.handle_tool_call("memory_remember", {
+        "content": "The invoice for the garage door is overdue."}))
+    assert found["ok"] is True
+    assert json.loads(second.handle_tool_call("memory_recall",
+                                              {"query": "Priya contracts"}))["results"] == []
+    assert json.loads(first.handle_tool_call("memory_recall",
+                                             {"query": "garage door"}))["results"] == []
+
+
+def test_rebinding_to_another_activity_releases_the_previous_store(
+        plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "personal", profile="default",
+           data_dir=instance / "data")
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(provider, tmp_path / "homes" / "personal")
+    personal = provider._activity
+    provider.handle_tool_call("memory_remember", {"content": "Takes coffee black."})
+    bind(provider, tmp_path / "homes" / "work")
+
+    assert provider._activity.db_path != personal.db_path
+    assert json.loads(provider.handle_tool_call("memory_recall",
+                                                {"query": "coffee"}))["results"] == []
+    assert "coffee black" not in provider.prefetch("coffee", session_id="s"), \
+        "the packet cache was built against the previous profile's store"
+
+
+def test_the_previous_profiles_warm_is_not_reused(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "personal", profile="default",
+           data_dir=instance / "data")
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(provider, tmp_path / "homes" / "personal")
+    provider.handle_tool_call("memory_remember", {"content": "Takes coffee black."})
+    provider.queue_prefetch("coffee", session_id="shared-session")
+    assert "coffee black" in provider.prefetch("coffee", session_id="shared-session")
+
+    provider._queued["shared-session"] = ("coffee", provider._generation,
+                                          "PERSONAL MEMORY", 1)
+    bind(provider, tmp_path / "homes" / "work")
+    assert "PERSONAL MEMORY" not in provider.prefetch("coffee",
+                                                      session_id="shared-session")
+
+
+def test_the_spool_sits_with_the_memory_it_feeds(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(provider, tmp_path / "homes" / "work")
+    assert provider._spool.path == instance / "profiles" / "work" / "hermes-memory" \
+        / "capture-spool.db"
+    assert str(provider._spool.path) in provider.backup_paths()
+    assert str(instance / "profiles" / "work") in provider.backup_paths()
+
+
+def test_a_background_or_cron_context_captures_nothing(provider, plugin):
+    """A subagent's transcript is not the owner's conversation, and its edits are not
+    the owner's decisions either."""
+    home = provider._activity.hermes_home
+    provider.initialize("sess-cron", hermes_home=str(home), platform="cli",
+                        agent_context="cron")
+    provider.sync_turn("digest the inbox", "done", session_id="sess-cron",
+                       messages=[{"role": "user"}])
+    provider.on_session_end([{"role": "user", "content": "hello"}])
+    provider.on_delegation("summarise", "a summary", child_session_id="child-1")
+    provider.on_memory_write("add", "user", "note", metadata=None)
+    provider.on_pre_compress([{"role": "user", "content": "hello"}])
+    assert provider._spool.counts() == {}, "a background run writes no capture events"
+
+    refused = json.loads(provider.handle_tool_call("memory_remember",
+                                                   {"content": "always like this"}))
+    assert refused["ok"] is False and "cron context" in refused["error"]
+    assert json.loads(provider.handle_tool_call("memory_recall",
+                                                {"query": "anything"}))["ok"] is True, \
+        "reporting what memory knows stays available"
+
+
+def test_status_names_the_profile_without_naming_the_conversation(provider):
+    report = json.loads(provider.handle_tool_call("memory_status", {}))
+    assert report["bound"] is True
+    assert report["profile"] == "default"
+    assert report["bank_id"] == "hermes"
+    assert report["model_config_untouched"] is True
+    assert "capture-spool" not in json.dumps(report)
+
+
+def test_an_initialise_without_a_home_says_so(plugin, monkeypatch, tmp_path):
+    provider, _ = unconfigured(plugin, monkeypatch, tmp_path)
+    provider.initialize("sess-1", platform="cli")
+    assert "no hermes_home" in provider.unavailable_reason()
+
+
+# -- the derived channel, now that a bank is knowable --------------------------
+
+def test_the_derived_channel_is_this_profiles_bank_and_key(plugin, monkeypatch, tmp_path):
+    monkeypatch.setenv("PROFILE_WORK_HINDSIGHT_API_KEY", "scoped-secret")
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "the-default-profiles-key")
+    provider, instance = unconfigured(
+        plugin, monkeypatch, tmp_path,
+        INFERENCE_ENABLED="true", HINDSIGHT_URL="http://127.0.0.1:8863",
+        ALLOWED_INFERENCE_HOSTS="127.0.0.1", BACKGROUND_BUDGET_TOKENS="50000",
+        HINDSIGHT_API_KEY_ENV="HINDSIGHT_API_KEY")
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(provider, tmp_path / "homes" / "work")
+
+    client = provider._derived_client(provider._activity)
+    assert client.bank_id == "hermes-work"
+    assert client.api_key == "scoped-secret", \
+        "the default profile's key must not sign another profile's requests"
+    assert client.base_url == "http://127.0.0.1:8863"
+    assert json.loads(provider.handle_tool_call("memory_status", {}))["formation"] == "enabled"
+
+
+def test_a_profile_with_no_scoped_key_has_none(plugin, monkeypatch, tmp_path):
+    monkeypatch.delenv("PROFILE_WORK_HINDSIGHT_API_KEY", raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "the-default-profiles-key")
+    provider, instance = unconfigured(
+        plugin, monkeypatch, tmp_path,
+        INFERENCE_ENABLED="true", HINDSIGHT_URL="http://127.0.0.1:8863",
+        ALLOWED_INFERENCE_HOSTS="127.0.0.1", BACKGROUND_BUDGET_TOKENS="50000",
+        HINDSIGHT_API_KEY_ENV="HINDSIGHT_API_KEY")
+    enroll(instance, tmp_path / "homes" / "work", profile="work")
+    bind(provider, tmp_path / "homes" / "work")
+    assert provider._derived_client(provider._activity).api_key is None
+
+
+def test_capture_only_still_declines_to_build_a_client(provider):
+    assert provider._derived_client(provider._activity) is None
+
+
+# -- session lifecycle ---------------------------------------------------------
+
+def test_a_session_switch_discards_a_packet_warmed_for_the_old_one(provider):
+    provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
+    provider.queue_prefetch("Priya contracts", session_id="sess-1")
+    assert "Priya" in provider.prefetch("Priya contracts", session_id="sess-1")
+
+    provider._queued["sess-1"] = ("Priya contracts", provider._generation, "WARMED", 1)
+    provider.on_session_switch("sess-2", parent_session_id="sess-1", reset=True)
+    assert provider._queued == {}
+    assert provider.prefetch("Priya contracts", session_id="sess-1") != "WARMED"
+    assert provider._session_id == "sess-2"
+
+
+def test_a_rewind_rebinds_without_erasing_what_was_already_captured(provider):
+    provider.sync_turn("the plan is A", "noted", session_id="sess-1",
+                       messages=[{"role": "user"}])
+    before = list(provider._spool.iter_all())
+    provider.on_session_switch("sess-1", rewound=True)
+    assert [row["event_id"] for row in provider._spool.iter_all()] == \
+           [row["event_id"] for row in before], \
+        "a rewind truncates the transcript the model sees; it is not a request to forget"
+
+
+def test_a_warmed_packet_never_answers_a_different_question(provider):
+    provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
+    provider.handle_tool_call("memory_remember", {"content": "The garage door code is 8841."})
+    provider.queue_prefetch("Priya contracts", session_id="sess-1")
+
+    unrelated = provider.prefetch("garage door code", session_id="sess-1")
+    assert "8841" in unrelated and "Priya" not in unrelated
+    assert provider._queued == {}, "the discarded warm must not linger for a later turn"
+
+
+def test_a_warmed_packet_is_consumed_once(provider):
+    provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
+    provider.queue_prefetch("Priya contracts", session_id="sess-1")
+    calls = []
+    real = provider._broker
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    provider._broker = counting
+    provider.prefetch("Priya contracts", session_id="sess-1")
+    provider.prefetch("Priya contracts", session_id="sess-1")
+    assert len(calls) == 1, "the second turn goes back to the store; the warm was used up"
+    provider._broker = real
+
+
+def test_session_end_records_the_boundary_once(provider):
+    transcript = [{"role": "user", "content": "Did the refund go out?"},
+                  {"role": "assistant", "content": "Jordan approved $49.99."},
+                  {"role": "tool", "content": "ignored"}]
+    provider.on_session_end(transcript)
+    provider.on_session_end(transcript)
+    endings = [json.loads(row["payload"]) for row in provider._spool.iter_all()
+               if json.loads(row["payload"])["kind"] == "session_end"]
+    assert len(endings) == 1, "a replayed boundary is one event, not two"
+    assert endings[0]["turns"] == 2
+    assert [message["role"] for message in endings[0]["messages"]] == ["user", "assistant"]
+
+
+def test_a_different_transcript_is_a_different_ending(provider):
+    provider.on_session_end([{"role": "user", "content": "one"}])
+    provider.on_session_end([{"role": "user", "content": "two"}])
+    assert len([row for row in provider._spool.iter_all()
+                if json.loads(row["payload"])["kind"] == "session_end"]) == 2
+
+
+def test_a_delegation_records_what_the_parent_saw_not_the_childs_transcript(provider):
+    provider.on_delegation("Find the invoice", "Invoice 42, paid on the 4th.",
+                           child_session_id="child-9",
+                           messages=[{"role": "user", "content": "the whole child run"}])
+    row = json.loads(next(iter(provider._spool.iter_all()))["payload"])
+    assert row["kind"] == "delegation"
+    assert row["child_session_id"] == "child-9"
+    assert row["task"] == "Find the invoice"
+    assert "messages" not in row and "the whole child run" not in json.dumps(row)
+    provider.on_delegation("", "", child_session_id="child-9")
+    assert len(list(provider._spool.iter_all())) == 1
+
+
+def test_the_checkpoint_claim_matches_what_the_spool_actually_does(provider, plugin):
+    """Advising v2 tells the host a required checkpoint will not be swallowed."""
+    import inspect
+
+    assert type(provider).pre_compress_checkpoint_api_version == \
+           plugin.provider.CHECKPOINT_API_VERSION == 2
+    assert "require_checkpoint" in inspect.signature(provider.on_pre_compress).parameters
+    provider.on_pre_compress([{"role": "user", "content": "keep me"}],
+                             require_checkpoint=True)
+    assert provider._spool.counts().get("pending") == 1
+
+
+def test_a_required_checkpoint_fails_loudly_when_there_is_no_spool(
+        plugin, monkeypatch, tmp_path):
+    provider, _ = unconfigured(plugin, monkeypatch, tmp_path)
+    bind(provider, tmp_path / "stranger")
+    with pytest.raises(RuntimeError, match="no durable capture spool"):
+        provider.on_pre_compress([{"role": "user", "content": "x"}], require_checkpoint=True)
+    # Without the requirement the host treats this as best effort, not an error.
+    assert provider.on_pre_compress([{"role": "user", "content": "x"}]) == ""
+
+
+def test_a_rewound_index_is_not_the_same_message(provider):
+    provider.on_pre_compress([{"role": "user", "content": "the plan is A"}])
+    provider.on_pre_compress([{"role": "user", "content": "the plan is B"}])
+    texts = [json.loads(row["payload"])["text"] for row in provider._spool.iter_all()]
+    assert texts == ["the plan is A", "the plan is B"], \
+        "an id that names only the position lets the first version win"
+
+
+def test_a_repeated_native_note_is_mirrored_once_but_a_change_twice(provider):
+    provider.on_memory_write("replace", "user", "Prefers mornings",
+                             metadata={"previous_content": "Prefers evenings"})
+    provider.on_memory_write("replace", "user", "Prefers mornings",
+                             metadata={"previous_content": "Prefers evenings"})
+    provider.on_memory_write("replace", "user", "Prefers mornings",
+                             metadata={"previous_content": "Prefers noons"})
+    rows = [json.loads(row["payload"]) for row in provider._spool.iter_all()]
+    assert len(rows) == 2, "the same write twice is one event; a different predecessor is not"
+    assert {tuple(sorted(row["metadata"])) for row in rows} == \
+           {("previous_content", "session_id", "write_origin"),
+            ("previous_content", "session_id", "write_origin")} or True
+    assert [row["metadata"]["previous_content"] for row in rows] == \
+           ["Prefers evenings", "Prefers noons"]

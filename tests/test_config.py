@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_memory.config import SettingError, load_settings, validate_inference_route
+from hermes_memory.config import (SettingError, load_settings, scoped_secret,
+                                  scoped_settings, validate_inference_route)
 
 APPROVED_LAN = "192.168.68.65"
 
@@ -195,3 +196,77 @@ def test_the_default_foreground_deadline_leaves_room_inside_the_host_stop(tmp_pa
     monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
     settings = load_settings()
     assert 0 < settings.foreground_deadline_s < 8.0
+
+
+# -- per-profile configuration -------------------------------------------------
+
+def instance(tmp_path, monkeypatch, extra=None):
+    home = tmp_path / "instance"
+    values = {"HERMES_MEMORY_DATA_DIR": tmp_path / "data",
+              "HERMES_MEMORY_INFERENCE_ENABLED": "false"}
+    values.update(extra or {})
+    write_env(home, values)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.delenv("HERMES_MEMORY_DATA_DIR", raising=False)
+    return load_settings()
+
+
+def test_scoping_a_configuration_moves_only_the_memory_it_names(tmp_path, monkeypatch):
+    settings = instance(tmp_path, monkeypatch)
+    scoped = scoped_settings(settings, profile="work", data_dir=tmp_path / "w",
+                             bank_id="hermes-work", credential_scope="profile-work")
+    assert scoped.db_path == tmp_path / "w" / "canonical.db"
+    assert scoped.blob_dir == tmp_path / "w" / "blobs"
+    assert (scoped.profile, scoped.bank_id, scoped.credential_scope) == \
+           ("work", "hermes-work", "profile-work")
+    # The policy stays the operator's: another profile is another person's memory,
+    # not another permission to reach a model or spend a budget.
+    for field in ("hindsight_url", "allowed_inference_hosts", "inference_enabled",
+                  "background_budget_tokens", "owner_principal", "text_route",
+                  "max_output_tokens", "foreground_deadline_s", "gate_token", "home"):
+        assert getattr(scoped, field) == getattr(settings, field), field
+
+
+@pytest.mark.parametrize("field", ["profile", "bank_id", "credential_scope"])
+@pytest.mark.parametrize("junk", ["", "   ", None, 6])
+def test_a_scoped_configuration_must_name_everything_it_scopes(tmp_path, monkeypatch,
+                                                               field, junk):
+    settings = instance(tmp_path, monkeypatch)
+    arguments = {"profile": "work", "data_dir": tmp_path / "w", "bank_id": "hermes-work",
+                 "credential_scope": "profile-work"}
+    arguments[field] = junk
+    with pytest.raises(SettingError, match=f"{field} must be nonempty text"):
+        scoped_settings(settings, **arguments)
+
+
+def test_a_relative_data_directory_cannot_be_smuggled_in(tmp_path, monkeypatch):
+    settings = instance(tmp_path, monkeypatch)
+    with pytest.raises(SettingError, match="must be absolute"):
+        scoped_settings(settings, profile="work", data_dir="elsewhere",
+                        bank_id="hermes-work", credential_scope="profile-work")
+
+
+def test_a_scoped_profile_never_reads_the_default_profiles_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "default-key")
+    monkeypatch.setenv("PROFILE_WORK_HINDSIGHT_API_KEY", "work-key")
+    settings = instance(tmp_path, monkeypatch)
+    work = scoped_settings(settings, profile="work", data_dir=tmp_path / "w",
+                           bank_id="hermes-work", credential_scope="profile-work")
+    assert scoped_secret(work, "HINDSIGHT_API_KEY") == "work-key"
+    assert scoped_secret(settings, "HINDSIGHT_API_KEY") == "default-key"
+
+
+def test_a_profile_without_its_own_secret_has_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "default-key")
+    monkeypatch.delenv("PROFILE_WORK_HINDSIGHT_API_KEY", raising=False)
+    work = scoped_settings(instance(tmp_path, monkeypatch), profile="work",
+                           data_dir=tmp_path / "w", bank_id="hermes-work",
+                           credential_scope="profile-work")
+    assert scoped_secret(work, "HINDSIGHT_API_KEY") is None, \
+        "falling back would sign one profile's requests with another's key"
+
+
+@pytest.mark.parametrize("name", [None, "", "   ", 7])
+def test_a_secret_with_no_name_is_no_secret(tmp_path, monkeypatch, name):
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "default-key")
+    assert scoped_secret(instance(tmp_path, monkeypatch), name) is None

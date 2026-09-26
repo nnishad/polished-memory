@@ -26,6 +26,9 @@ provides_tools:
 # Hooks this plugin actually implements. Anything not listed here is not
 # claimed: notably there is no provider-initiated notification hook in Hermes,
 # so proactive output is left as a durable artifact for cron to collect.
+# on_turn_start and identity_signature are deliberately absent — the host calls
+# them, but we have nothing verified to do with them, and a hook we cannot
+# describe is a hook we should not have installed.
 provides_hooks:
   - sync_turn
   - prefetch
@@ -34,6 +37,7 @@ provides_hooks:
   - on_memory_write
   - on_session_end
   - on_session_switch
+  - on_delegation
   - backup_paths
 
 # Maps to plugins.entries.hermes-memory.settings. Distinct from the provider's
