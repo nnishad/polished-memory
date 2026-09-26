@@ -64,6 +64,20 @@ def test_a_supersession_chain_is_walked_to_its_head(store, lineage):
     assert lineage.chain(ids[2])["ancestors"] == []
 
 
+def test_a_chain_of_corrections_builds_itself(store, lineage):
+    ids = [commit(store, "msg-1", f"Version {n}.", revision=str(n)) for n in (1, 2, 3)]
+
+    # Nobody called supersede. Each commit retired the revision it replaced, and the
+    # pointers still run one step at a time rather than sending the first straight to the
+    # last, so "what did we believe then" has an answer for every date rather than only
+    # for the newest one.
+    assert lineage.current("gmail", "msg-1") == ids[2]
+    assert lineage.chain(ids[0])["ancestors"] == [ids[1], ids[2]]
+    assert lineage.chain(ids[0])["head"] == ids[2]
+    assert [item["revision"] for item in lineage.revisions("gmail", "msg-1",
+                                                           include_hidden=False)] == ["3"]
+
+
 def test_a_supersession_cycle_is_reported_rather_than_walked_forever(store, lineage):
     first = commit(store, "msg-1", "One.")
     second = commit(store, "msg-1", "Two.", revision="2")

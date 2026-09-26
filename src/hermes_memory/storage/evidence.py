@@ -161,6 +161,48 @@ def journal(db: sqlite3.Connection, record_pk: str, change: str,
     return int(cursor.lastrowid)
 
 
+def _visible_head(db: sqlite3.Connection, source: str, source_id: str,
+                  *, exclude: str) -> str | None:
+    """The revision that stands for one source item right now, if any does.
+
+    Ingestion order decides, because it is the only ordering this store can observe: a
+    source's revision token is frequently a content digest, and two digests do not
+    compare. A connector reporting the item again *is* the source's account of what is
+    current now — and the earlier revision remains in the table, answerable as history.
+    """
+    row = db.execute(
+        """
+        SELECT r.id FROM records r LEFT JOIN record_visibility v ON v.record_id = r.id
+        WHERE r.source=? AND r.source_id=? AND r.deleted=0 AND r.id<>?
+          AND COALESCE(v.hidden, 0)=0
+        ORDER BY r.ingested_at DESC, r.revision DESC LIMIT 1
+        """, (source, source_id, exclude)).fetchone()
+    return None if row is None else str(row["id"])
+
+
+def _apply_supersede(db: sqlite3.Connection, old_id: str, new_id: str, *,
+                     reason: str, actor: str) -> None:
+    """Hide one revision and point it at its replacement. Requires an ambient transaction.
+
+    The old row is preserved and merely leaves the live set: a correction has to stay
+    quotable, or "what did we believe then" becomes unanswerable exactly when someone
+    asks it — which is after the thing was corrected.
+    """
+    _required_text(reason, "reason", 500)
+    _required_text(actor, "actor", 500)
+    db.execute(
+        """
+        INSERT INTO record_visibility(record_id, hidden, replacement_id, reason, changed_at)
+        VALUES(?, 1, ?, ?, ?)
+        ON CONFLICT(record_id) DO UPDATE SET
+            hidden=1, replacement_id=excluded.replacement_id,
+            reason=excluded.reason, changed_at=excluded.changed_at
+        """,
+        (old_id, new_id, reason, now()),
+    )
+    db.execute("DELETE FROM record_fts WHERE id=?", (old_id,))
+
+
 class EvidenceStore:
     def __init__(self, path: str | Path):
         path = Path(path)
@@ -347,6 +389,18 @@ class EvidenceStore:
             "INSERT INTO ingestion_receipts(id, record_id, observed_at, envelope) VALUES(?,?,?,?)",
             (prepared.receipt_id, prepared.id, prepared.observed_at, prepared.receipt),
         )
+        # A second revision of one source item corrects the first, and a correction that
+        # leaves the old bytes in the live set is not a correction: retrieval would keep
+        # answering "the flight is on the 12th" beside "…on the 14th", and every derived
+        # claim that quoted the old revision would still report itself supported. The row
+        # survives; only its standing changes.
+        replaced = _visible_head(db, prepared.source, prepared.source_id, exclude=prepared.id)
+        if replaced is not None:
+            _apply_supersede(db, replaced, prepared.id,
+                             reason=f"revised to {prepared.revision}", actor=prepared.source)
+            self._audit("evidence_supersede", replaced, {"actor": prepared.source,
+                                                          "replacement": prepared.id})
+            journal(db, replaced, "supersede", source=prepared.source, generation=generation)
         self._audit("evidence_commit", prepared.id, {"source": prepared.source})
         journal(db, prepared.id, "add", source=prepared.source, generation=generation)
         return prepared.id, False
@@ -357,7 +411,6 @@ class EvidenceStore:
         The old row is preserved: 'what did we believe at the time' is a valid
         query and must remain answerable.
         """
-        _required_text(reason, "reason", 500)
         self.db.execute("BEGIN IMMEDIATE")
         try:
             for candidate in (old_id, new_id):
@@ -365,17 +418,7 @@ class EvidenceStore:
                     raise EvidenceError(f"unknown record {candidate!r}")
             if old_id == new_id:
                 raise EvidenceError("a record cannot supersede itself")
-            self.db.execute(
-                """
-                INSERT INTO record_visibility(record_id, hidden, replacement_id, reason, changed_at)
-                VALUES(?, 1, ?, ?, ?)
-                ON CONFLICT(record_id) DO UPDATE SET
-                    hidden=1, replacement_id=excluded.replacement_id,
-                    reason=excluded.reason, changed_at=excluded.changed_at
-                """,
-                (old_id, new_id, reason, now()),
-            )
-            self.db.execute("DELETE FROM record_fts WHERE id=?", (old_id,))
+            _apply_supersede(self.db, old_id, new_id, reason=reason, actor=actor)
             self._audit("evidence_supersede", old_id, {"actor": actor, "replacement": new_id})
             journal(self.db, old_id, "supersede")
             self.db.execute("COMMIT")

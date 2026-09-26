@@ -197,6 +197,21 @@ def test_a_claim_that_lost_its_evidence_stops_being_returned(store, claims, note
     assert review[0]["reason"] == "the cited evidence is hidden or forgotten"
 
 
+def test_a_correction_sends_the_claim_that_quoted_the_old_wording_to_review(
+        store, claims, note):
+    assertion = propose(claims, note)["id"]
+    store.commit(envelope(revision="2", text="Correction: I work from home on Wednesdays."))
+
+    # Ingress supersedes the revision it replaces, so a claim resting on the withdrawn
+    # wording leaves `current()` and becomes reviewable. This is the same door an erasure
+    # reaches, arrived at by a source that simply changed its mind: the correction does not
+    # delete the claim, it stops pretending the evidence is still there.
+    assert claims.current() == []
+    review = claims.needs_review()
+    assert [item["assertion"]["id"] for item in review] == [assertion]
+    assert review[0]["reason"] == "the cited evidence is hidden or forgotten"
+
+
 def test_forgetting_the_evidence_invalidates_the_claim_through_the_real_path(
         store, claims, note):
     claim = propose(claims, note)

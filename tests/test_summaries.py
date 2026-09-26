@@ -189,9 +189,15 @@ def test_a_correction_after_publication_makes_it_stale(store, summaries, inciden
                           text="Correction: the build broke at 04:12 and stayed broken."))
 
     assert summaries.is_stale(summaries.get(out["id"])) is True
+    # Two reasons, because a correction says two things at once: the window has new
+    # material (so the summary is out of date) and the sentence the summary quoted is no
+    # longer live evidence (so the summary is unsupported). Reporting only the first
+    # would let a refresh be scheduled while the old body kept being served as if it
+    # still stood.
     assert summaries.needs_refresh() == [
         {"scope": "day:2026-09-25", "kind": "day", "summary": out["id"],
-         "reasons": ["changed since publication"], "revisions": 1}]
+         "reasons": ["unsupported", "changed since publication"], "revisions": 1}]
+    assert summaries.read(out["id"])["available"] is False
 
 
 def test_a_refresh_promise_is_measured_against_the_clock_it_was_made_with(store):

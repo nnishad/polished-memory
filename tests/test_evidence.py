@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_memory.ids import backend_document_id, record_id
+from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
 from hermes_memory.storage.migrations import (
     MIGRATIONS,
@@ -58,9 +59,71 @@ def test_naive_timestamp_is_refused(store):
         store.commit(envelope(occurred_at="2026-09-24T09:15:00"))
 
 
-def test_supersede_hides_from_search_but_preserves_history(store):
+def test_a_later_revision_supersedes_the_earlier_one_without_anyone_asking(store):
     old = store.commit(envelope())
     new = store.commit(envelope(revision="2", text="Correction: the meeting is Friday."))
+
+    # The corrected revision is what the source says *now*, so it is the only thing
+    # retrieval may offer. Leaving revision 1 in the live set would answer "when is the
+    # meeting" with both dates, and would leave every claim that quoted the old sentence
+    # reporting itself supported.
+    assert [hit.id for hit in store.search("meeting")] == [new["id"]]
+    assert store.get(old["id"]) is None                             # not visible
+    assert store.get(old["id"], include_hidden=True) is not None     # still stored
+    row = store.db.execute(
+        "SELECT replacement_id, reason FROM record_visibility WHERE record_id=?",
+        (old["id"],)).fetchone()
+    assert row["replacement_id"] == new["id"]
+    assert row["reason"] == "revised to 2"
+    # The index is not the source of truth, but a withdrawn sentence must not sit in it:
+    # every read that goes through the index would otherwise find a row the store has
+    # already said is not current.
+    assert store.db.execute("SELECT count(*) FROM record_fts WHERE id=?",
+                            (old["id"],)).fetchone()[0] == 0
+    journaled = store.db.execute(
+        "SELECT change FROM change_journal WHERE record_id=? ORDER BY seq", (old["id"],),
+    ).fetchall()
+    assert [row["change"] for row in journaled] == ["add", "supersede"]
+    audited = store.db.execute(
+        "SELECT object_id, metadata FROM audit WHERE action='evidence_supersede'").fetchall()
+    assert [row["object_id"] for row in audited] == [old["id"]]
+    assert json.loads(audited[0]["metadata"]) == {"actor": "gmail", "replacement": new["id"]}
+
+
+def test_a_correction_does_not_disturb_forgotten_evidence(store):
+    first = store.commit(envelope())
+    manager = ErasureManager(store, owner_principal="owner-principal")
+    preview = manager.preview(record_ids=[first["id"]], actor="owner-principal",
+                              reason="withdrawn")
+    manager.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                    actor="owner-principal")
+
+    second = store.commit(envelope(revision="2", text="Correction: the meeting is Friday."))
+
+    # The tombstone is not a revision to supersede. Pointing a forgotten record at a live
+    # one would write it back into a chain, and a chain is a thing the store reads out loud.
+    assert [hit.id for hit in store.search("meeting")] == [second["id"]]
+    assert store.db.execute("SELECT count(*) FROM record_visibility WHERE record_id=?",
+                            (first["id"],)).fetchone()[0] == 0
+
+
+def test_replaying_a_superseded_revision_does_not_un_correct_it(store):
+    old = store.commit(envelope())
+    store.commit(envelope(revision="2", text="Correction: the meeting is Friday."))
+
+    replay = store.commit(envelope())
+
+    # The replay is acknowledged, not rewritten — and the acknowledgement must not put
+    # the withdrawn sentence back in the index, or a source that re-serves a stale page
+    # would silently undo a correction.
+    assert replay == {"id": old["id"], "duplicate": True}
+    assert store.get(old["id"]) is None
+
+
+def test_supersede_hides_from_search_but_preserves_history(store):
+    old = store.commit(envelope(source_id="msg-1"))
+    new = store.commit(envelope(source_id="msg-2", text="Correction: the meeting is Friday."))
+
     assert {hit.id for hit in store.search("meeting")} == {old["id"], new["id"]}
 
     store.supersede(old["id"], new["id"], reason="user correction", actor="owner")
@@ -72,6 +135,38 @@ def test_supersede_hides_from_search_but_preserves_history(store):
         "SELECT replacement_id FROM record_visibility WHERE record_id=?", (old["id"],)
     ).fetchone()
     assert row["replacement_id"] == new["id"]
+    # Journaled like any other change: the packet cache and every derived index decide what
+    # to drop by the journal sequence, so an unreported supersession keeps serving a
+    # reading the store has already withdrawn.
+    assert store.db.execute(
+        "SELECT count(*) FROM change_journal WHERE record_id=? AND change='supersede'",
+        (old["id"],)).fetchone()[0] == 1
+
+
+def test_the_latest_report_wins_even_when_its_revision_token_is_older(store):
+    late = store.commit(envelope(revision="2", text="Correction: the meeting is Friday."))
+    earlier = store.commit(envelope(text="The meeting moved to Thursday at 3pm."))
+
+    # Revision tokens are not comparable here — a file adapter reports a content digest,
+    # an IMAP revision a mod-sequence — so the source's latest report is the only ordering
+    # available. What must never happen is the store retiring the row it just wrote and
+    # leaving the item unfindable.
+    assert [hit.id for hit in store.search("meeting")] == [earlier["id"]]
+    assert store.live_and_visible(late["id"]) is False
+
+
+def test_supersede_refuses_an_edge_it_cannot_name(store):
+    kept = store.commit(envelope())
+
+    with pytest.raises(EvidenceError, match="cannot supersede itself"):
+        store.supersede(kept["id"], kept["id"], reason="typo", actor="owner")
+    with pytest.raises(EvidenceError, match="unknown record"):
+        store.supersede(kept["id"], "rec_" + "0" * 32, reason="typo", actor="owner")
+
+    # A refused supersession leaves no trace to read back: neither the visibility row nor
+    # the withdrawn revision, because both were written in the transaction that rolled back.
+    assert store.db.execute("SELECT count(*) FROM record_visibility").fetchone()[0] == 0
+    assert [hit.id for hit in store.search("meeting")] == [kept["id"]]
 
 
 def test_hidden_records_leave_the_lexical_index(store):
