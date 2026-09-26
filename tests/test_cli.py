@@ -702,3 +702,242 @@ def test_an_approved_setup_enrolls_the_profile_and_selects_the_provider(home, st
     assert "model: deepseek-chat" in (activity / "config.yaml").read_text(encoding="utf-8")
     _, profiles = run("profiles")
     assert [item["profile"] for item in profiles["profiles"]] == ["work"]
+
+
+# -- the archive, the release and the sources ---------------------------------
+
+@pytest.fixture()
+def exports(tmp_path):
+    """A directory of exports the owner pointed at, in their own words."""
+    root = tmp_path / "exports"
+    root.mkdir()
+    (root / "lease.md").write_text("The lease on the flat ends in March.\n",
+                                   encoding="utf-8")
+    (root / "move.md").write_text("The meeting moved to Thursday.\n", encoding="utf-8")
+    return root
+
+
+def test_backup_copies_the_store_and_says_whether_the_copy_verifies(home):
+    run("init")
+    code, receipt = run("backup", "--reason", "before the switch")
+    assert code == 0
+    made = receipt["backups"][0]
+    assert made["verified"] is True and made["snapshot"]["reason"] == "before the switch"
+    assert Path(made["snapshot"]["directory"]).is_dir()
+
+
+def test_backup_names_every_profile_it_copied(home):
+    run("init")
+    registry = ProfileRegistry.open(load_settings())
+    registry.db.close()
+    _, receipt = run("backup", "--reason", "all of them")
+    assert [item["profile"] for item in receipt["backups"]] == ["default"]
+    assert receipt["skipped"] == []
+
+
+def test_a_backup_reports_what_the_verifier_actually_found(home, monkeypatch):
+    """The claim is the verifier's answer, not a constant in the report."""
+    from hermes_memory.lifecycle.snapshots import Snapshots
+
+    run("init")
+    monkeypatch.setattr(Snapshots, "verify", lambda self, snapshot_id: {"ok": False})
+    code, receipt = run("backup", "--reason", "unverified")
+    assert code == 0
+    assert receipt["backups"][0]["verified"] is False
+
+
+def test_a_store_that_is_not_there_yet_is_skipped_rather_than_created(home, tmp_path):
+    code, receipt = run("backup", "--reason", "nothing to copy")
+    assert code == 0
+    assert receipt["backups"] == []
+    assert "no store at" in receipt["skipped"][0]["reason"]
+    assert not (tmp_path / "data" / "canonical.db").exists()
+
+
+def test_a_backup_needs_somebody_to_be_answerable_for(tmp_path, monkeypatch):
+    root = tmp_path / "unowned"
+    (root / "data").mkdir(parents=True)
+    (root / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={root / 'data'}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(root))
+    run("init")
+    code, message = errors("backup")
+    assert code == 2 and "owner" in message
+
+
+def test_a_backup_can_be_read_back_without_taking_another_one(home):
+    run("init")
+    _, made = run("backup", "--reason", "first")
+    code, listing = run("backup", "--list")
+    assert code == 0
+    assert [item["id"] for item in listing["profiles"][0]["snapshots"]] == \
+        [made["backups"][0]["snapshot"]["id"]]
+    assert len(listing["profiles"][0]["snapshots"]) == 1, "listing took nothing"
+
+
+def test_an_upgrade_plan_is_read_only_even_though_it_is_called_upgrade(home, staged):
+    activity, calls = staged
+    code, report = run("upgrade", "--version", str(home / "runtime" / "current"),
+                       "--hermes-home", str(activity))
+    assert code == 0 and calls == []
+    assert report["target"]["executable"].endswith("bin/hermes-memory")
+    assert not (home / "installation.db").exists()
+    assert report["not_performed"] and "performs them" in report["note"]
+
+
+def test_an_upgrade_with_no_target_named_is_a_hop_not_a_switch(home, service_home):
+    code, report = run("upgrade")
+    assert code == 0
+    assert report["blocking"] and "no target release" in report["blocking"][0]
+    assert report["target_release"] is None
+
+
+def test_a_release_tree_missing_its_plugin_is_only_half_an_upgrade(home, staged):
+    activity, _ = staged
+    _code, report = run("upgrade", "--version", str(home / "runtime" / "current"),
+                        "--hermes-home", str(activity))
+    assert any("plugin" in line for line in report["blocking"])
+    assert report["target"]["runnable"] is False
+
+
+def test_the_uninstall_list_is_printed_before_anything_is_removed(home, service_home,
+                                                                  runner):
+    run("init")
+    _, written = run("services")
+    run("services", "--install", written["review_digest"], "--actor", OWNER)
+    code, proposal = run("uninstall", "--keep-data")
+    assert code == 0
+    assert [item["unit"] for item in proposal["removals"]] == ["hermes-memory.service"]
+    assert proposal["purging_data"] is False
+    assert proposal["review_digest"] in proposal["next"], \
+        "the printed next step approves this exact list"
+    assert proposal["next"].endswith(f"--actor {OWNER}")
+    assert Path(proposal["removals"][0]["path"]).exists(), "a plan removes nothing"
+    assert runner == []
+
+
+def test_an_uninstall_without_keep_data_is_refused_by_name(home, service_home, runner):
+    run("init")
+    _, written = run("services")
+    run("services", "--install", written["review_digest"], "--actor", OWNER)
+    _code, proposal = run("uninstall")
+    code, message = errors("uninstall", "--review", proposal["review_digest"],
+                           "--actor", OWNER)
+    assert code == 2
+    assert "no flag here that removes them" in message
+    assert Path(proposal["removals"][0]["path"]).exists()
+
+
+def test_an_approved_uninstall_removes_the_units_and_keeps_the_memory(home, service_home,
+                                                                      runner):
+    run("init")
+    _, written = run("services")
+    run("services", "--install", written["review_digest"], "--actor", OWNER)
+    _code, proposal = run("uninstall", "--keep-data")
+    code, receipt = run("uninstall", "--keep-data",
+                        "--review", proposal["review_digest"], "--actor", OWNER)
+    assert code == 0, receipt
+    assert [call[1:3] for call in runner] == [["plugins", "disable"], ["plugins", "remove"]]
+    assert all(not Path(path).exists() for path in receipt["removed"])
+    assert (home / "hermes-memory.env").is_file()
+    assert str(Path(home / "hermes-memory.env")) in " ".join(receipt["kept"])
+    assert not any(path.endswith(".service") for path in receipt["kept"])
+
+
+def test_the_uninstall_gives_back_a_selection_the_owner_has_not_changed(home, staged):
+    """The whole transaction, then its undo, on one machine nobody else can see."""
+    activity, calls = staged
+    _code, proposal = run("setup", "--hermes-home", str(activity), "--ref", "a" * 40)
+    run("setup", "--hermes-home", str(activity), "--ref", "a" * 40,
+        "--review", proposal["review_digest"])
+    assert "provider: hermes-memory" in (activity / "config.yaml").read_text(encoding="utf-8")
+
+    def undoing(argv):
+        calls.append(list(argv))
+        if argv[1:3] == ["config", "unset"]:
+            (activity / "config.yaml").write_text(
+                (activity / "config.yaml").read_text(encoding="utf-8")
+                .replace("  provider: hermes-memory\n", ""), encoding="utf-8")
+        return 0, ""
+
+    calls.clear()
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("hermes_memory.cli._HOST_RUNNER", undoing)
+    try:
+        _code, plan = run("uninstall", "--keep-data", "--hermes-home", str(activity))
+        assert plan["provider"]["command"] == ["hermes", "config", "unset",
+                                               "memory.provider"]
+        code, receipt = run("uninstall", "--keep-data", "--hermes-home", str(activity),
+                            "--review", plan["review_digest"], "--actor", OWNER)
+    finally:
+        monkey.undo()
+    assert code == 0, receipt
+    assert [call[1:3] for call in calls] == [["config", "unset"], ["plugins", "disable"],
+                                             ["plugins", "remove"]]
+    assert "provider: hermes-memory" not in (activity / "config.yaml").read_text(
+        encoding="utf-8")
+    assert (home / "installation.db").is_file(), "the map to the memory outlives its owner"
+
+
+def test_an_uninstall_approval_cannot_be_spent_on_a_different_list(home, service_home,
+                                                                   runner):
+    run("init")
+    _code, proposal = run("uninstall", "--keep-data")
+    code, message = errors("uninstall", "--keep-data", "--review", "0" * 64,
+                           "--actor", OWNER)
+    assert code == 2 and "does not match" in message
+
+
+def test_sources_list_reads_the_connectors_own_account(home, exports):
+    run("init")
+    _code, empty = run("sources", "list")
+    assert empty["sources"] == []
+    run("import", "--source", "files", "--path", str(exports))
+    code, report = run("sources", "list", "--gaps")
+    assert code == 0
+    assert report["registered"] == 1
+    entry = report["sources"][0]
+    assert entry["source"] == "files" and entry["policy"] == "local-only"
+    assert entry["coverage"] == "current" and entry["open_gaps"] == []
+
+
+def test_sources_is_a_verb_and_not_a_free_text_argument(home):
+    code, message = errors("sources", "show")
+    assert code == 2 and "invalid choice" in message
+
+
+def test_an_import_reads_a_directory_the_owner_named(home, exports):
+    run("init")
+    code, report = run("import", "--source", "files", "--path", str(exports))
+    assert code == 0
+    assert report["stopped"] == "complete" and report["records"] == 2
+    assert report["coverage_state"] == "current"
+
+
+def test_an_import_twice_is_one_import(home, exports):
+    run("init")
+    run("import", "--source", "files", "--path", str(exports))
+    _code, again = run("import", "--source", "files", "--path", str(exports))
+    assert again["records"] == 0 and again["repeats"] >= 1
+
+
+def test_a_dry_run_import_reads_nothing_at_all(home, exports):
+    run("init")
+    _code, before = run("sources", "list")
+    code, report = run("import", "--source", "files", "--path", str(exports), "--dry-run")
+    assert code == 0
+    assert report["reachable"]["ok"] is True
+    assert report["reachable"]["content_read"] is False
+    assert run("sources", "list")[1]["registered"] == before["registered"]
+
+
+def test_an_import_refuses_to_invent_a_connector(home, exports):
+    run("init")
+    code, message = errors("import", "--source", "gmail", "--path", str(exports))
+    assert code == 2 and "no export reader" in message
+    assert "files" in message
+
+
+def test_an_import_will_not_create_the_store_it_writes_into(home, exports):
+    code, message = errors("import", "--source", "files", "--path", str(exports))
+    assert code == 2 and "init" in message

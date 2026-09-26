@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Release pointer swapped atomically by `hermes-memory upgrade`.
+# Which release this unit runs is named by HERMES_MEMORY_RELEASE; `hermes-memory
+# upgrade` plans a switch to another staged tree and performs none of it.
 Environment=HERMES_MEMORY_RELEASE=@RELEASE@
 Environment=HERMES_MEMORY_HOME=@INSTANCE_HOME@
 WorkingDirectory=@INSTANCE_HOME@

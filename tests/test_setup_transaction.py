@@ -574,3 +574,55 @@ def test_readiness_never_writes_configured_up_as_operational(installation, tmp_p
     assert receipt["readiness"]["inference"] == "off"
     assert receipt["readiness"]["real_sources"] == "disabled until the owner enables one"
     assert receipt["readiness"]["delivery"] == "off"
+
+
+# -- the receipt that lets an uninstall give the selection back ------------------
+
+def test_activation_records_the_selection_it_replaced(installation, tmp_path):
+    """§10.7 restores the prior provider, and that is a fact only for one moment.
+
+    After the write the file answers a different question, so the answer has to be kept
+    while it is still true.
+    """
+    settings, environ = installation
+    home = activity(tmp_path, provider="pg0-memory")
+    approve(settings, home, environ, runner=Heremes(home / "config.yaml"), ref=REF)
+    written = json.loads((settings.home / "provider-selection.json").read_text(
+        encoding="utf-8"))
+    assert written["prior"] == "pg0-memory"
+    assert written["written"] == "hermes-memory"
+    assert written["config"] == str(home / "config.yaml")
+    assert written["actor"] == settings.owner_principal
+
+
+def test_an_already_selected_provider_is_not_blocked_by_a_missing_executor(installation,
+                                                                          tmp_path):
+    """A Hermes-first installation arrives with the selection already made.
+
+    Refusing the whole transaction then would be the installer claiming it still has to
+    do something it has done, and a plan whose blockers are wrong is a plan nobody can
+    act on.
+    """
+    settings, environ = installation
+    home = activity(tmp_path, provider="hermes-memory")
+    proposal = plan(settings, hermes_home=home, environ=environ, ref=REF)
+    entry = {item["step"]: item for item in proposal["steps"]}["activate"]
+    assert entry["blocking"] == []
+    assert entry["state"] == "pending"
+    assert "already reads 'hermes-memory'" in " ".join(entry["actions"])
+
+
+def test_an_already_selected_provider_says_so_instead_of_taking_another_snapshot(
+        installation, tmp_path):
+    settings, environ = installation
+    home = activity(tmp_path, provider="pg0-memory")
+    approve(settings, home, environ, runner=Heremes(home / "config.yaml"), ref=REF)
+    before = sorted(path.name for path in settings.home.glob("config.yaml.before-*"))
+    assert before, "activation snapshots the file it is about to change"
+
+    second = Heremes(home / "config.yaml")
+    approve(settings, home, environ, runner=second, ref=REF)
+    assert [call for call in second.calls if call[1:3] == ["config", "set"]] == []
+    assert sorted(path.name for path in settings.home.glob("config.yaml.before-*")) == before
+    assert (settings.home / "provider-selection.json").read_text(
+        encoding="utf-8").count("pg0-memory") == 1, "the prior is recorded once"

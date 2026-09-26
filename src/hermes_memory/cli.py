@@ -144,6 +144,51 @@ def main(argv: list[str] | None = None) -> int:
     pause.add_argument("--actor")
     pause.add_argument("--reason")
 
+    backup = sub.add_parser("backup",
+                            help="copy each profile's store to a snapshot that can be "
+                                 "identified and verified")
+    backup.add_argument("--profile", help="one enrolled profile; every of them by default")
+    backup.add_argument("--reason", default="operator backup")
+    backup.add_argument("--actor")
+    backup.add_argument("--list", action="store_true",
+                        help="report the backups that exist and take none")
+
+    upgrade = sub.add_parser("upgrade",
+                             help="plan a switch to a staged release. It is read only: "
+                                  "there is no flag here that performs one")
+    upgrade.add_argument("--version", metavar="RELEASE-TREE",
+                         help="the staged release tree to switch to")
+    upgrade.add_argument("--hermes-home",
+                         help="the Hermes profile home whose host facts are reported")
+
+    uninstall = sub.add_parser("uninstall",
+                               help="remove this installation and keep every byte of memory")
+    uninstall.add_argument("--keep-data", action="store_true",
+                           help="required: data-preserving is the only uninstall there is")
+    uninstall.add_argument("--hermes-home",
+                           help="the profile home whose provider selection setup changed")
+    uninstall.add_argument("--actor")
+    uninstall.add_argument("--review", metavar="DIGEST",
+                           help="the digest of the list that was actually shown")
+
+    sources = sub.add_parser("sources", help="what the connectors know, including what "
+                                             "they did not get")
+    sources.add_argument("action", choices=("list",))
+    sources.add_argument("--gaps", action="store_true", help="include each source's open gaps")
+    sources.add_argument("--limit", type=int, default=20)
+
+    importing = sub.add_parser("import",
+                               help="read one export directory into the memory that owns it")
+    importing.add_argument("--source", required=True, help="the connector id to record it under")
+    importing.add_argument("--path", required=True,
+                           help="a directory of exports the owner pointed at")
+    importing.add_argument("--profile", help="whose memory it goes into")
+    importing.add_argument("--policy", default="local-only",
+                           choices=("local-only", "private-api", "disabled"),
+                           help="the scope declared for a connector new to this store")
+    importing.add_argument("--dry-run", action="store_true",
+                           help="ask whether the export can be read, and read nothing else")
+
     args = parser.parse_args(argv)
 
     try:
@@ -180,6 +225,16 @@ def main(argv: list[str] | None = None) -> int:
         return _stop_command(settings, args)
     if args.command == "pause":
         return _pause_command(settings, args)
+    if args.command == "backup":
+        return _backup_command(settings, args)
+    if args.command == "upgrade":
+        return _upgrade_command(settings, args)
+    if args.command == "uninstall":
+        return _uninstall_command(settings, args)
+    if args.command == "sources":
+        return _sources_command(settings, args)
+    if args.command == "import":
+        return _import_command(settings, args)
     return _explain_command(settings, args)
 
 
@@ -463,6 +518,217 @@ def _pause_command(settings, args) -> int:
     return _emit({"ok": True, "scope": args.scope, "state": state, "actor": actor,
                   "reason": reason, "held": held,
                   "survives_a_restart": True})
+
+
+# -- the archive, the release and the sources ----------------------------------
+
+def _backup_command(settings, args) -> int:
+    """A copy of the archive that can be named, verified and taken back.
+
+    Every enrolled profile is backed up unless one is named, because the operator who
+    types `backup` means "this installation is now recoverable" — and one store copied
+    out of three would make that sentence false.
+    """
+    from .lifecycle.snapshots import Snapshots
+    from .storage.evidence import EvidenceStore
+
+    actor = args.actor or settings.owner_principal
+    if not actor:
+        print("refused: a backup records who took it, and no owner principal is configured",
+              file=sys.stderr)
+        return 2
+    try:
+        targets = _archive_targets(settings, args.profile)
+    except Exception as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    taken, present = [], []
+    try:
+        for scoped in targets:
+            directory = Path(scoped.data_dir) / "snapshots"
+            if not scoped.db_path.is_file():
+                present.append({"profile": scoped.profile, "snapshot": None,
+                                "directory": str(directory),
+                                "reason": f"no store at {scoped.db_path} to copy"})
+                continue
+            with EvidenceStore(scoped.db_path) as store:
+                snapshots = Snapshots(store, directory=directory)
+                if args.list:
+                    present.append({"profile": scoped.profile, "directory": str(directory),
+                                    "snapshots": [item.as_dict() for item in
+                                                  snapshots.list(limit=20)]})
+                    continue
+                made = snapshots.create(reason=args.reason, actor=actor)["snapshot"]
+                taken.append({"profile": scoped.profile, "snapshot": made.as_dict(),
+                              "verified": snapshots.verify(made.id)["ok"]})
+    except EvidenceError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if args.list:
+        return _emit({"listing": True, "profiles": present})
+    return _emit({"ok": True, "actor": actor, "backups": taken, "skipped": present,
+                  "note": "a snapshot is one consistent copy of one store, taken while "
+                          "the store stayed open; restoring it is `hermes-memory` recovery "
+                          "work, not this command"})
+
+
+def _archive_targets(settings, profile: str | None) -> list:
+    """The configurations whose stores a backup covers."""
+    from .install.profiles import InstallationError, ProfileRegistry
+
+    if not (Path(settings.home) / "installation.db").is_file():
+        if profile:
+            raise InstallationError(
+                f"no instance ledger exists, so profile {profile!r} is not enrolled")
+        return [settings]
+    registry = ProfileRegistry.reading(settings)
+    try:
+        if profile:
+            return [registry.profile(profile).scoped(settings)]
+        enrolled = [item.scoped(settings) for item in registry.profiles()]
+    finally:
+        registry.db.close()
+    return enrolled or [settings]
+
+
+def _upgrade_command(settings, args) -> int:
+    """The plan of §10.6, and deliberately not the switch.
+
+    There is no ``--apply`` here to approve. Performing the switch needs a quiesced
+    machine, a rehearsal on a restored copy and a validated final state, and an operator
+    who has those would not want a flag that guesses at them.
+    """
+    from .install.upgrade import UpgradeError, upgrade_plan
+
+    try:
+        report = upgrade_plan(settings, release=args.version, hermes_home=args.hermes_home)
+    except UpgradeError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({**report,
+                  "next": "this plan performs nothing. Read the blockers, take a backup, "
+                          "rehearse the migrations on a restored copy, and switch the "
+                          "release pointer only when the rehearsal passed"})
+
+
+def _uninstall_command(settings, args) -> int:
+    """Two steps again: the list first, then the removal of exactly that list."""
+    from .install.uninstall import UninstallError, uninstall_apply, uninstall_plan
+
+    try:
+        proposal = uninstall_plan(settings, hermes_home=args.hermes_home)
+    except UninstallError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not args.review:
+        return _emit({**proposal, "next": proposal["next"].replace(
+            "--actor <owner-principal>",
+            f"--actor {args.actor or settings.owner_principal or '<owner-principal>'}")})
+    try:
+        return _emit(uninstall_apply(
+            settings, actor=args.actor or settings.owner_principal or "",
+            review=args.review, keep_data=args.keep_data,
+            hermes_home=args.hermes_home, runner=_HOST_RUNNER))
+    except UninstallError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
+def _sources_command(settings, args) -> int:
+    """Each connector's own account: where it stopped, and what it could not get."""
+    from .sources.sync import SyncController
+
+    def read(store):
+        sync = SyncController(store)
+        listed = []
+        for row in store.db.execute("SELECT source FROM connectors ORDER BY source"):
+            state = sync.state(row["source"])
+            entry = {"source": row["source"], "generation": state["generation"],
+                     "policy": state["policy_version"], "cursor": state["cursor"],
+                     "coverage": state["coverage_state"],
+                     "last_success_at": state["last_success_at"],
+                     "paused_stages": sync.paused_stages(row["source"]),
+                     "lease": "held" if state["lease_active"] else "free"}
+            if args.gaps:
+                entry["open_gaps"] = sync.gaps(row["source"], limit=args.limit)
+            listed.append(entry)
+        return {"sources": listed,
+                "registered": len(listed),
+                "note": "coverage is what the source says it has; a gap is what it could "
+                        "not hand over, and neither is a claim about what is missing"}
+
+    return _with_store(settings, read)
+
+
+def _import_command(settings, args) -> int:
+    """Read a directory of exports the owner named into the store that owns it.
+
+    The adapter is chosen from a fixed map of ids to file readers: no path here is ever
+    turned into a command, a URL or an import of somebody's code. A connector already
+    registered keeps its own policy version, because re-declaring a scope from a shell
+    command is how a private source starts looking public.
+    """
+    from .sources.runtime import ConnectorRuntime
+    from .sources.sync import SyncController
+    from .storage.evidence import EvidenceStore
+
+    adapter_class = _export_readers().get(args.source)
+    if adapter_class is None:
+        print("refused: no export reader for source "
+              f"{args.source!r}; this command reads {', '.join(sorted(_export_readers()))} "
+              "from a directory the owner points at", file=sys.stderr)
+        return 2
+    try:
+        targets = _archive_targets(settings, args.profile)
+    except Exception as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if len(targets) != 1:
+        print("refused: --profile must name which memory the export is being read into",
+              file=sys.stderr)
+        return 2
+    scoped = targets[0]
+    if not scoped.db_path.is_file():
+        print(f"refused: no canonical store at {scoped.db_path}; an import writes into a "
+              "memory that exists, so run `hermes-memory init` (or enroll) first",
+              file=sys.stderr)
+        return 2
+    adapter = adapter_class(args.path, source=args.source)
+    if not args.dry_run:
+        try:
+            with EvidenceStore(scoped.db_path) as store:
+                sync = SyncController(store)
+                try:
+                    declared = sync.state(args.source)["policy_version"]
+                except EvidenceError:
+                    declared = args.policy
+                    sync.register(args.source, policy_version=declared)
+                runtime = ConnectorRuntime(store, sync,
+                                           holder=f"cli import from {args.path}")
+                outcome = runtime.run(adapter)
+        except EvidenceError as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
+        return _emit({**outcome.as_dict(), "profile": scoped.profile, "policy": declared,
+                      "store": str(scoped.db_path),
+                      "recheck": "a run that stopped for a reason says so; the source's "
+                                 "coverage claim is its own"})
+    return _emit({"dry_run": True, "source": args.source, "path": str(args.path),
+                  "profile": scoped.profile, "reachable": adapter.check(),
+                  "note": "nothing was read; run the same command without --dry-run to "
+                          "record what is in the export"})
+
+
+# The file readers only. A live mailbox, an MCP server or the host's own event spool
+# each need an authorisation this command cannot carry, so they are not in the map.
+def _export_readers() -> dict[str, Any]:
+    from .sources.email import EmailSource
+    from .sources.files import FileSource
+    from .sources.structured import StructuredSource
+    from .sources.whatsapp_export import WhatsAppExport
+
+    return {"email": EmailSource, "files": FileSource, "structured": StructuredSource,
+            "whatsapp": WhatsAppExport}
 
 
 # -- the commands ------------------------------------------------------------

@@ -25,6 +25,7 @@ from ..ids import content_digest, digest, now
 from .inventory import conflicts, provider_selection, survey
 from .profiles import InstallationError, ProfileRegistry, STATE_FILENAME
 from .services import plan as service_plan
+from .uninstall import record_provider_selection
 
 __all__ = ["STEPS", "plan", "run", "SetupError", "CANARY_SOURCE"]
 
@@ -171,7 +172,6 @@ def _inventory(ctx: Context, *, apply: bool) -> dict[str, Any]:
                     f"{report['host']['memory_provider']!r}"],
         "advisory": [line for line in said if line not in blocking],
         "blocking": blocking,
-        "result": {"unknowns": list(report["unknowns"])},
         "inputs": {"ports": report["endpoints"]["listening_ports"],
                    "wanted": report["endpoints"]["wanted"],
                    "stores": report["capture_owners"]["canonical_stores"],
@@ -414,9 +414,20 @@ def _activate(ctx: Context, *, apply: bool) -> dict[str, Any]:
                 "blocking": [f"no host configuration at {config}"],
                 "inputs": {"config": "absent"}}
     before = _model_block(config)
+    prior = _provider(config)
+    if prior == "hermes-memory":
+        # Said out loud rather than performed again: re-running a completed activation
+        # would take a second snapshot of a file nothing changed and ask the host to
+        # write the value it already holds. The inputs are the same facts the activation
+        # itself records, so a rerun after a finished setup resumes this step instead of
+        # finding work for it.
+        return {"actions": [f"memory.provider already reads {prior!r}, so the host is "
+                            "already selecting this memory"],
+                "inputs": {"config": _digest_of(config), "model": before,
+                           "provider": prior, "executor": True}}
     actions = [" ".join(str(part) for part in argv[0]),
                f"model block digest {before[:12]}",
-               f"memory.provider currently reads {_provider(config)!r}"]
+               f"memory.provider currently reads {prior!r}"]
     if ctx.runner is None:
         return {"actions": actions + ["not run: no host command executor was provided"],
                 "blocking": ["no host command executor was provided, so the provider "
@@ -427,6 +438,11 @@ def _activate(ctx: Context, *, apply: bool) -> dict[str, Any]:
         snapshot = Path(ctx.settings.home) / f"config.yaml.before-{_digest_of(config)[:12]}"
         snapshot.write_bytes(config.read_bytes())
         snapshot.chmod(0o600)
+        # Recorded before the write, because afterwards the file answers a different
+        # question: §10.7 restores the prior selection only if it can say what it was.
+        receipt = record_provider_selection(hermes_home=ctx.hermes_home,
+                                            settings=ctx.settings, prior=prior,
+                                            actor=ctx.actor)
         code, output = ctx.command(argv[0])
         if code != 0:
             raise SetupError(f"`{' '.join(str(part) for part in argv[0])}` failed "
@@ -439,8 +455,13 @@ def _activate(ctx: Context, *, apply: bool) -> dict[str, Any]:
         if _provider(config) != "hermes-memory":
             raise SetupError(f"memory.provider still reads {_provider(config)!r} after "
                              "activation; the host did not take the change")
+        actions.append(f"prior selection {prior!r} recorded at {receipt['path']}")
     return {"actions": actions,
             "inputs": {"config": _digest_of(config), "model": before,
+                       # The value the step leaves behind, not the one it found: the
+                       # receipt has to say "this is finished", and the only way a rerun
+                       # can recognise its own result is to compare against the state the
+                       # result produced.
                        "provider": _provider(config), "executor": True}}
 
 
