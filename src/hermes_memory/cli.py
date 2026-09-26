@@ -82,6 +82,16 @@ def main(argv: list[str] | None = None) -> int:
     doctor.add_argument("--synthetic-probe", action="store_true",
                         help="run one bounded, synthetic retain and recall round trip")
 
+    compatibility = sub.add_parser(
+        "compatibility",
+        help="compare this build against the manifest that states what it is compatible with")
+    compatibility.add_argument("--write", action="store_true",
+                               help="regenerate the manifest from this tree; a packaging step, "
+                                    "not something a running installation does")
+    compatibility.add_argument("--digests", action="store_true",
+                               help="also compare the digests that name which code this is, "
+                                    "which is what a release build has to do")
+
     setup = sub.add_parser("setup",
                            help="the installation transaction; run without --review to "
                                 "see every step first")
@@ -266,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         return _init_command(settings, args)
     if args.command == "doctor":
         return _doctor_command(settings, args)
+    if args.command == "compatibility":
+        return _compatibility_command(args)
     if args.command == "audit":
         return _audit_command(settings, args)
     if args.command == "profiles":
@@ -1170,6 +1182,26 @@ def _doctor_command(settings, args) -> int:
         return _emit(unreachable_store_report(settings.db_path, str(error)), 1)
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     return int(report["exit_code"])
+
+
+def _compatibility_command(args) -> int:
+    """The manifest door: reading it is safe anywhere, writing it belongs to packaging.
+
+    ``--write`` is deliberately not a step the installer performs. A setup that regenerated
+    its own compatibility claims would be a build grading its own homework; the check is only
+    worth anything because the file was written by a different act than the one that reads it.
+    """
+    from .install import compatibility
+
+    if args.write:
+        written = compatibility.write()
+        return _emit({"written": str(written), "facts": compatibility.facts(),
+                      "note": "ship this file with the release it describes"})
+    checked = compatibility.verify(digests=args.digests)
+    if not checked["ok"]:
+        checked["next"] = ("hermes-memory compatibility --write, and ship what it prints "
+                           "beside the code that produced it")
+    return _emit(checked, 0 if checked["ok"] else 1)
 
 
 def _audit_command(settings, args) -> int:

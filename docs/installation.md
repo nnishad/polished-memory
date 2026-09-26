@@ -36,12 +36,13 @@ sources. It is generated from the code that enforces each of those facts rather 
 next to it, which is what lets `doctor` check the release against itself:
 
 ```sh
-python -c 'from hermes_memory.install import compatibility; compatibility.write()'
+hermes-memory compatibility --write
 ```
 
 A running installation compares only the compatibility claims, so editing a source file does
-not make `doctor` red; the packaging step compares the digests as well, so a patched plugin
-directory or a tree that was never cut as a release is caught where it matters.
+not make `doctor` red; the packaging step compares the digests as well —
+`hermes-memory compatibility --digests`, which is what a release build has to pass — so a
+patched plugin directory or a tree that was never cut as a release is caught.
 
 ## Configuration
 

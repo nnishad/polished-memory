@@ -7,6 +7,7 @@ the claim that the manifest itself makes about which code it describes.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -110,6 +111,8 @@ def test_a_missing_manifest_is_a_difference_with_the_command_that_fixes_it(tmp_p
     checked = compatibility.verify(path=tmp_path / "nothing.json")
     assert checked["ok"] is False and checked["remedy"]
     assert "does not exist" in checked["differences"][0]
+    assert "hermes-memory compatibility --write" in checked["remedy"], (
+        "the report that names a fault has to name the door that clears it")
 
 
 def test_an_unreadable_manifest_is_reported_rather_than_raising(tmp_path):
@@ -159,3 +162,77 @@ def test_the_manifest_claims_nothing_it_cannot_support(shipped):
     facts = json.loads(shipped.read_text(encoding="utf-8"))
     assert len(facts["not_claimed"]) == 3
     assert not any(key not in facts for key in ("package", "hindsight", "schema", "plugin"))
+
+
+# -- the door an operator can open -------------------------------------------
+
+@pytest.fixture()
+def release(tmp_path, monkeypatch):
+    """A release tree this test owns, standing where the installer would put one."""
+    root = tmp_path / "release"
+    (root / "deployment").mkdir(parents=True)
+    monkeypatch.setattr(compatibility, "SHIP_AT",
+                        root / "deployment" / "compatibility.json")
+    monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(root))
+    return root / "deployment" / "compatibility.json"
+
+
+@pytest.fixture()
+def door(monkeypatch):
+    """Run the CLI and hand back its exit code and the document it printed."""
+    from hermes_memory.cli import main
+
+    def call(*argv):
+        printed = []
+        monkeypatch.setattr("builtins.print",
+                            lambda *a, **k: printed.append(a[0] if a else ""))
+        code = main(list(argv))
+        return code, json.loads(printed[-1])
+
+    return call
+
+
+def test_the_command_writes_the_manifest_and_then_believes_it(release, door):
+    code, written = door("compatibility", "--write")
+
+    assert code == 0
+    assert Path(written["written"]) == release and release.is_file()
+    assert written["facts"]["hindsight"]["engine_pinned"] == PINNED_VERSION
+
+    code, read = door("compatibility", "--digests")
+
+    assert code == 0, read
+    assert read["ok"] is True and read["digests"]["agree"] is True
+
+
+def test_the_command_refuses_a_manifest_that_stopped_describing_the_build(release, door):
+    door("compatibility", "--write")
+    facts = json.loads(release.read_text(encoding="utf-8"))
+    facts["hindsight"]["engine_pinned"] = "0.11.0"
+    release.write_text(json.dumps(facts), encoding="utf-8")
+
+    code, read = door("compatibility")
+
+    assert code == 1, "a release that misstates its own pin must not exit clean"
+    assert any("engine_pinned" in line for line in read["differences"])
+    assert "compatibility --write" in read["next"]
+
+
+def test_a_patched_tree_passes_the_claims_and_fails_only_the_digests(release, door,
+                                                                     monkeypatch):
+    """The documented split, from the door rather than from the module.
+
+    Editing code is not lying about compatibility, so the ordinary check stays green and a
+    developer's `doctor` keeps meaning something. Shipping is the act that has to notice the
+    two have come apart, and that is what the digest comparison is for.
+    """
+    door("compatibility", "--write")
+    monkeypatch.setattr(compatibility, "_framework_digest", lambda: "f" * 64)
+
+    assert door("compatibility")[0] == 0
+    code, strict = door("compatibility", "--digests")
+
+    assert code == 1
+    assert strict["digests"] == {"agree": False, "framework": "f" * 64,
+                                 "shipped": strict["digests"]["shipped"]}
+    assert any("framework_digest" in line for line in strict["differences"])

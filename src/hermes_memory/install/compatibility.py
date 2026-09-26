@@ -162,9 +162,9 @@ def verify(*, path: Path | None = None, settings=None,
           digests: bool = False) -> dict[str, Any]:
     """Does the shipped file still claim what this build claims?"""
     target = path or manifest_path(settings)
-    remedy = ("regenerate deployment/compatibility.json (`python -c 'from hermes_memory"
-              ".install import compatibility; compatibility.write()'`) as part of the release,"
-              " because the code and its stated compatibility have already diverged")
+    remedy = ("regenerate deployment/compatibility.json with `hermes-memory compatibility "
+              "--write` as part of the release, because the code and its stated "
+              "compatibility have already diverged")
     if not target.is_file():
         return {"ok": False, "checked": str(target),
                 "differences": [f"{target} does not exist"], "remedy": remedy,
