@@ -13,6 +13,8 @@ from hermes_memory.config import load_settings
 from hermes_memory.install.profiles import InstallationError, ProfileRegistry
 from hermes_memory.ids import now
 from hermes_memory.lifecycle.erasure import ErasureManager
+from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
+                                                   gate_path, instance_gate)
 from hermes_memory.storage.evidence import EvidenceStore
 
 SOURCE = "gmail"
@@ -567,12 +569,45 @@ def test_stopping_holds_the_fence_first_and_the_hold_outlives_the_process(
     assert runner == [["systemctl", "--user", "stop", "hermes-memory.service"]]
     settings = load_settings()
     with EvidenceStore(settings.db_path) as store:
-        assert store.stage_is_paused("global", "inference") is True
         assert store.stage_is_paused("global", "delivery") is True
+    with instance_gate(settings) as gate:
+        assert gate.paused is True, "the hold on the shared models is in one ledger"
+
+
+def test_stopping_holds_delivery_for_every_profile_not_just_the_first(service_home,
+                                                                       runner,
+                                                                       tmp_path):
+    """An owner's stop is one decision about one machine.
+
+    The delivery outbox is per-profile, so the hold has to be written on each enrolled
+    archive; holding only the first one would leave the second person's drafts queued for
+    a morning that was supposed to be quiet.
+    """
+    run("init")
+    settings = load_settings()
+    stores = {}
+    registry = ProfileRegistry.open(settings)
+    for name in ("work", "personal"):
+        home = tmp_path / "homes" / name
+        home.mkdir(parents=True)
+        proposal = registry.plan(name, home)
+        registry.enroll(name, home, actor=OWNER, review_digest=proposal["review_digest"])
+        store_at = Path(proposal["data_dir"]) / "canonical.db"
+        with EvidenceStore(store_at):
+            pass
+        stores[name] = store_at
+    registry.db.close()
+
+    code, report = run("stop", "--actor", OWNER, "--reason", "overnight maintenance")
+    assert code == 0 and report["paused"] == ["inference", "delivery"]
+    assert sorted(report["held_for"]) == ["personal", "work"]
+    for name, path in stores.items():
+        with EvidenceStore(path) as scoped:
+            assert scoped.stage_is_paused("global", "delivery") is True, name
 
 
 def test_stopping_without_an_owner_touches_no_process(service_home, tmp_path, monkeypatch,
-                                                     runner):
+                                                      runner):
     other = tmp_path / "no-owner"
     other.mkdir()
     (other / "hermes-memory.env").write_text(

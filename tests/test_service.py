@@ -20,6 +20,7 @@ import pytest
 
 from hermes_memory.config import SettingError, load_settings
 from hermes_memory.processing.gate_server import UpstreamResult
+from hermes_memory.processing.instance_gate import instance_gate
 from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.service import (HEALTH_PATH, GateServer, admission_url, bind_endpoint,
                                    gate_app_factory, serve)
@@ -198,9 +199,9 @@ def test_health_answers_without_a_credential_and_asks_nothing_of_a_model(gate):
 
 
 def test_health_reports_the_fence_as_the_gate_knows_it(settings):
-    """The pause is instance state, so it is read from the store and not remembered."""
-    with EvidenceStore(settings.db_path) as store:
-        ResourceGate(store).pause(actor=OWNER, reason="owner stopped formation")
+    """The pause is instance state, so it is read from the ledger and not remembered."""
+    with instance_gate(settings) as gate:
+        gate.pause(actor=OWNER, reason="owner stopped formation")
     started = Started(gate_app_factory(settings, upstream=boom))
     try:
         report = json.loads(started.call("GET", HEALTH_PATH)[2])

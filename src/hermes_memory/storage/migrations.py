@@ -16,9 +16,89 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 __all__ = ["Migration", "MIGRATIONS", "MIGRATION_LEDGER", "apply_migrations",
-           "current_version", "connect"]
+           "current_version", "connect", "GATE_STATEMENTS", "CONTROLS_STATEMENTS",
+           "BUDGET_STATEMENTS"]
 
 MIGRATION_LEDGER = "CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+
+CONTROLS_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per (scope, stage) the operator can hold. The same table shape is
+    -- created in the instance gate database, where the scope is ``global`` and the
+    -- stage is ``inference``: a pause of the shared models belongs to the machine,
+    -- not to whichever profile happened to press the button.
+    CREATE TABLE runtime_controls(
+        scope TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        state TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        changed_at TEXT NOT NULL,
+        PRIMARY KEY(scope, stage)
+    )""",
+)
+
+# Admission for the physical models. These statements are also the whole schema of
+# the instance gate database (see ``processing.instance_gate``), which is why they are
+# named here rather than buried inside the profile store's own migration.
+# Consumption accounting for the physical resources. The gate writes it when it
+# releases a reservation, so the same statements are part of the instance gate
+# database as well; a budget tracker over one profile's store is a different scope and
+# must never be asked what the models themselves have spent.
+BUDGET_STATEMENTS: tuple[str, ...] = (
+    """
+    -- Budget consumption is measured, including internal retries, so a job that
+    -- keeps producing truncated output runs out rather than looping.
+    CREATE TABLE budget_usage(
+        scope TEXT NOT NULL,
+        period TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        calls INTEGER NOT NULL DEFAULT 0,
+        seconds REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY(scope, period, resource)
+    )""",
+)
+
+
+GATE_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per physical resource in use. The partial unique index is the
+    -- whole design: SQLite itself refuses a second concurrent holder, so the
+    -- single-slot rule survives multiple processes and profiles without any
+    -- in-memory lock that a crash could orphan.
+    CREATE TABLE gate_reservations(
+        id TEXT PRIMARY KEY,
+        resource TEXT NOT NULL,
+        route TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        acquired_at REAL NOT NULL,
+        lease_until REAL NOT NULL,
+        job_id TEXT,
+        released_at REAL,
+        outcome TEXT
+    )""",
+    """
+    CREATE UNIQUE INDEX gate_single_slot ON gate_reservations(resource)
+        WHERE state IN ('held', 'uncertain')""",
+    "CREATE INDEX gate_lease ON gate_reservations(state, lease_until)",
+    """
+    CREATE TABLE gate_ledger(
+        id INTEGER PRIMARY KEY,
+        reservation_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        route TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        event TEXT NOT NULL,
+        at REAL NOT NULL,
+        detail TEXT NOT NULL
+    )""",
+    "CREATE INDEX gate_ledger_reservation ON gate_ledger(reservation_id)",
+)
+
 
 EVIDENCE_STATEMENTS: tuple[str, ...] = (
     """
@@ -90,17 +170,7 @@ EVIDENCE_STATEMENTS: tuple[str, ...] = (
     "CREATE UNIQUE INDEX backend_documents_docid ON backend_documents(backend, bank_id, document_id)",
     "CREATE TABLE memory_epoch(id INTEGER PRIMARY KEY CHECK(id = 1), value INTEGER NOT NULL)",
     "INSERT INTO memory_epoch VALUES(1, 1)",
-    """
-    CREATE TABLE runtime_controls(
-        scope TEXT NOT NULL,
-        stage TEXT NOT NULL,
-        state TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        policy_version TEXT NOT NULL,
-        changed_at TEXT NOT NULL,
-        PRIMARY KEY(scope, stage)
-    )""",
+    *CONTROLS_STATEMENTS,
 )
 
 
@@ -271,41 +341,10 @@ IDENTITY_STATEMENTS: tuple[str, ...] = (
 )
 
 
+
+
 PROCESSING_STATEMENTS: tuple[str, ...] = (
-    """
-    -- One row per physical resource in use. The partial unique index is the
-    -- whole design: SQLite itself refuses a second concurrent holder, so the
-    -- single-slot rule survives multiple processes and profiles without any
-    -- in-memory lock that a crash could orphan.
-    CREATE TABLE gate_reservations(
-        id TEXT PRIMARY KEY,
-        resource TEXT NOT NULL,
-        route TEXT NOT NULL,
-        holder TEXT NOT NULL,
-        priority INTEGER NOT NULL,
-        state TEXT NOT NULL,
-        acquired_at REAL NOT NULL,
-        lease_until REAL NOT NULL,
-        job_id TEXT,
-        released_at REAL,
-        outcome TEXT
-    )""",
-    """
-    CREATE UNIQUE INDEX gate_single_slot ON gate_reservations(resource)
-        WHERE state IN ('held', 'uncertain')""",
-    "CREATE INDEX gate_lease ON gate_reservations(state, lease_until)",
-    """
-    CREATE TABLE gate_ledger(
-        id INTEGER PRIMARY KEY,
-        reservation_id TEXT NOT NULL,
-        resource TEXT NOT NULL,
-        route TEXT NOT NULL,
-        holder TEXT NOT NULL,
-        event TEXT NOT NULL,
-        at REAL NOT NULL,
-        detail TEXT NOT NULL
-    )""",
-    "CREATE INDEX gate_ledger_reservation ON gate_ledger(reservation_id)",
+    *GATE_STATEMENTS,
     """
     CREATE TABLE processing_jobs(
         id TEXT PRIMARY KEY,
@@ -336,18 +375,7 @@ PROCESSING_STATEMENTS: tuple[str, ...] = (
     )""",
     "CREATE INDEX jobs_dispatch ON processing_jobs(state, priority, created_at)",
     "CREATE INDEX jobs_submission ON processing_jobs(submission_id)",
-    """
-    -- Budget consumption is measured, including internal retries, so a job that
-    -- keeps producing truncated output runs out rather than looping.
-    CREATE TABLE budget_usage(
-        scope TEXT NOT NULL,
-        period TEXT NOT NULL,
-        resource TEXT NOT NULL,
-        tokens INTEGER NOT NULL DEFAULT 0,
-        calls INTEGER NOT NULL DEFAULT 0,
-        seconds REAL NOT NULL DEFAULT 0,
-        PRIMARY KEY(scope, period, resource)
-    )""",
+    *BUDGET_STATEMENTS,
 )
 
 

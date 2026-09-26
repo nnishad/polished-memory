@@ -7,7 +7,9 @@ to place one row would test those components instead of the reading.
 from __future__ import annotations
 
 import json
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,8 +31,10 @@ RETAIN = Route("retain", "remote-9b", "chat", "http://127.0.0.1:8080/v1", "cred"
 
 
 def settings(**overrides):
+    # ``home`` is in the surface because the resource gate is read from the instance
+    # admission ledger beside it, not from whichever profile asked first.
     base = {"capture_only": False, "hindsight_url": "http://127.0.0.1:8080/v1",
-            "owner_principal": "owner"}
+            "owner_principal": "owner", "home": Path(tempfile.mkdtemp(prefix="hm-"))}
     base.update(overrides)
     return SimpleNamespace(**base)
 

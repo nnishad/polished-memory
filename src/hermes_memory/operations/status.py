@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
 from ..ids import now, timestamp
-from ..processing.resource_gate import HELD, UNCERTAIN, WAITING, ResourceGate
+from ..processing.instance_gate import instance_gate, status_gate
+from ..processing.resource_gate import UNCERTAIN, WAITING, ResourceGate
 from ..sources.sync import COVERAGE_STATES
 from ..storage.evidence import EvidenceError
 
@@ -81,7 +82,12 @@ class StatusReporter:
         self.store = store
         self.db = store.db
         self.settings = settings
-        self.gate = gate or ResourceGate(store)
+        # One gate for the whole installation, not one per profile: two people using
+        # the same GPU are one queue, and the reading that reports it has to look at the
+        # ledger where both of them actually stand. Read-only, because a status report
+        # that created the file it was about to measure would not be a reading.
+        self.gate = gate or (status_gate(settings) if settings is not None
+                             else ResourceGate(store))
         if not 1 <= int(stale_queue_minutes) <= 10_080:
             raise EvidenceError("stale_queue_minutes must be between 1 minute and a week")
         self.stale_queue_minutes = int(stale_queue_minutes)
@@ -361,9 +367,13 @@ class StatusReporter:
 
     def resource_gate(self) -> StageReport:
         """One slot per physical resource. This says who is standing in it."""
-        held = self.db.execute(
-            "SELECT resource, route, holder, priority, acquired_at, lease_until "
-            "FROM gate_reservations WHERE state=? ORDER BY resource", (HELD,)).fetchall()
+        if self.gate is None:
+            return StageReport("resource_gate", UNCONFIGURED,
+                               "no admission ledger exists, so nothing has been queued "
+                               "against a physical model from here",
+                               {"occupancy": {}, "held": [], "uncertain": 0,
+                                "waiting": 0, "blocked": [], "usage": None})
+        held = self.gate.held()
         occupancy = {resource: dict(states)
                      for resource, states in self.gate.occupancy().items()}
         uncertain = sum(int(states.get(UNCERTAIN, 0)) for states in occupancy.values())
@@ -373,7 +383,7 @@ class StatusReporter:
         # reported before the "never reserved" case rather than hidden behind it.
         state = (DEGRADED if uncertain else
                  PAUSED if self.gate.paused else
-                 OPERATIONAL if taken or self._ever_reserved() else UNCONFIGURED)
+                 OPERATIONAL if taken or self.gate.ever_used() else UNCONFIGURED)
         return StageReport(
             "resource_gate", state,
             f"{taken} slot(s) occupied, {waiting} waiting"
@@ -476,9 +486,6 @@ class StatusReporter:
         """
         sources = [row["source"] for row in self.db.execute("SELECT source FROM connectors")]
         return bool(sources) and all(source in paused for source in sources)
-
-    def _ever_reserved(self) -> bool:
-        return bool(self.db.execute("SELECT 1 FROM gate_reservations LIMIT 1").fetchone())
 
     def _journal(self) -> dict[str, Any]:
         """How far behind each consumer is, in changes rather than in guesses.

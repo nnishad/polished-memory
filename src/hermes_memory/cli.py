@@ -457,7 +457,7 @@ def _stop_command(settings, args) -> int:
     to the next boot, which resumes exactly the formation the owner was trying to halt.
     """
     from .install.profiles import InstallationError
-    from .processing.resource_gate import ResourceGate
+    from .processing.instance_gate import instance_gate
     from .storage.evidence import EvidenceStore
 
     actor = args.actor or settings.owner_principal
@@ -467,12 +467,21 @@ def _stop_command(settings, args) -> int:
         return 2
     reason = args.reason
     paused = []
+    held_for = []
 
     def hold() -> None:
-        with EvidenceStore(settings.db_path) as store:
-            ResourceGate(store).pause(actor=actor, reason=reason)
-            store.set_control("global", "delivery", "paused", actor=actor, reason=reason,
-                              policy_version="operator-stop")
+        # Inference is held once, for the whole installation: the models are shared
+        # hardware, and a stop that only paused the default profile would leave the
+        # second one dispatching against a machine its owner just stopped.
+        with instance_gate(settings) as gate:
+            gate.pause(actor=actor, reason=reason)
+        for scoped in _archive_targets(settings, None):
+            if not scoped.db_path.is_file():
+                continue
+            with EvidenceStore(scoped.db_path) as store:
+                store.set_control("global", "delivery", "paused", actor=actor,
+                                  reason=reason, policy_version="operator-stop")
+            held_for.append(scoped.profile)
         paused.extend(["inference", "delivery"])
 
     try:
@@ -480,7 +489,8 @@ def _stop_command(settings, args) -> int:
     except InstallationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
-    return _emit({"ok": True, "stopped": stopped, "paused": paused, "actor": actor,
+    return _emit({"ok": True, "stopped": stopped, "paused": paused, "held_for": held_for,
+                  "actor": actor,
                   "resumes_with": "hermes-memory pause --scope inference --resume"
                                   " (and --scope delivery --resume)"})
 
@@ -488,11 +498,13 @@ def _stop_command(settings, args) -> int:
 def _pause_command(settings, args) -> int:
     """A hold that outlives the process that set it.
 
-    Both scopes are recorded in the canonical store rather than in the unit, because a
-    restart is exactly the event that must not lift it — and an autostart that resumed
-    formation would be the machine deciding against its owner.
+    Both are written to a database rather than to the unit, because a restart is exactly
+    the event that must not lift it — and an autostart that resumed formation would be the
+    machine deciding against its owner. Inference goes in the instance admission ledger,
+    which is the one place every profile's queue can see; delivery is a per-profile
+    outbox, so it is held on each profile's own archive.
     """
-    from .processing.resource_gate import ResourceGate
+    from .processing.instance_gate import instance_gate
     from .storage.evidence import EvidenceStore
 
     actor = args.actor or settings.owner_principal
@@ -503,21 +515,40 @@ def _pause_command(settings, args) -> int:
     reason = args.reason or ("the owner lifted the hold" if args.resume
                              else "the owner held this stage")
     state = "active" if args.resume else "paused"
-    with EvidenceStore(settings.db_path) as store:
-        gate = ResourceGate(store)
-        if args.scope == "inference":
-            if args.resume:
-                gate.resume(actor=actor, reason=reason)
-            else:
-                gate.pause(actor=actor, reason=reason)
-        else:
-            store.set_control("global", "delivery", state, actor=actor, reason=reason,
-                              policy_version="operator-pause")
-        held = {"inference": gate.paused,
-                "delivery": store.stage_is_paused("global", "delivery")}
+    written_to: list[str] = []
+    if args.scope == "inference":
+        with instance_gate(settings) as gate:
+            (gate.resume if args.resume else gate.pause)(actor=actor, reason=reason)
+    else:
+        for scoped in _archive_targets(settings, None):
+            if not scoped.db_path.is_file():
+                continue
+            with EvidenceStore(scoped.db_path) as store:
+                store.set_control("global", "delivery", state, actor=actor,
+                                  reason=reason, policy_version="operator-pause")
+            written_to.append(scoped.profile)
     return _emit({"ok": True, "scope": args.scope, "state": state, "actor": actor,
-                  "reason": reason, "held": held,
+                  "reason": reason, "held": _holds(settings), "written_to": written_to,
                   "survives_a_restart": True})
+
+
+def _holds(settings) -> dict[str, Any]:
+    """What is being held right now, read from both ledgers that hold anything.
+
+    Reported rather than echoed from the command that was just run: an operator asking
+    "is it stopped" wants the machine's answer, not a restatement of their own request.
+    """
+    from .processing.instance_gate import instance_gate
+
+    with instance_gate(settings) as gate:
+        inference = gate.paused
+    delivery = False
+    for scoped in _archive_targets(settings, None):
+        if not scoped.db_path.is_file():
+            continue
+        with ReadOnlyStore(scoped.db_path) as store:
+            delivery = delivery or store.stage_is_paused("global", "delivery")
+    return {"inference": inference, "delivery": delivery}
 
 
 # -- the archive, the release and the sources ----------------------------------

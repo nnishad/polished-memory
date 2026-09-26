@@ -229,6 +229,21 @@ class ResourceGate:
     def paused(self) -> bool:
         return self.store.stage_is_paused("global", "inference")
 
+    def close(self) -> None:
+        """Release the database this gate opened, if it opened one.
+
+        A gate built on somebody's evidence store leaves that store alone: closing it
+        here would take the archive's connection out from under its owner.
+        """
+        if getattr(self.store, "closes_with_gate", False):
+            self.store.close()
+
+    def __enter__(self) -> "ResourceGate":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
     def _refuse_if_paused(self) -> None:
         if self.paused:
             raise GatePaused("all inference is paused by the operator; new dispatch is denied")
@@ -244,6 +259,22 @@ class ResourceGate:
         for row in rows:
             out.setdefault(row["resource"], {})[row["state"]] = row["n"]
         return out
+
+    def held(self) -> list[dict[str, Any]]:
+        """Who is standing in a slot right now, with the clocks left as stored.
+
+        Reported rather than recomputed: the age of a reservation is the first thing an
+        operator asks, and a reader that rounds it here would hide how stale the row was
+        when it was read.
+        """
+        rows = self.db.execute(
+            "SELECT resource, route, holder, priority, acquired_at, lease_until "
+            "FROM gate_reservations WHERE state=? ORDER BY resource", (HELD,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def ever_used(self) -> bool:
+        """Whether this gate has ever admitted anything. An empty table is a fact."""
+        return bool(self.db.execute("SELECT 1 FROM gate_reservations LIMIT 1").fetchone())
 
     def blocked_resources(self) -> list[str]:
         """Resources that cannot accept work, including ones stuck uncertain."""

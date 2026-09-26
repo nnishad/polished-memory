@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -78,7 +80,7 @@ def configured(**values):
                 hindsight_api_key_env=None, background_budget_tokens=50_000,
                 owner_principal="owner:judge", gate_token="t",
                 allowed_inference_hosts=frozenset(), data_dir=None, db_path=None,
-                blob_dir=None)
+                blob_dir=None, home=Path(tempfile.mkdtemp(prefix="hm-doctor-")))
     base.update(values)
     return SimpleNamespace(**base)
 

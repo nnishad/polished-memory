@@ -25,8 +25,10 @@ from hermes_memory.install.services import apply as write_units
 from hermes_memory.install.services import plan as units_plan
 from hermes_memory.install.upgrade import (BACKUP_AGE_DAYS, UpgradeError,
                                            profile_stores, upgrade_plan)
-from hermes_memory.lifecycle.snapshots import Snapshots
+from hermes_memory.processing.instance_gate import (GateStore, gate_path,
+                                                   instance_gate)
 from hermes_memory.processing.resource_gate import ResourceGate
+from hermes_memory.lifecycle.snapshots import Snapshots
 from hermes_memory.storage.evidence import EvidenceStore
 
 OWNER = "jugaadu"
@@ -254,24 +256,36 @@ def test_a_store_that_does_not_exist_yet_is_reported_as_absent(installation):
 
 def test_a_held_gate_slot_blocks_the_switch_and_names_its_holder(installation):
     settings, environ, release, _tmp = installation
-    with EvidenceStore(settings.db_path) as store:
-        held = ResourceGate(store).try_acquire(route="retain", holder="generation-7",
-                                               resource="local-gpu", priority=1)
-    assert held is not None
+    with instance_gate(settings) as gate:
+        assert gate.try_acquire(route="retain", holder="generation-7",
+                                resource="local-gpu", priority=1) is not None
     report = upgrade_plan(settings, release=release, environ=environ)
-    assert report["in_flight"]["held"] == ["local-gpu for the default profile"]
+    assert report["in_flight"]["held"] == ["local-gpu for generation-7"]
+    assert report["in_flight"]["present"] is True
     assert "hold a gate slot" in said(report)
 
 
 def test_an_uncertain_lease_still_counts_as_work_the_machine_is_inside(installation):
+    """An expired lease is not evidence that the model server stopped answering."""
     settings, environ, release, _tmp = installation
-    with EvidenceStore(settings.db_path) as store:
-        store.db.execute("INSERT INTO gate_reservations(id, resource, route, holder, "
-                         "priority, state, acquired_at, lease_until) VALUES "
-                         "('r1','remote-9b','consolidate','generation-7',1,'uncertain',"
-                         "0,0)")
+    with instance_gate(settings) as gate:
+        held = gate.try_acquire(route="consolidate", holder="generation-7",
+                                resource="remote-9b", priority=1)
+        gate.mark_uncertain(held, reason="no response")
     report = upgrade_plan(settings, release=release, environ=environ)
-    assert report["in_flight"]["held"] == ["remote-9b for the default profile"]
+    assert report["in_flight"]["held"] == ["remote-9b for generation-7"]
+    assert "hold a gate slot" in said(report)
+
+
+def test_a_waiting_caller_is_not_work_in_flight(installation):
+    settings, environ, release, _tmp = installation
+    with instance_gate(settings) as gate:
+        gate.try_acquire(route="retain", holder="generation-7", resource="local-gpu",
+                         priority=1)
+        gate.try_acquire(route="retain", holder="generation-8", resource="local-gpu",
+                         priority=0)
+    report = upgrade_plan(settings, release=release, environ=environ)
+    assert [item.split(" for ")[0] for item in report["in_flight"]["held"]] == ["local-gpu"]
 
 
 def test_the_plan_leaves_no_ledger_behind(installation):
@@ -281,8 +295,13 @@ def test_the_plan_leaves_no_ledger_behind(installation):
         "reading the profile map is not a reason to create one"
 
 
-def test_a_slot_held_in_a_second_profile_store_is_not_invisible(installation, tmp_path):
-    """One installation, three people: the upgrade has to see all three stores."""
+def test_one_admission_ledger_covers_every_profile_so_a_slot_cannot_hide(
+        installation, tmp_path):
+    """The second person's queue is the same queue; that is the whole point of §10.5.
+
+    Before this, a reservation lived in the profile's own archive, so an upgrade that
+    looked at one store could switch code out from under a retain running in another.
+    """
     settings, environ, release, _tmp = installation
     work = tmp_path / "homes" / "work"
     registry = ProfileRegistry.open(settings)
@@ -291,14 +310,14 @@ def test_a_slot_held_in_a_second_profile_store_is_not_invisible(installation, tm
         registry.enroll("work", work, actor=OWNER, review_digest=proposal["review_digest"])
     finally:
         registry.db.close()
-    with EvidenceStore(Path(proposal["data_dir"]) / "canonical.db") as store:
-        assert ResourceGate(store).try_acquire(route="retain", holder="generation-8",
-                                              resource="remote-9b", priority=1)
+    scoped = None
+    with GateStore(gate_path(settings)) as ledger:
+        ResourceGate(ledger).try_acquire(route="retain", holder="work:generation-8",
+                                         resource="remote-9b", priority=1)
     report = upgrade_plan(settings, release=release, environ=environ)
+    assert report["in_flight"]["held"] == ["remote-9b for work:generation-8"]
     assert [name for name, _ in profile_stores(settings)] == [
         "work", f"the unenrolled store at {settings.db_path}"]
-    assert report["in_flight"]["held"] == ["remote-9b for work"]
-    assert report["in_flight"]["stores"] == 2
 
 
 # -- backups ------------------------------------------------------------------
@@ -460,21 +479,25 @@ def test_a_host_not_selecting_this_memory_is_said(installation, tmp_path):
         upgrade_plan(settings, release=release, environ=environ))
 
 
-def test_an_unreadable_store_leaves_the_in_flight_claim_falsifiable(installation, tmp_path):
+def test_an_unreadable_admission_ledger_is_said_rather_than_called_idle(installation):
     settings, environ, release, _tmp = installation
-    work = tmp_path / "homes" / "work"
-    registry = ProfileRegistry.open(settings)
-    try:
-        proposal = registry.plan("work", work)
-        registry.enroll("work", work, actor=OWNER, review_digest=proposal["review_digest"])
-    finally:
-        registry.db.close()
-    broken = Path(proposal["data_dir"]) / "canonical.db"
-    broken.parent.mkdir(parents=True, exist_ok=True)
-    broken.write_text("not a database\n", encoding="utf-8")
+    with instance_gate(settings) as gate:
+        assert gate.try_acquire(route="retain", holder="generation-7",
+                                resource="local-gpu", priority=1) is not None
+    gate_path(settings).write_text("not a ledger at all\n", encoding="utf-8")
     report = upgrade_plan(settings, release=release, environ=environ)
     assert report["in_flight"]["held"] == []
-    assert "could not be asked about" in said(report)
+    assert report["in_flight"]["unreadable"] == 1
+    assert "could not be read" in said(report)
+
+
+def test_no_admission_ledger_yet_says_so_rather_than_promising_quiet(installation):
+    settings, environ, release, _tmp = installation
+    report = upgrade_plan(settings, release=release, environ=environ)
+    assert report["in_flight"] == {"ledger": str(gate_path(settings)), "present": False,
+                                   "held": [], "unreadable": 0}
+    assert "nothing has been queued" in said(report)
+    assert not gate_path(settings).exists(), "planning does not create the gate"
 
 
 # -- the digest ---------------------------------------------------------------

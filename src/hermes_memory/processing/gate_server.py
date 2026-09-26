@@ -65,12 +65,26 @@ class GateApp:
 
     def __init__(self, *, routes: RouteTable, gate: ResourceGate, upstream_credentials,
                  upstream: Callable | None = None,
-                 token_estimate: Callable[[dict], int] | None = None):
+                 token_estimate: Callable[[dict], int] | None = None,
+                 store: Any = None):
         self.routes = routes
         self.gate = gate
+        self.store = store
         self.upstream_credentials = dict(upstream_credentials)
         self.upstream = upstream or urllib_upstream()
         self.token_estimate = token_estimate or _estimate_tokens
+
+    def close(self) -> None:
+        """Release what this application was built from.
+
+        The gate and the evidence store are usually two different databases now — one
+        admission ledger for the installation, one archive per profile — and closing one
+        while leaving the other open is a leak with a plausible name.
+        """
+        self.gate.close()
+        close = getattr(self.store, "close", None)
+        if close is not None:
+            close()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":

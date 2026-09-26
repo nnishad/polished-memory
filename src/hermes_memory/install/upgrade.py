@@ -63,7 +63,7 @@ def upgrade_plan(settings, *, release: str | Path | None = None,
     units = service_plan(settings, environ=environ)
     schema = _schema_state(settings)
     profiles = profile_stores(settings)
-    occupied = _in_flight(profiles)
+    occupied = _in_flight(settings)
     backups = _backups(profiles, moment=moment)
 
     blocking: list[str] = []
@@ -89,9 +89,13 @@ def upgrade_plan(settings, *, release: str | Path | None = None,
     if occupied["held"]:
         blocking.append(f"{', '.join(occupied['held'])} hold a gate slot right now; §10.6 "
                         "reconciles active work before switching code")
+    elif not occupied["present"]:
+        advisory.append("there is no admission ledger at "
+                        f"{occupied['ledger']} yet, so nothing has been queued against a "
+                        "physical model from here")
     if occupied["unreadable"]:
-        advisory.append(f"{occupied['unreadable']} store(s) could not be asked about "
-                        "in-flight work, so none is claimed to be absent there")
+        advisory.append(f"{occupied['ledger']} could not be read, so no claim is made "
+                        "about work in flight")
     if backups["missing"]:
         blocking.append("there is no backup to fall back to for "
                         + ", ".join(backups["missing"])
@@ -288,33 +292,32 @@ def _schema_state(settings) -> dict[str, Any]:
             "now": applied, "head": head, "store": str(path)}
 
 
-def _in_flight(profiles: list[tuple[str, Path]]) -> dict[str, Any]:
-    """Which resources are occupied right now, across every store this installation serves.
+def _in_flight(settings) -> dict[str, Any]:
+    """Which physical resources are occupied right now.
 
-    Counted rather than inferred from a PID: an upgrade that swapped the code out from
-    under a running retain is the failure §10.6 calls quiescing for, and a generation
-    still holding a lease is the evidence that one is.
+    Read from the instance admission ledger rather than from any profile's archive,
+    because that is where every profile actually stands in line: an upgrade that swapped
+    the code out from under a running retain is the failure §10.6 calls quiescing for, and
+    a queue read from one of two profiles would say "idle" while the other was working.
     """
+    from sqlite3 import OperationalError
+
+    from ..processing.instance_gate import gate_path
     from ..processing.resource_gate import HELD, UNCERTAIN
     from ..storage.evidence import ReadOnlyStore
 
-    held: list[str] = []
-    unreadable = 0
-    scanned = 0
-    for profile, path in profiles:
-        if not path.is_file():
-            continue
-        scanned += 1
-        try:
-            with ReadOnlyStore(path) as store:
-                rows = store.db.execute(
-                    "SELECT resource FROM gate_reservations WHERE state IN (?,?)",
-                    (HELD, UNCERTAIN)).fetchall()
-        except Exception:
-            unreadable += 1
-            continue
-        held.extend(f"{row[0]} for {profile}" for row in rows)
-    return {"stores": scanned, "held": sorted(held), "unreadable": unreadable}
+    path = gate_path(settings)
+    if not path.is_file():
+        return {"ledger": str(path), "present": False, "held": [], "unreadable": 0}
+    try:
+        with ReadOnlyStore(path) as store:
+            rows = store.db.execute(
+                "SELECT resource, holder FROM gate_reservations WHERE state IN (?,?) "
+                "ORDER BY resource, holder", (HELD, UNCERTAIN)).fetchall()
+    except (OperationalError, Exception):
+        return {"ledger": str(path), "present": True, "held": [], "unreadable": 1}
+    return {"ledger": str(path), "present": True,
+            "held": [f"{row[0]} for {row[1]}" for row in rows], "unreadable": 0}
 
 
 def _backups(profiles: list[tuple[str, Path]], *, moment: float) -> dict[str, Any]:

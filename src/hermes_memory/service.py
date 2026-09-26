@@ -80,12 +80,16 @@ def build_app(settings, *, store, upstream: Callable | None = None,
 
     ``store`` is required rather than created so that the caller decides which database
     is opened and when it is closed; ``upstream`` is injected so no test reaches a model.
+    The admission ledger is *not* the evidence store: one installation, one queue for its
+    physical models, however many profiles are standing in it.
     """
+    from .processing.instance_gate import instance_gate
+
     routes = (RouteTable({}) if not settings.hindsight_url else
               build_routes(settings, credentials=settings.route_credentials))
-    return GateApp(routes=routes, gate=gate or ResourceGate(store),
+    return GateApp(routes=routes, gate=gate or instance_gate(settings),
                    upstream_credentials=settings.route_credentials,
-                   upstream=upstream)
+                   upstream=upstream, store=store)
 
 
 class GateServer(ThreadingHTTPServer):
@@ -122,8 +126,7 @@ class GateServer(ThreadingHTTPServer):
             super().shutdown_request(request)
         finally:
             holder = getattr(self._local, "app", None)
-            store = getattr(getattr(holder, "gate", None), "store", None)
-            close = getattr(store, "close", None)
+            close = getattr(holder, "close", None)
             if close is not None:
                 close()
             self._local.app = None
