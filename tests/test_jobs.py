@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_memory.processing.jobs import (CANCELLED, QUARANTINED, QUEUED, RETRY_WAIT,
+from hermes_memory.processing.jobs import (CANCELLED, LEASED, QUARANTINED, QUEUED, RETRY_WAIT,
                                            RUNNING, SUCCEEDED, SUBMITTING, UNCERTAIN, JobQueue)
 from hermes_memory.processing.routes import PRIORITY, Route
 from hermes_memory.storage.evidence import EvidenceError
@@ -218,6 +218,44 @@ def test_the_reconciliation_backlog_is_queryable(jobs):
     unresolved = jobs.unresolved()
     assert [item.id for item in unresolved] == [job.id]
     assert unresolved[0].state == UNCERTAIN
+
+
+def test_a_job_past_its_attempt_ceiling_is_not_claimed_even_if_the_row_drifted(jobs):
+    """The ceiling is enforced where the work is handed out, not only where it is recorded.
+
+    `retry()` quarantines at the ceiling, so a queued row past `max_attempts` should not exist —
+    and the claim does not assume it, because a queue whose guard depends on every writer
+    having behaved is a queue that runs the extra attempt.
+    """
+    created = enqueued(jobs, max_attempts=2)
+    jobs.db.execute("UPDATE processing_jobs SET attempts=2 WHERE id=?", (created["job_id"],))
+
+    assert jobs.claim(worker="w1") is None
+    assert jobs.get(created["job_id"]).state == QUEUED, "refusing to claim changes nothing"
+
+
+def test_a_backed_off_retry_is_the_next_thing_a_worker_claims(jobs):
+    """A retry that only a report can see is not a retry.
+
+    Before this, ``retry()`` moved the row to ``retry_wait`` and ``claim()`` looked only at
+    ``queued`` — so the job waited forever, the status report called it waiting, and the
+    plan's bounded retry never happened.
+    """
+    clock = _Clock()
+    jobs.clock = clock
+    created = enqueued(jobs, max_attempts=5)
+    first = jobs.claim(worker="w1")
+    jobs.retry(first, error="503 saturated", backoff=60.0)
+
+    assert jobs.claim(worker="w2") is None, "the backoff has not passed yet"
+
+    clock.advance(61)
+    again = jobs.claim(worker="w2")
+
+    assert again is not None and again.id == created["job_id"]
+    assert again.attempts == 1, "the retry is the second attempt of one job, not a new one"
+    assert again.state == LEASED
+    assert jobs.counts().get(RETRY_WAIT, 0) == 0
 
 
 def test_retry_waits_its_backoff_before_becoming_eligible(jobs):

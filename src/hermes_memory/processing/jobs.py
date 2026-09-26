@@ -131,20 +131,28 @@ class JobQueue:
 
         An overdue job is not claimed: handing out work that has already blown
         its own deadline would spend a physical slot on a result nobody wanted.
+
+        A job waiting out its backoff *is* claimable, once the backoff has passed. Leaving
+        ``retry_wait`` out of this query made a retry a silent ending: the row sat in a state
+        the status report called "waiting", the plan's bounded retry never happened, and
+        nothing said why. It is the same rule `ready_for_retry()` reports, so the two agree by
+        construction rather than by anybody remembering to update both.
         """
         if not 1 <= ttl <= 3600:
             raise EvidenceError("ttl must be between 1 and 3600 seconds")
         now_epoch = self.store.epoch()
+        moment = self.clock()
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self._reclaim_expired_leases()
             row = self.db.execute(
                 """
                 SELECT * FROM processing_jobs
-                WHERE state=? AND epoch=? AND attempts < max_attempts
+                WHERE (state=? OR (state=? AND (not_before IS NULL OR not_before <= ?)))
+                  AND epoch=? AND attempts < max_attempts
                   AND (deadline IS NULL OR deadline > ?)
                 ORDER BY priority, created_at, id LIMIT 1
-                """, (QUEUED, now_epoch, self.clock())).fetchone()
+                """, (QUEUED, RETRY_WAIT, moment, now_epoch, moment)).fetchone()
             if row is None:
                 self.db.execute("COMMIT")
                 return None
