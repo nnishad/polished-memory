@@ -197,11 +197,18 @@ class Recovery:
             raise
         self.store._audit("restore_complete", snapshot_id,
                           {"actor": actor, "guard": guard.name, **applied})
+        note = ("Evidence forgotten since this snapshot stays forgotten: "
+                f"{applied['reapplied']} tombstoned record(s) were taken out of "
+                "the restored copy again before it answered a single read.")
+        if applied["tombstones_without_a_record"]:
+            # Said out loud rather than left as a count: these are the owner's decisions
+            # about evidence this snapshot never held, so their obligations travel while
+            # their markers have nothing to mark.
+            note += (f" {applied['tombstones_without_a_record']} erasure intent(s) name "
+                     "records this snapshot does not contain; their deletion obligations "
+                     "are carried and their tombstones are not.")
         return {"restored": snapshot_id, "epoch": carried.epoch, **applied,
-                "pre_restore_backup": str(guard),
-                "note": ("Evidence forgotten since this snapshot stays forgotten: "
-                         f"{applied['reapplied']} tombstoned record(s) were taken out of "
-                         "the restored copy again before it answered a single read.")}
+                "pre_restore_backup": str(guard), "note": note}
 
     # -- the ledger that does not roll back ----------------------------------
 
@@ -225,6 +232,7 @@ class Recovery:
         which the restored store can be read with the ledger still missing.
         """
         self.db.execute("BEGIN IMMEDIATE")
+        orphans: list[str] = []
         try:
             # Empty the ledger before refilling it, children first: the copy that
             # just landed has its own intents, and clearing the parent table under
@@ -235,6 +243,22 @@ class Recovery:
                 rows = carried.tables.get(table) or []
                 if not rows:
                     continue
+                if table == "tombstones":
+                    # A tombstone names the record it buries, and the record table belongs to
+                    # the snapshot rather than to the ledger. Evidence that arrived *after* this
+                    # snapshot and was forgotten after that has no row here to hide, and
+                    # inserting its grave marker anyway is a foreign-key failure that aborts the
+                    # whole restore — which is the opposite of what a rollback is for. The
+                    # intent and its obligations are carried regardless, so the owner's decision
+                    # survives; only the marker for a body this copy never held is left out.
+                    present = {str(row["id"]) for row in
+                               self.db.execute("SELECT id FROM records")}
+                    unmatched = [str(row["record_id"]) for row in rows
+                                 if str(row["record_id"]) not in present]
+                    rows = [row for row in rows if str(row["record_id"]) in present]
+                    orphans.extend(unmatched)
+                    if not rows:
+                        continue
                 columns = sorted({key for row in rows for key in row})
                 self.db.executemany(
                     f"INSERT INTO {table}({', '.join(columns)}) "
@@ -259,6 +283,8 @@ class Recovery:
                 len(carried.tables.get("erasure_targets") or []),
                 "intents": len(carried.tables.get("erasure_ledger") or []),
                 "tombstones": len(carried.tables.get("tombstones") or []),
+                "tombstones_without_a_record": len(orphans),
+                "orphaned_tombstones": orphans[:20],
                 "stale_projections_dropped": dropped}
 
     def _honour_tombstones(self) -> int:

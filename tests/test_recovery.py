@@ -631,6 +631,26 @@ def test_a_forgotten_record_stays_forgotten_through_a_rollback(store, snapshots,
                                 (secret,)).fetchone()[0]) == 1
 
 
+def test_an_erasure_of_evidence_the_snapshot_never_held_completes_anyway(store, snapshots,
+                                                                        recovery, forget):
+    made = snapshots.create(reason="before the arrival", actor=OWNER)["snapshot"]
+    late = committed(store, source_id="msg-late",
+                     text="A diagnosis written after the snapshot was taken.")
+    intent = forget(late)["intent_id"]
+
+    result = recovery.restore(made.id, actor=OWNER)
+
+    # There is no row in this copy to re-hide: the evidence arrived after the snapshot and
+    # left again before anything was copied. Refusing to restore over the dangling marker —
+    # which is what the foreign key did first — turns a backup into a restore that cannot
+    # happen, so the decision and its obligations travel and the marker does not.
+    assert result["tombstones_without_a_record"] == 1
+    assert store.get(late) is None
+    assert store.db.execute("SELECT 1 FROM erasure_ledger WHERE id=?",
+                            (intent,)).fetchone() is not None
+    assert "does not contain" in result["note"]
+
+
 def test_the_erasure_ledger_survives_the_rollback(store, snapshots, recovery, forget):
     secret = committed(store, source_id="msg-1")
     made = snapshots.create(reason="baseline", actor=OWNER)["snapshot"]
