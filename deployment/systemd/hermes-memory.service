@@ -1,19 +1,19 @@
 [Unit]
 Description=Hermes memory runtime (canonical store, context broker and resource gate)
-Documentation=file:///home/jugaadu/Projects/hermes-memory/docs/operations.md
-After=network-online.target hermes-memory-hindsight.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 # Release pointer swapped atomically by `hermes-memory upgrade`.
-Environment=HERMES_MEMORY_RELEASE=/home/jugaadu/services/hermes-memory/current
-Environment=HERMES_MEMORY_HOME=/home/jugaadu/data/hermes-memory
-ExecStart=/home/jugaadu/services/hermes-memory/current/bin/hermes-memory serve
+Environment=HERMES_MEMORY_RELEASE=@RELEASE@
+Environment=HERMES_MEMORY_HOME=@INSTANCE_HOME@
+WorkingDirectory=@INSTANCE_HOME@
+ExecStart=@RELEASE@/bin/hermes-memory serve
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Owned config, not an interactive shell's environment.
-EnvironmentFile=/home/jugaadu/data/hermes-memory/hermes-memory.env
+EnvironmentFile=@ENV_FILE@
 
 Restart=on-failure
 RestartSec=5
@@ -24,10 +24,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/jugaadu/data/hermes-memory
-# The gate must be reachable by the backend and the worker before either may
-# dispatch inference, so start ordering is not optional.
-NotifyAccess=main
+ReadWritePaths=@INSTANCE_HOME@
 
 MemoryHigh=6G
 MemoryMax=10G

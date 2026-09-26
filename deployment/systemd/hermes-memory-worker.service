@@ -1,15 +1,15 @@
 [Unit]
 Description=Hindsight background worker (single slot, gate-serialised)
-Documentation=file:///home/jugaadu/Projects/hermes-memory/docs/operations.md
 After=hermes-memory-hindsight.service
 BindsTo=hermes-memory-hindsight.service
 PartOf=hermes-memory-hindsight.service
 
 [Service]
 Type=simple
-Environment=HERMES_MEMORY_RELEASE=/home/jugaadu/services/hermes-memory/current
-Environment=HERMES_MEMORY_HOME=/home/jugaadu/data/hermes-memory
-ExecStart=/home/jugaadu/services/hermes-memory/hindsight/current/bin/hindsight-worker
+Environment=HERMES_MEMORY_RELEASE=@RELEASE@
+Environment=HERMES_MEMORY_HOME=@INSTANCE_HOME@
+WorkingDirectory=@HINDSIGHT_DATA_DIR@
+ExecStart=@RELEASE@/hindsight/bin/hindsight-worker
 
 Restart=on-failure
 RestartSec=15
@@ -19,8 +19,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/jugaadu/data/hermes-memory/hindsight /home/jugaadu/data/hermes-memory/pg0
-EnvironmentFile=/home/jugaadu/data/hermes-memory/hindsight.env
+ReadWritePaths=@HINDSIGHT_DATA_DIR@ @PG0_DIR@
+EnvironmentFile=@HINDSIGHT_ENV@
+Environment=PG0_HOME=@PG0_DIR@
 Environment=PYTHONDONTWRITEBYTECODE=1
 
 # One slot only. Native reservations are floors, not ceilings, so a default
