@@ -108,6 +108,15 @@ class ResourceGate:
         Registering for the duration is what makes priority meaningful: two
         blocked callers can see each other, so the more urgent one wins instead
         of whichever happened to poll first after the slot freed.
+
+        Waiting is only offered to a caller that can be served by it. A held slot belongs to a
+        request that will end; an unresolved one belongs to a request nobody can answer for, and
+        it keeps the device blocked until that outcome is established from outside — by a
+        reconciliation that asks the backend, or by an operator's written settlement. Standing in
+        line behind that pays a full timeout for an answer no amount of waiting produces, so the
+        standing ends with it. The question is asked after the first attempt, not before it, so
+        that a lease which only just expired is reaped into uncertainty and named as such, rather
+        than being waited on as though it were still live work.
         """
         deadline = self.clock() + timeout
         while True:
@@ -115,6 +124,8 @@ class ResourceGate:
                                        priority=priority, job_id=job_id, ttl=ttl)
             if attempt is not None or self.clock() >= deadline:
                 return attempt
+            if self.unresolved_for(resource):
+                return None
             time.sleep(max(poll, 0.001))
 
     def _promote_locked(self, waiter: str, resource: str, priority: int) -> bool:
@@ -396,6 +407,17 @@ class ResourceGate:
             "SELECT id, resource, route, holder, job_id, acquired_at, outcome "
             "FROM gate_reservations WHERE state=? ORDER BY acquired_at", (UNCERTAIN,)).fetchall()
         return [dict(row) for row in rows]
+
+    def unresolved_for(self, resource: str) -> bool:
+        """Whether this device is blocked by a request nobody can answer for.
+
+        The question a caller asks before it decides to wait. A held slot is a queue this caller
+        can join and be served from; an unresolved row is a device that stays blocked until
+        somebody establishes what happened outside this process, and waiting is not somebody.
+        """
+        return bool(self.db.execute(
+            "SELECT 1 FROM gate_reservations WHERE resource=? AND state=?",
+            (resource, UNCERTAIN)).fetchone())
 
     def ever_used(self) -> bool:
         """Whether this gate has ever admitted anything. An empty table is a fact."""

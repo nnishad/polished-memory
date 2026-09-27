@@ -1,6 +1,8 @@
 """C12 worker and budgets: the guarded formation path, offline."""
 from __future__ import annotations
 
+import time
+
 import pytest
 from types import SimpleNamespace
 
@@ -9,9 +11,9 @@ from hermes_memory.backend.hindsight_client import (HindsightClient, HindsightUn
                                                    TransportResult)
 from hermes_memory.processing.budgets import Budget, BudgetExhausted, Budgets
 from hermes_memory.processing.jobs import QUEUED, UNCERTAIN, JobQueue
-from hermes_memory.processing.resource_gate import ResourceGate
+from hermes_memory.processing.resource_gate import Reservation, ResourceGate
 from hermes_memory.processing.routes import PRIORITY, RouteTable, Route
-from hermes_memory.processing.worker import FormationWorker
+from hermes_memory.processing.worker import QUEUE_HEADROOM_S, FormationWorker
 from hermes_memory.storage.evidence import EvidenceError
 
 from conftest import envelope
@@ -244,6 +246,278 @@ def test_an_empty_queue_is_not_an_error(harness):
     assert harness.worker.drain()["attempted"] == 0
 
 
+# -- queueing for one slot ---------------------------------------------------
+
+def test_a_busy_device_is_queued_for_rather_than_refused(harness, monkeypatch):
+    """One slot means the device is serialised, not that its callers are turned away.
+
+    The engine presents several sub-calls of one operation at a time, each inside its own
+    concurrency limit, so a submitter that refuses on contact cannot form anything at all.
+    """
+    import hermes_memory.processing.resource_gate as gate_module
+
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    assert rival is not None
+
+    polls: list[float] = []
+
+    def give_up_after_one_look(seconds):
+        polls.append(seconds)
+        if len(polls) == 1:
+            harness.gate.release(rival, outcome="succeeded")
+
+    monkeypatch.setattr(gate_module.time, "sleep", give_up_after_one_look)
+    harness.worker.slot_queue_s = 30.0
+    outcome = harness.worker.run_once()
+    assert outcome.state == "succeeded", "the caller that waited is served once the device frees"
+    assert harness.jobs.get(job_id).state == "succeeded"
+    assert len(polls) == 1, "one admission stood in line; the job was not re-claimed per round"
+    assert harness.gate.blocked_resources() == []
+
+
+def test_an_interactive_route_is_refused_at_once_rather_than_queued(harness, monkeypatch):
+    """A human turn degrades instead of blocking behind a consolidation run."""
+    import hermes_memory.processing.resource_gate as gate_module
+
+    foreground = Route("foreground", REMOTE, "chat", "http://127.0.0.1:8813/v1", "cred-foreground",
+                       "interactive", 1024)
+    harness.worker.routes = RouteTable({"retain": RETAIN, "foreground": foreground})
+    harness.jobs.enqueue(kind="retain", inputs=[harness.record()], input_revision="1",
+                         route=foreground, processor_fingerprint=FINGERPRINT,
+                         priority="interactive")
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+
+    polls: list[float] = []
+    monkeypatch.setattr(gate_module.time, "sleep", polls.append)
+    harness.worker.slot_queue_s = 30.0
+    outcome = harness.worker.run_once()
+    assert outcome.state == "slot_busy"
+    assert polls == [], "the interactive route never stands in line"
+    assert "no wait to spend" in outcome.detail
+    harness.gate.release(rival, outcome="succeeded")
+
+
+def test_no_wait_is_spent_on_a_device_nobody_can_answer_for(harness, monkeypatch):
+    """A held slot is a queue this caller can be served from; an unproven one is not.
+
+    An uncertain reservation keeps the device blocked until its outcome is established from
+    outside — by the reconciliation that asks the backend, or by an operator's written
+    settlement. Standing in line for 120s against it would be a slower way of refusing.
+    """
+    import hermes_memory.processing.resource_gate as gate_module
+
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    harness.gate.mark_uncertain(rival, reason="the request went away mid-flight")
+
+    polls: list[float] = []
+    monkeypatch.setattr(gate_module.time, "sleep", polls.append)
+    harness.worker.slot_queue_s = 30.0
+    outcome = harness.worker.run_once()
+    assert outcome.state == "slot_busy"
+    assert polls == [], "nothing was waited for, because nothing waiting could have helped"
+    assert "form --reconcile" in outcome.detail, "the refusal names the door that does answer"
+    assert harness.jobs.get(job_id).state == QUEUED
+
+
+def test_a_wait_that_runs_out_says_how_long_it_stood(harness):
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    harness.worker.slot_queue_s = 0.2
+    outcome = harness.worker.run_once()
+    assert outcome.state == "slot_busy"
+    assert "waited 0.2s for the slot" in outcome.detail
+    job = harness.jobs.get(job_id)
+    assert job.state == QUEUED and job.attempts == 0, "standing in line costs no attempt"
+    harness.gate.release(rival, outcome="succeeded")
+
+
+def test_a_queueing_caller_keeps_vouching_for_its_claim(harness):
+    """The claim was made for the work, and queueing for the device is part of the work.
+
+    A lease that lapses while its holder is still standing in line is read by the next worker
+    as a dead one, and the row becomes reconciled work nobody abandoned.
+    """
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    harness.worker.slot_queue_s = 30.0
+
+    promised: list[float] = []
+
+    def watch(**kwargs):
+        promised.append(harness.jobs.get(job_id).lease_until - time.time())
+        return None
+
+    harness.gate.acquire = watch
+    assert harness.worker.run_once().state == "slot_busy"
+    harness.gate.release(rival, outcome="succeeded")
+    assert promised and promised[0] >= 30.0 + QUEUE_HEADROOM_S - 1.0, \
+        "the promise has to outlast the standing, not merely cover the submission"
+
+
+def test_a_deadline_caps_the_wait_it_is_given(harness):
+    """Standing in line for work that has run out of its own time buys a result nobody wants."""
+    record = harness.record()
+    harness.jobs.enqueue(kind="retain", inputs=[record], input_revision="1", route=RETAIN,
+                         processor_fingerprint=FINGERPRINT, priority="freshness",
+                         deadline=time.time() + 5.0)
+    harness.worker.slot_queue_s = 30.0
+
+    timeouts: list[float] = []
+
+    def watch(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return None
+
+    harness.gate.acquire = watch
+    assert harness.worker.run_once().state == "slot_busy"
+    assert timeouts and 4.5 < timeouts[0] <= 5.0, \
+        "the job's deadline binds before the configured wait does"
+
+
+def test_a_wait_its_deadline_ate_leaves_no_standing(harness):
+    """A wait capped to nothing is the immediate refusal, and it is reported as one.
+
+    The deadline is put behind the worker's own clock rather than raced against the wall: the
+    queue still has the job, and the caller still has the configured wait to spend.
+    """
+    record = harness.record()
+    harness.jobs.enqueue(kind="retain", inputs=[record], input_revision="1", route=RETAIN,
+                         processor_fingerprint=FINGERPRINT, priority="freshness",
+                         deadline=time.time() + 5.0)
+    harness.worker.slot_queue_s = 30.0
+    harness.worker.clock = lambda: time.time() + 5.5
+
+    timeouts: list[float] = []
+
+    def watch(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return None
+
+    harness.gate.acquire = watch
+    outcome = harness.worker.run_once()
+    assert outcome.state == "slot_busy"
+    assert timeouts == [0.0] and "no wait to spend" in outcome.detail
+
+
+def test_the_drain_stops_when_the_device_it_waited_for_did_not_free(harness):
+    """One exhausted wait is the answer for the whole pass, not just for one job.
+
+    A drain that kept claiming would pay that wait once per job — fifty jobs against one busy
+    model is an hour of standing in line to be told the same thing. The queue holds the work
+    with no attempt spent, and the next scheduled pass asks again.
+    """
+    harness.enqueue(harness.record())
+    harness.enqueue(harness.record())
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    harness.worker.slot_queue_s = 0.2
+    report = harness.worker.drain(max_jobs=5)
+    assert report["attempted"] == 1, "the pass stopped rather than queueing fifty times"
+    assert report["outcomes"][0]["state"] == "slot_busy"
+    assert harness.jobs.counts()[QUEUED] == 2, "and no job spent an attempt on the contention"
+    harness.gate.release(rival, outcome="succeeded")
+
+
+def test_a_drain_with_no_wait_configured_still_sweeps_the_queue(harness):
+    """The immediate refusal is cheap, so a busy device is no reason to stop looking.
+
+    `GATE_QUEUE_S=0` is the owner asking for the old behaviour back. Stopping the drain early
+    there would turn a cheap sweep into a pass that leaves work it could have run.
+    """
+    harness.enqueue(harness.record())
+    harness.enqueue(harness.record())
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    report = harness.worker.drain(max_jobs=5)
+    assert report["attempted"] == 5, "every job was looked at as many times as the pass was told"
+    assert {item["state"] for item in report["outcomes"]} == {"slot_busy"}
+    assert harness.jobs.counts()[QUEUED] == 2
+    harness.gate.release(rival, outcome="succeeded")
+
+
+def test_uncertainty_about_one_device_does_not_block_another(harness):
+    """Each device is queued on its own account.
+
+    An unproven embedding request says nothing about the remote model, and refusing the retain
+    because of it would turn one lost answer into an installation-wide outage.
+    """
+    record = harness.record()
+    harness.enqueue(record)
+    other = harness.gate.try_acquire(route="embeddings", holder="somebody-else",
+                                     resource=GPU, priority=PRIORITY["freshness"])
+    harness.gate.mark_uncertain(other, reason="the embedding request went away mid-flight")
+    harness.worker.slot_queue_s = 30.0
+    assert harness.worker.run_once().state == "succeeded"
+
+
+def test_uncertainty_about_one_device_does_not_stop_a_wait_on_another(harness, monkeypatch):
+    """Two facts about two devices, and only the relevant one decides anything.
+
+    The device this caller wants is busy in a way that waiting can fix, while some other device
+    is stuck unaccounted for. Refusing here because of the other device would make one lost
+    embedding request an installation-wide outage.
+    """
+    import hermes_memory.processing.resource_gate as gate_module
+
+    record = harness.record()
+    harness.enqueue(record)
+    other = harness.gate.try_acquire(route="embeddings", holder="somebody-else", resource=GPU,
+                                     priority=PRIORITY["freshness"])
+    harness.gate.mark_uncertain(other, reason="the embedding request went away mid-flight")
+    rival = harness.gate.try_acquire(route="retain", holder="another-worker", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    polls: list[float] = []
+
+    def give_it_back(seconds):
+        polls.append(seconds)
+        if len(polls) == 1:
+            harness.gate.release(rival, outcome="succeeded")
+
+    monkeypatch.setattr(gate_module.time, "sleep", give_it_back)
+    harness.worker.slot_queue_s = 30.0
+    assert harness.worker.run_once().state == "succeeded"
+    assert len(polls) == 1, "this caller waited for the device it was actually queued on"
+
+
+def test_a_device_that_goes_unanswerable_mid_wait_stops_the_standing(harness, monkeypatch):
+    """The slot was free to wait for when the caller joined the line, and then it was not.
+
+    A request that ends is what a queue is for. A request that stops being answerable is not
+    served by any amount of polling, so the standing ends with it rather than running out the
+    owner's whole configured wait.
+    """
+    import hermes_memory.processing.resource_gate as gate_module
+
+    record = harness.record()
+    harness.enqueue(record)
+    rival = harness.gate.try_acquire(route="retain", holder="somebody-else", resource=REMOTE,
+                                     priority=PRIORITY["maintenance"])
+    polls: list[float] = []
+
+    def go_unanswerable(seconds):
+        polls.append(seconds)
+        if len(polls) == 1:
+            harness.gate.mark_uncertain(rival, reason="the request went away mid-flight")
+
+    monkeypatch.setattr(gate_module.time, "sleep", go_unanswerable)
+    harness.worker.slot_queue_s = 30.0
+    outcome = harness.worker.run_once()
+    assert outcome.state == "slot_busy"
+    assert len(polls) == 1, "the standing ended when waiting stopped being able to help"
+    assert "form --reconcile" in outcome.detail
+
+
 # -- waiting for the operation ------------------------------------------------
 
 class OperationScript:
@@ -358,6 +632,31 @@ def test_a_wait_that_runs_out_leaves_the_job_uncertain_and_frees_everything(harn
         "the identity left on the row is what a later pass asks the backend about"
 
 
+def test_a_long_wait_keeps_vouching_for_the_claim(harness):
+    """Handing back the device is not handing back the job.
+
+    The row stays this process's to answer for while the engine runs, and a wait that can run
+    for an hour outlives any lease fixed when the slot was claimed. A lease that stopped being
+    renewed is what another worker reads as a dead worker's abandonment — of work that was
+    sitting there polling, alive.
+    """
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    script = waiting_for(harness, *[TransportResult(200, {"status": "processing"})] * 5)
+    promised: list[str] = []
+    real_renew = harness.jobs.renew
+
+    def watch(job, **kwargs):
+        promised.append(job.id)
+        return real_renew(job, **kwargs)
+
+    harness.jobs.renew = watch
+    assert harness.worker.run_once().state == "uncertain"
+    assert len(script.asks) == harness.worker.follow_max_polls
+    assert promised == [job_id] * (harness.worker.follow_max_polls + 1), \
+        "one promise per round of the wait, on top of the one made while submitting"
+
+
 def test_an_operation_that_never_arrived_is_not_waited_for(harness):
     record = harness.record()
     job_id = harness.enqueue(record)
@@ -437,6 +736,49 @@ def test_an_unreachable_backend_holds_the_slot_as_uncertain(harness):
     assert harness.jobs.get(job_id).state == UNCERTAIN
     assert harness.gate.blocked_resources() == [REMOTE]
     assert harness.transport.calls and len(harness.transport.calls) == 1, "no retry storm"
+
+
+class SettlesTheDevice:
+    """The transport, asked to let an operator have the last word on this caller's slot.
+
+    A lease that runs out while the pass is busy is reaped to uncertainty, and `gate --resolve`
+    establishes its outcome from outside. The fault that follows is seen by this process; the
+    answer about the device is not its own to overrule.
+    """
+
+    def __init__(self, inner, gate):
+        self.inner, self.gate = inner, gate
+        self.done = False
+
+    def __call__(self, *arguments):
+        answer = self.inner(*arguments)
+        if self.done or "/operations/" in arguments[1]:
+            return answer
+        self.done = True
+        row = self.gate.db.execute("SELECT * FROM gate_reservations WHERE holder='w1'").fetchone()
+        held = Reservation(row["id"], row["resource"], row["route"], row["holder"],
+                           row["priority"], row["lease_until"])
+        self.gate.mark_uncertain(held, reason="test: the lease ran out")
+        self.gate.resolve(row["id"], outcome="cancelled", actor="owner",
+                          reason="test: what became of it was established here")
+        return answer
+
+
+def test_a_slot_an_operator_settled_is_not_blocked_again_by_a_later_fault(harness):
+    """An answer from outside this process outranks a fault seen inside it.
+
+    Absorbing the refusal is the whole of it: the device stays free because somebody said it
+    is, and the job stays uncertain because nothing said the model read the document.
+    """
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    harness.transport.reply = TransportResult(0, transport_error="connection reset")
+    harness.client.transport = SettlesTheDevice(harness.transport, harness.gate)
+    outcome = harness.worker.run_once()
+    assert outcome.state == "uncertain"
+    assert harness.jobs.get(job_id).state == UNCERTAIN
+    assert not harness.gate.unresolved_for(REMOTE), "the operator's answer was not overruled"
+    assert harness.gate.blocked_resources() == []
 
 
 def test_a_500_retries_and_frees_the_slot(harness):

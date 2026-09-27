@@ -148,12 +148,17 @@ class GateApp:
         if reservation is None:
             # 429 with Retry-After: the caller must back off, not assume failure
             # and resend into an occupied device. For a queued route this is said
-            # only after its wait ran out, so the number is in the message.
-            await _respond(send, 429, {"error": {
-                "message": f"{route.resource} is busy" + (
+            # only after its wait ran out, so the number is in the message — and a
+            # device nobody can answer for is named as such, because no retry by this
+            # caller is what frees it.
+            blocked = self.gate.unresolved_for(route.resource)
+            message = (
+                f"{route.resource} is blocked by a request whose outcome nobody has "
+                "established; waiting on it would not free it" if blocked else
+                f"{route.resource} is busy" + (
                     f": waited {waited:g}s for the slot" if waited else
-                    ", and this route never waits for one"),
-                "type": "rate_limit"}},
+                    ", and this route never waits for one"))
+            await _respond(send, 429, {"error": {"message": message, "type": "rate_limit"}},
                            headers=[(b"retry-after", b"2")])
             return
 

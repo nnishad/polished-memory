@@ -255,6 +255,7 @@ def formation_apply(settings, *, review: str, actor: str, limit: int = DEFAULT_B
                 documents=DocumentMap(store, bank_id=settings.bank_id),
                 client=client or backend_client(settings),
                 routes=build_routes(settings, credentials=settings.route_credentials),
+                slot_queue_s=settings.gate_queue_s,
                 worker_id=(worker_id or f"form-{actor.strip()}")[:120])
             drained = holder.drain(max_jobs=max_jobs)
             return {

@@ -212,6 +212,26 @@ already spent is charged in every one of those cases — an ending is not a reba
 charge is recorded as tokens rather than as another admission, because the admission for this
 work was already counted when the submission released its slot.
 
+A single slot serialises its callers rather than turning them away.
+`HERMES_MEMORY_GATE_QUEUE_S` (default 120s, admissible 0 to 900, `0` asking for the old
+refusal-on-contact back) is how long a background caller — a pass, one of the engine's sub-calls,
+a consolidation — stands in line for a device somebody else holds, and the line is served by
+priority, so a more urgent caller is promoted ahead of one that arrived earlier. The interactive
+route is excluded: a human turn degrades at once rather than blocking behind maintenance work, and
+a refusal from either door says which kind of busy it was and how long the caller stood there. Two
+promises bound the standing — the job's own deadline outranks the configured wait, because
+queueing for work that has stopped being wanted buys a result nobody wants, and the claim keeps
+vouching for itself across the queue, because a lease that lapsed while its holder was still
+standing there reads as a dead worker's abandonment — and one exhausted wait ends the pass, since
+every further job would buy the same answer at the same price.
+
+A wait is only ever paid for a device that waiting can free. A reservation nobody can answer for
+— a lease that expired, a request whose connection went away mid-flight — keeps its device blocked
+until `form --reconcile` asks the backend or an operator settles it in writing, so both the pass
+and the gate's own HTTP admission refuse it at once and name that door. Standing in line behind an
+unanswerable slot would be a slower way of refusing, and 120 seconds of it per job would turn a
+bounded pass into an hour of nothing.
+
 That is what `--reconcile` is for. It sends no model request and charges no budget, so it
 needs no approval digest; it asks the backend, one bounded list at a time, what became of the
 submissions this machine cannot account for, and writes down the answer it was given. A row it

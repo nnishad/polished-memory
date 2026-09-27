@@ -1003,3 +1003,20 @@ def test_reconcile_refuses_an_unbounded_limit_and_an_absent_archive(installation
     missing = replace(installation, db_path=installation.db_path.parent / "nope.db")
     with pytest.raises(FormationError, match="no canonical store"):
         formation_reconcile(missing, client=Answers())
+
+
+def test_the_pass_queues_for_its_device_with_the_owner_s_number(installation, monkeypatch):
+    """HERMES_MEMORY_GATE_QUEUE_S is the owner's word for how long a busy device is worth
+    standing in line for, and the pass is the caller that has to honour it. A drain that
+    refused on contact would leave the configured wait with nothing to do."""
+    given: dict[str, object] = {}
+    real = formation.FormationWorker
+
+    def compose(**kwargs):
+        given.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(formation, "FormationWorker", compose)
+    report = approve(replace(installation, gate_queue_s=77.0), Answers(), limit=1)
+    assert report["ok"] is True
+    assert given["slot_queue_s"] == 77.0

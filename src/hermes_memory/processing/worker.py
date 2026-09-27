@@ -36,10 +36,14 @@ ESTIMATED_TOKENS_PER_ITEM = 2_000
 # How a job waits for the operation it started. The engine runs a consolidation long
 # after the submission has been answered, so the wait is the work, not a delay to
 # optimise away; it is bounded because a job that waits forever holds a physical
-# device forever, and every round renews the lease because an operation outlives any
-# ttl fixed when the slot was claimed.
+# device forever.
 FOLLOW_POLL_S = 5.0
 FOLLOW_MAX_POLLS = 720
+
+# A caller that stands in the queue for a device is still the holder of the claim it queued
+# under, and a lease that lapses mid-standing is read by the next worker as a dead one. This
+# much promise is kept over and above the wait.
+QUEUE_HEADROOM_S = 120.0
 
 
 class OperationAbandoned(HindsightError):
@@ -72,6 +76,8 @@ class FormationWorker:
     def __init__(self, *, store, jobs: JobQueue, gate: ResourceGate, budgets: Budgets,
                  documents: DocumentMap, client, routes: RouteTable, worker_id: str,
                  sleeper: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.time,
+                 slot_queue_s: float = 0.0,
                  follow_poll_s: float = FOLLOW_POLL_S,
                  follow_max_polls: int = FOLLOW_MAX_POLLS):
         self.store = store
@@ -83,6 +89,8 @@ class FormationWorker:
         self.routes = routes
         self.worker_id = worker_id
         self.sleeper = sleeper
+        self.clock = clock
+        self.slot_queue_s = slot_queue_s
         self.follow_poll_s = follow_poll_s
         self.follow_max_polls = follow_max_polls
 
@@ -94,6 +102,11 @@ class FormationWorker:
             if outcome is None:
                 break
             outcomes.append(outcome)
+            if outcome.state == "slot_busy" and self.slot_queue_s:
+                # The device was waited for and did not free. Every further job in this drain
+                # would pay the same wait for the same answer, so the pass stops here and leaves
+                # the queue holding the work — no attempt is spent on a busy device either way.
+                break
         return {"attempted": len(outcomes), "outcomes": [item.as_dict() for item in outcomes],
                 "counts": self.jobs.counts(), "budget": self.budgets.report()}
 
@@ -116,19 +129,63 @@ class FormationWorker:
             self.jobs.release(job)
             return AttemptOutcome(job.id, "budget_exhausted", str(error))
 
-        reservation = self.gate.try_acquire(route=route.name, holder=self.worker_id,
-                                           resource=route.resource, priority=route.priority_rank(),
-                                           job_id=job.id, ttl=max(60.0, self.gate.default_ttl))
+        wait = self._queue_wait(job, route)
+        if wait:
+            # The claim was made for the work, and standing in line for the device is part
+            # of doing it: the promise has to cover the queueing as well.
+            self.jobs.renew(job, ttl=wait + QUEUE_HEADROOM_S)
+        reservation = self.gate.acquire(route=route.name, holder=self.worker_id,
+                                        resource=route.resource, priority=route.priority_rank(),
+                                        job_id=job.id, ttl=max(60.0, self.gate.default_ttl),
+                                        timeout=wait)
         if reservation is None:
             # Contention is not failure. The job returns to the queue with its
             # attempt count untouched and retries once the slot frees.
             self.jobs.release(job)
             if idle_wait:
                 self.sleeper(idle_wait)
-            return AttemptOutcome(job.id, "slot_busy", f"{route.resource} is occupied")
+            return AttemptOutcome(job.id, "slot_busy", self._busy_reason(route, wait))
 
         started = time.monotonic()
         return self._execute(job, route, reservation, started)
+
+    def _queue_wait(self, job, route) -> float:
+        """How long this caller stands in line for its device, in seconds.
+
+        An interactive route is the one a human is already late for, so it keeps the immediate
+        refusal and the turn degrades instead of blocking behind a consolidation. Everything
+        else is work with nobody on the other end of it, on a device that one other caller
+        legitimately holds — being next is the right answer to that, and refusing on contact
+        is the self-inflicted deadlock that stops an installation with one slot forming
+        anything at all.
+
+        The job's own deadline still wins. Standing in line for work that has run out of the
+        time it was worth is spending a physical device on a result nobody wants any more,
+        which is the same reason `claim()` refuses an overdue row outright.
+        """
+        if route.priority == "interactive" or self.slot_queue_s <= 0:
+            return 0.0
+        wait = self.slot_queue_s
+        if job.deadline is not None:
+            wait = min(wait, job.deadline - self.clock())
+        return max(0.0, wait)
+
+    def _busy_reason(self, route, wait: float) -> str:
+        """Why the device was not taken, in the terms this caller can act on.
+
+        Three refusals wear the same coat, and telling them apart is the whole use of the
+        message. A device blocked by a request nobody answered for will not free by waiting, so
+        the answer names the door that does establish it; a wait that ran out is reported as the
+        standing it actually was; and a route with no wait to spend is not made to sound as if it
+        tried.
+        """
+        if self.gate.unresolved_for(route.resource):
+            return (f"{route.resource} is blocked by a request nobody has answered for, and "
+                    "waiting would not free it — `hermes-memory form --reconcile` asks the "
+                    "backend what became of it")
+        if wait:
+            return f"{route.resource} is occupied: waited {wait:g}s for the slot"
+        return f"{route.resource} is occupied, and this route has no wait to spend"
 
     # -- the guarded request -------------------------------------------------
 
@@ -271,7 +328,7 @@ class FormationWorker:
         try:
             for record_id, operation, body in submitted:
                 try:
-                    finished = self._follow(operation)
+                    finished = self._follow(job, operation)
                 except OperationStopped as error:
                     self.jobs.cancel(job.id, actor="backend", reason=str(error)[:400])
                     return AttemptOutcome(job.id, CANCELLED, str(error))
@@ -296,7 +353,7 @@ class FormationWorker:
                                  seconds=time.monotonic() - waiting,
                                  note=f"operation(s) of job {job.id}")
 
-    def _follow(self, operation: str) -> dict[str, Any]:
+    def _follow(self, job, operation: str) -> dict[str, Any]:
         """Ask the engine, on a bounded schedule, whether its operation finished.
 
         A status read is not a use of the device: it is the engine's own worker that runs the
@@ -304,6 +361,11 @@ class FormationWorker:
         wait still has an end — a worker that polled forever would report a job as live long
         after anybody who could answer had stopped listening. When the end comes the honest
         state is uncertainty, and the identity on the job row is what settles it later.
+
+        Each round vouches for the claim again. Handing back the device is not handing back the
+        job: this process is still the one that answers for the row, an operation outlives any
+        ttl fixed when the slot was claimed, and a lease that stopped being renewed is what
+        reconciliation reads as work a dead worker left.
         """
         for _ in range(self.follow_max_polls):
             answer = self.client.operation(operation)
@@ -322,6 +384,7 @@ class FormationWorker:
                     f"operation {operation} answered {state!r}, which the pinned backend does "
                     "not document. An answer nobody recognises is neither evidence that the "
                     "projection happened nor evidence that it will")
+            self.jobs.renew(job)
             self.sleeper(self.follow_poll_s)
         raise HindsightUnavailable(
             f"operation {operation} was still unfinished after {self.follow_max_polls} looks "

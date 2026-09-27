@@ -401,7 +401,9 @@ def test_a_busy_device_is_reaped_before_the_wait_it_starts(store):
     """A lease that expired while this request was arriving is still not a free device.
 
     Waiting must not become a way around the rule that an unestablished completion keeps
-    the slot: the waiter gets the same refusal a caller that never waited would get.
+    the slot: the waiter gets the same refusal a caller that never waited would get. And it
+    gets it at once — a device nobody can answer for is not going to free by standing here,
+    so the configured wait would only be a slower way of saying the same thing.
     """
     app, gate, upstream = queued_harness(store, queue_s=0.2)
     held = hold(gate, resource=GPU, ttl=60.0)
@@ -409,8 +411,12 @@ def test_a_busy_device_is_reaped_before_the_wait_it_starts(store):
     # marks it uncertain itself, on its next attempt, from its own row.
     with EvidenceStore(store.path) as other:
         ResourceGate(other).mark_uncertain(held, reason="test: lease expired")
+    started = time.monotonic()
     response = call(app, "/v1/embeddings", token="cred-emb",
                     body={"input": "hello", "model": "emb"})
     assert response["status"] == 429
+    assert "nobody has established" in response["body"]["error"]["message"], \
+        "the refusal says which kind of busy this is, and what would actually free it"
+    assert time.monotonic() - started < 0.15, "no wait was spent on an unanswerable device"
     assert gate.occupancy()[GPU]["uncertain"] == 1
     assert upstream.calls == []
