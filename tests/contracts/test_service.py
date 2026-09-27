@@ -418,6 +418,7 @@ def test_readiness_is_announced_only_after_the_socket_is_listening(settings):
     connection.request("GET", HEALTH_PATH)
     assert connection.getresponse().status == 200
     assert set(announced[0]["routes"]) == set(ROUTES)
+    assert announced[0]["routes_withheld"] == {}, "a healthy installation says so"
     thread.join(timeout=2)
     assert thread.is_alive(), "serving returned early"
 

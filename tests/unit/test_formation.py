@@ -251,7 +251,11 @@ def test_no_archive_is_a_reason_to_refuse_and_not_to_create_one(installation):
 def test_a_route_with_no_credential_selects_nothing(installation):
     without(installation, "HERMES_MEMORY_ROUTE_CREDENTIAL_RETAIN")
     plan = formation_plan(load_settings())
-    assert any("no credential" in line for line in plan["blocking"])
+    # Withheld rather than fatal: the gate still serves the routes that are authenticated,
+    # but a pass that needs the unminted one has nothing to spend and says which key is
+    # missing.
+    assert any("ROUTE_CREDENTIAL_RETAIN is not set" in line for line in plan["blocking"]), \
+        plan["blocking"]
 
 
 def test_an_operator_hold_on_inference_blocks_the_pass_before_it_is_approved(installation):

@@ -48,12 +48,23 @@ class Route:
 
 
 class RouteTable:
-    def __init__(self, routes: dict[str, Route]):
+    def __init__(self, routes: dict[str, Route], *, withheld: dict[str, str] | None = None):
         self._by_name = dict(routes)
+        self._withheld = dict(withheld or {})
         self._by_credential = {route.credential: route for route in routes.values()}
         collisions = len(routes) - len(self._by_credential)
         if collisions:
             raise SettingError(f"{collisions} route credential(s) are not unique")
+
+    @property
+    def withheld(self) -> dict[str, str]:
+        """Routes an owner configured but this build will not serve, and why.
+
+        A route is admitted by its credential, so a configured upstream with no credential is
+        a gap in the installation rather than a reason to withhold the routes that *are*
+        authenticated — see `build_routes`.
+        """
+        return dict(self._withheld)
 
     def by_name(self, name: str) -> Route:
         try:
@@ -61,7 +72,9 @@ class RouteTable:
         except KeyError:
             raise RouteError(
                 f"unknown route {name!r}; admissible routes are {sorted(self._by_name)}"
-                " — there is no default and no fallback"
+                + (f"; this one is configured and withheld: {self._withheld[name]}"
+                   if name in self._withheld else "")
+                + " — there is no default and no fallback"
             ) from None
 
     def by_credential(self, credential: str) -> Route:
@@ -99,6 +112,7 @@ def build_routes(settings, *, credentials: dict[str, str] | None = None) -> Rout
         raise SettingError("a text route and an embeddings route are both required")
     caps = settings.max_output_tokens
     given = credentials or {}
+    withheld: dict[str, str] = {}
 
     def route(name: str, *, resource: str, operation: str, upstream: str | None,
               priority: str, cap: int) -> Route | None:
@@ -106,8 +120,16 @@ def build_routes(settings, *, credentials: dict[str, str] | None = None) -> Rout
             return None
         credential = given.get(name)
         if not credential:
-            raise SettingError(f"route {name!r} has no credential; refusing to serve it "
-                               "unauthenticated on loopback")
+            # The credential is what admits a route, and it is not served without one — but a
+            # route the owner configured and did not mint a credential for is an unusable
+            # route, not a broken gate. Refusing to start here took down the operations that
+            # *were* authenticated, on an installation whose vision model was simply waiting
+            # for its canary; `names()` and the readiness line report the absence, and the
+            # doctor says why.
+            withheld[name] = (f"HERMES_MEMORY_ROUTE_CREDENTIAL_{name.upper()} is not set, so "
+                              "this route is withheld rather than served unauthenticated on "
+                              "loopback")
+            return None
         return Route(name=name, resource=resource, operation=operation, upstream=upstream,
                      credential=credential, priority=priority, max_output_tokens=cap)
 
@@ -129,4 +151,12 @@ def build_routes(settings, *, credentials: dict[str, str] | None = None) -> Rout
     ):
         if candidate is not None:
             routes[candidate.name] = candidate
-    return RouteTable(routes)
+    if not routes:
+        # Withholding is per route, so that a route awaiting its credential does not take the
+        # authenticated ones down with it. A table with nothing in it is not that case: a gate
+        # that serves no route would answer every caller with "unknown route" and look, from
+        # the outside, like a running service.
+        raise SettingError("no inference route is admitted: every configured upstream is "
+                           "missing its route credential"
+                           + "; withheld: " + ", ".join(sorted(withheld)))
+    return RouteTable(routes, withheld=withheld)

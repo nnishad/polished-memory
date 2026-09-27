@@ -275,6 +275,7 @@ def serve(settings, *, store_factory: Callable[[], Any] | None = None,
     announcing = factory()
     try:
         routes = announcing.routes.names()
+        withheld = announcing.routes.withheld
     finally:
         store = getattr(getattr(announcing, "gate", None), "store", None)
         if store is not None and hasattr(store, "close"):
@@ -289,7 +290,8 @@ def serve(settings, *, store_factory: Callable[[], Any] | None = None,
         bound_host, bound_port = server.bound
         ready = {"ok": True, "service": "hermes-memory-gate",
                  "listening_on": [bound_host, bound_port], "health_path": HEALTH_PATH,
-                 "routes": routes, "maintenance": ticker.state()}
+                 "routes": routes, "routes_withheld": withheld,
+                 "maintenance": ticker.state()}
         (report or (lambda payload: print(json.dumps(payload, sort_keys=True))))(ready)
         server.serve_forever()
     except KeyboardInterrupt:

@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 
 from hermes_memory.processing.resource_gate import (GateClosed, GatePaused, ResourceGate)
-from hermes_memory.processing.routes import PRIORITY, RouteTable, Route
-from hermes_memory.config import SettingError
+from hermes_memory.processing.routes import PRIORITY, RouteTable, RouteError, Route, build_routes
+from hermes_memory.config import SettingError, load_settings
 from hermes_memory.storage.evidence import EvidenceError
 
 LOCAL = "local-gpu"
@@ -245,3 +245,110 @@ def test_the_route_report_never_exposes_credentials():
     report = table.as_dict()
     assert "secret-credential" not in str(report)
     assert report["retain"]["upstream"] == "http://127.0.0.1:8080/v1"
+
+
+BASE = {
+    "DATA_DIR": None,  # filled per home by `configured`
+    "INFERENCE_ENABLED": "true",
+    "OWNER_PRINCIPAL": "jugaadu",
+    "HINDSIGHT_URL": "http://127.0.0.1:8888",
+    "ALLOWED_INFERENCE_HOSTS": "127.0.0.1,192.168.68.65",
+    "TEXT_BASE_URL": "http://192.168.68.65:8080/v1",
+    "TEXT_RESOURCE": REMOTE,
+    "EMBEDDINGS_BASE_URL": "http://127.0.0.1:11434/v1",
+    "EMBEDDINGS_RESOURCE": LOCAL,
+    "VISION_BASE_URL": "http://127.0.0.1:8080/v1",
+    "VISION_RESOURCE": LOCAL,
+}
+
+
+def configured(tmp_path, monkeypatch, *, credentials, over=None):
+    """A real settings object for a machine with two models and minted route credentials.
+
+    `over` changes or (with None) removes a line, because the refusals below are about what
+    an installation left out.
+    """
+    home = tmp_path / "instance"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    values = dict(BASE, DATA_DIR=str(home / "data"))
+    for key, value in (over or {}).items():
+        if value is None:
+            values.pop(key)
+        else:
+            values[key] = value
+    lines = [f"HERMES_MEMORY_{key}={value}" for key, value in values.items()]
+    lines += [f"HERMES_MEMORY_ROUTE_CREDENTIAL_{name}={value}"
+              for name, value in credentials.items()]
+    (home / "hermes-memory.env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return load_settings()
+
+
+def test_a_route_the_owner_configured_but_never_minted_is_withheld_not_fatal(tmp_path,
+                                                                             monkeypatch):
+    """An upstream with no credential is unusable; it is not a reason to stop serving.
+
+    The gate used to refuse to start over it, which took the credentialed routes down with
+    it and left a `Restart=always` unit crash-looping because a vision model was waiting for
+    its canary. Withholding is per route, and the reason is said out loud.
+    """
+    settings = configured(tmp_path, monkeypatch,
+                          credentials={"RETAIN": "cred-retain", "EMBEDDINGS": "cred-embed"})
+    table = build_routes(settings, credentials=settings.route_credentials)
+    # Each operation presents its own credential, so minting two of six leaves four dark —
+    # and the two that are authenticated are the ones the installation can still use.
+    assert table.names() == ["embeddings", "retain"]
+    assert sorted(table.withheld) == ["consolidate", "foreground", "reflect", "vision"]
+    assert "HERMES_MEMORY_ROUTE_CREDENTIAL_VISION" in table.withheld["vision"]
+    with pytest.raises(RouteError, match="withheld"):
+        table.by_name("vision")
+
+
+def test_a_gate_that_would_serve_nothing_refuses_to_start_at_all(tmp_path, monkeypatch):
+    """Withholding every route is not a partial gate; it is an installation with no models."""
+    settings = configured(tmp_path, monkeypatch, credentials={})
+    with pytest.raises(SettingError, match="no inference route is admitted"):
+        build_routes(settings, credentials=settings.route_credentials)
+
+
+def test_no_route_is_built_before_a_backend_is_named(tmp_path, monkeypatch):
+    settings = configured(tmp_path, monkeypatch, over={"HINDSIGHT_URL": None},
+                          credentials={"RETAIN": "cred-retain"})
+    with pytest.raises(SettingError, match="nothing to map"):
+        build_routes(settings, credentials=settings.route_credentials)
+
+
+def test_a_generation_route_needs_both_a_text_and_an_embeddings_upstream(tmp_path, monkeypatch):
+    """Recall without embeddings finds nothing, and embeddings without text forms nothing."""
+    for missing in ("TEXT_BASE_URL", "EMBEDDINGS_BASE_URL"):
+        settings = configured(tmp_path / missing, monkeypatch,
+                              over={missing: None}, credentials={"RETAIN": "cred-retain"})
+        with pytest.raises(SettingError, match="both required"):
+            build_routes(settings, credentials=settings.route_credentials)
+
+
+def test_the_embeddings_route_carries_no_generation_cap(tmp_path, monkeypatch):
+    """An output cap is a promise about tokens a route generates; embeddings generates none."""
+    settings = configured(tmp_path, monkeypatch,
+                          credentials={"RETAIN": "cred-retain", "EMBEDDINGS": "cred-embed"})
+    table = build_routes(settings, credentials=settings.route_credentials)
+    assert table.by_name("embeddings").max_output_tokens == 0
+    assert table.by_name("retain").max_output_tokens > 0
+
+
+def test_only_the_route_a_person_is_waiting_on_holds_the_interactive_slot(tmp_path,
+                                                                         monkeypatch):
+    """The foreground request is the one the host truncates at eight seconds.
+
+    If a background operation shared its priority, a consolidation run already holding the
+    model would decide when a reply to the owner is answered, and the degradation would be
+    invisible: the host gives up and the memory looks slow rather than misprioritised.
+    """
+    settings = configured(tmp_path, monkeypatch, credentials={
+        "RETAIN": "cred-retain", "CONSOLIDATE": "cred-consolidate", "REFLECT": "cred-reflect",
+        "FOREGROUND": "cred-foreground", "EMBEDDINGS": "cred-embed"})
+    table = build_routes(settings, credentials=settings.route_credentials)
+    ranks = {name: table.by_name(name).priority_rank() for name in table.names()}
+    assert ranks["foreground"] == min(ranks.values())
+    assert all(ranks["foreground"] < ranks[name] for name in ("retain", "consolidate",
+                                                             "reflect"))
