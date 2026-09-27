@@ -72,7 +72,7 @@ CHECKPOINT_API_VERSION = 2
 # A write, in the sense Hermes means it: something a cron pass or a delegated
 # subagent must not do to the owner's memory on its own initiative.
 _WRITING_TOOLS = frozenset({"memory_remember", "memory_identity_candidate",
-                            "memory_forget_request"})
+                            "memory_forget_request", "memory_goal"})
 
 # A prefetch rides along with every turn, so it stays small enough that memory
 # never becomes the bulk of the context window.
@@ -92,6 +92,16 @@ _TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "What to look for."},
                 "limit": {"type": "integer", "description": "Maximum results, 1-20."},
+                "task": {
+                    "type": "object",
+                    "description": (
+                        "What you are doing, so that learned practice can be retrieved "
+                        "with the evidence. Keys are drawn from a closed vocabulary "
+                        "(source, kind, topic, tool, host, channel, account); an unknown "
+                        "key is an error rather than a silently ignored wish. This "
+                        "conversation's platform is supplied as channel unless you name one."
+                    ),
+                },
             },
         },
     },
@@ -139,6 +149,33 @@ _TOOLS = [
         },
     },
     {
+        "name": "memory_goal",
+        "description": (
+            "Propose that the owner should be reminded about something, citing the canonical "
+            "record that motivated it. This queues a candidate: it schedules no reminder, "
+            "sends nothing and becomes an obligation only when the owner activates it. A due "
+            "time is a wall time in the owner's own zone, which this process cannot know — "
+            "leave it out and say when in the statement."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["title", "statement"],
+            "properties": {
+                "title": {"type": "string",
+                          "description": "What the owner would be told, in their words."},
+                "statement": {"type": "string",
+                              "description": "The promise itself, including any timing said "
+                                             "as plainly as it was said to you."},
+                "due": {"type": "string",
+                        "description": "Optional wall time in the owner's zone, never an "
+                                       "instant inferred from this machine's clock."},
+                "timezone": {"type": "string"},
+                "basis_record": {"type": "string",
+                                 "description": "The rec_ id that motivated the proposal."},
+            },
+        },
+    },
+    {
         "name": "memory_forget_request",
         "description": (
             "Request forgetting of matching evidence. Returns an impact preview; it "
@@ -167,6 +204,7 @@ class HermesMemoryProvider(_MemoryProvider):
         self._activity: Any = None
         self._binding_error = ""
         self._session_id = ""
+        self._platform = ""
         self._agent_context = "primary"
         self._last_injected = 0
         self._unavailable = ""
@@ -224,6 +262,11 @@ class HermesMemoryProvider(_MemoryProvider):
         answer later conversations out of the wrong archive.
         """
         self._session_id = session_id
+        # The platform the host names this conversation by. It is the only part of a
+        # lesson's applicability vocabulary this provider knows without being told, so a
+        # learned practice can apply to the WhatsApp thread it was earned in and not to a
+        # terminal session on the same machine.
+        self._platform = str(kwargs.get("platform") or "").strip()[:120]
         # A subagent, cron run or flush pass is not a conversation with this
         # profile's owner, so it captures nothing of its own.
         self._agent_context = str(kwargs.get("agent_context") or "primary")
@@ -309,7 +352,8 @@ class HermesMemoryProvider(_MemoryProvider):
         if tool_name == "memory_status":
             return self._status()
         if tool_name == "memory_recall":
-            return self._recall(str(args.get("query", "")), int(args.get("limit") or 10))
+            return self._recall(str(args.get("query", "")), int(args.get("limit") or 10),
+                                args.get("task"))
         if tool_name in _WRITING_TOOLS and not self._capturing:
             # Hermes says a non-primary context writes nothing, and a candidate, a
             # forgetting intent and a remembered statement are all writes: a cron run
@@ -321,9 +365,46 @@ class HermesMemoryProvider(_MemoryProvider):
             return self._remember(args)
         if tool_name == "memory_identity_candidate":
             return self._identity_candidate(args)
+        if tool_name == "memory_goal":
+            return self._goal_proposal(args)
         if tool_name == "memory_forget_request":
             return self._forget_request(args)
         raise ValueError(f"unsupported tool {tool_name!r}")
+
+    def _goal_proposal(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Queue a reminder the owner has not yet adopted. Activation is elsewhere.
+
+        The candidate cannot be given an owner's own due time from here either: a wall time
+        means something in a zone this process has no right to assume, so an agent that names
+        one says so in the statement and lets the owner set the clock.
+        """
+        from hermes_memory.prospective.due_events import DueEventLog
+        from hermes_memory.prospective.goals import GoalStore
+
+        title = str(args.get("title", "")).strip()
+        statement = str(args.get("statement", "")).strip()
+        if not title or not statement:
+            raise ValueError("title and statement must both be given: an owner is being "
+                             "asked to adopt a promise, not a fragment")
+        basis = str(args.get("basis_record", "")).strip() or None
+        settings = self._bound().settings
+        with self._open_store() as store:
+            goals = GoalStore(store, events=DueEventLog(store),
+                              owner_principal=settings.owner_principal)
+            made = goals.propose(
+                title=title, statement=statement,
+                timezone_name=str(args.get("timezone") or "UTC"),
+                due=str(args["due"]) if args.get("due") else None,
+                proposed_by=f"agent:{self._session_id or 'unassigned'}",
+                proposed_kind="agent", source_record_id=basis)
+            return {
+                "ok": True,
+                "scheduled": False,
+                "goal_id": made["id"],
+                "status": made["status"],
+                "note": ("A proposal from outside the owner is a candidate: it reminds for "
+                         "nothing until `hermes-memory goal --activate` says it is theirs."),
+            }
 
     def _identity_candidate(self, args: dict[str, Any]) -> dict[str, Any]:
         """Queue a proposal. Confirmation is owner-only and unreachable here."""
@@ -349,13 +430,16 @@ class HermesMemoryProvider(_MemoryProvider):
                 proposed_by=f"agent:{self._session_id or 'unassigned'}",
                 proposed_kind="agent",
             )
+            decided = bool(outcome.get("already_joined"))
             return {
                 "ok": True,
-                "queued_for_owner_review": True,
+                "queued_for_owner_review": not decided,
                 "candidate_id": outcome["candidate_id"],
                 "state": outcome["state"],
-                "note": ("A candidate is not an identity. Only the owner principal can confirm "
-                         "it, and an agent credential cannot reach that call."),
+                "note": ("Nothing was queued: these accounts are already one person by a "
+                         "decision the owner confirmed." if decided else
+                         "A candidate is not an identity. Only the owner principal can "
+                         "confirm it, and an agent credential cannot reach that call."),
             }
 
     def _forget_request(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -410,7 +494,7 @@ class HermesMemoryProvider(_MemoryProvider):
         settings.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         return EvidenceStore(settings.db_path)
 
-    def _recall(self, query: str, limit: int) -> dict[str, Any]:
+    def _recall(self, query: str, limit: int, task: Any = None) -> dict[str, Any]:
         """One packet, assembled by the same broker prefetch() uses.
 
         The ceiling is the broker's, not the caller's: honouring a tool-supplied
@@ -418,12 +502,39 @@ class HermesMemoryProvider(_MemoryProvider):
         memory occupies. An empty query raises, and handle_tool_call turns that
         into an ok:false answer naming the argument.
         """
-        packet = self._broker().assemble(query, limit=min(max(1, limit), _MAX_ITEMS))
+        broker = self._broker()
+        packet = broker.assemble(query, limit=min(max(1, limit), _MAX_ITEMS),
+                                 lessons=self._lessons(task))
         payload = packet.as_dict()
         payload["ok"] = True
         payload["channel"] = "context_broker"
         payload["results"] = [item.as_dict() for item in packet.items]
+        # The packet's own summary counts lessons, because a count is what a rendered turn
+        # needs; a tool answer that reported "2" and showed neither of them would leave the
+        # agent to guess at the practice it was being told to follow.
+        payload["lessons"] = [dict(item) for item in packet.lessons]
         return payload
+
+    def _lessons(self, task: Any = None) -> list[dict[str, Any]]:
+        """Learned practice that applies to what the caller said it is doing.
+
+        ``applicable`` does not trust the status column: a lesson whose evidence was
+        forgotten, or whose evaluation has since been withdrawn, stops being taught on this
+        read rather than on the next review nobody schedules. A candidate is never in the
+        answer at all — promotion is the owner's or a run's act, not a side effect of asking.
+        """
+        given = _lesson_task(task, self._platform)
+        if not given:
+            return []
+        from hermes_memory.learning.lessons import LessonStore
+        from hermes_memory.learning.outcomes import OutcomeLog
+
+        settings = self._bound().settings
+        habits = LessonStore(self._store,
+                             outcomes=OutcomeLog(self._store,
+                                                 owner_principal=settings.owner_principal),
+                             owner_principal=settings.owner_principal)
+        return [item.as_dict() for item in habits.applicable(given, limit=4)]
 
     def _broker(self):
         """One broker per provider instance: a cache only pays off across turns.
@@ -438,6 +549,7 @@ class HermesMemoryProvider(_MemoryProvider):
             settings = activity.settings
             from hermes_memory.context import ContextBroker
             from hermes_memory.knowledge.assertions import AssertionStore
+            from hermes_memory.knowledge.summaries import SummaryStore
 
             self._store = self._open_store()
             self._context = ContextBroker(
@@ -445,6 +557,8 @@ class HermesMemoryProvider(_MemoryProvider):
                 budget_tokens=_PREFETCH_TOKENS,
                 assertions=AssertionStore(self._store,
                                           owner_principal=settings.owner_principal),
+                summaries=SummaryStore(self._store,
+                                       owner_principal=settings.owner_principal),
                 derived_timeout_s=settings.foreground_deadline_s)
         return self._context
 
@@ -515,7 +629,7 @@ class HermesMemoryProvider(_MemoryProvider):
             self._last_injected = warmed[1]
             return warmed[0]
         try:
-            packet = self._broker().assemble(wanted, limit=8)
+            packet = self._broker().assemble(wanted, limit=8, lessons=self._lessons())
         except Exception as error:
             # A store we cannot read is not an empty archive, and the difference
             # is the whole reason the packet carries its channels.
@@ -542,7 +656,9 @@ class HermesMemoryProvider(_MemoryProvider):
 
         def _warm() -> None:
             try:
-                packet = self._broker().assemble(wanted, limit=8)
+                # The same retrieval as the inline path above, or a warmed turn would
+                # teach a different practice than an unwarmed one.
+                packet = self._broker().assemble(wanted, limit=8, lessons=self._lessons())
             except Exception:
                 return  # a failed warm leaves nothing queued, and prefetch() will try
             if self._generation != generation:
@@ -836,6 +952,31 @@ def _namespace_of(value: str) -> str:
     if value.startswith("+") and any(char.isdigit() for char in value):
         return "phone"
     return "handle"
+
+
+def _lesson_task(value: Any, platform: str = "") -> dict[str, str]:
+    """Check the caller's description of its own task against the closed vocabulary.
+
+    An unknown field is refused rather than dropped. A retrieval that quietly ignored
+    ``recipient`` would answer as though nothing narrower had been asked, which is how a
+    rule written for one case gets taught to another.
+    """
+    from hermes_memory.learning.lessons import FIELDS
+
+    given = {} if value in (None, "", {}, []) else value
+    if not isinstance(given, dict):
+        raise ValueError("task must be an object of {field: value}")
+    unknown = sorted(str(key) for key in given if str(key) not in FIELDS)
+    if unknown:
+        raise ValueError(f"unknown task field(s) {unknown}; the vocabulary is "
+                         f"{list(FIELDS)}")
+    task = {str(key): str(item).strip()[:120] for key, item in given.items()
+            if str(item).strip()}
+    if platform and "channel" not in task:
+        # The host's own platform is the one part of the shape nobody has to declare, and
+        # a declared channel wins over it.
+        task["channel"] = str(platform).strip()[:120]
+    return task
 
 
 def post_setup(hermes_home: str, config: dict[str, Any]) -> dict[str, Any]:

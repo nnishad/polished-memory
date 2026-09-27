@@ -206,35 +206,11 @@ class ProvenanceLedger:
         resolved = self.resolve(artifact_id, account_id=account_id)
         return list(resolved.evidence)[:max(1, min(limit, 50))]
 
-    def affected_by(self, record_ids: Iterable[str]) -> list[str]:
-        """Artifacts that lean on any of these records, directly."""
-        targets = [pk for pk in record_ids if pk]
-        if not targets:
-            return []
-        placeholders = ",".join("?" * len(targets))
-        rows = self.db.execute(
-            f"SELECT DISTINCT artifact_id FROM derived_citations WHERE record_id IN ({placeholders})",
-            targets).fetchall()
-        return sorted(row["artifact_id"] for row in rows)
-
     def artifacts(self) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT artifact_id, kind, count(*) AS citations, max(added_at) AS declared_at "
             "FROM derived_citations GROUP BY artifact_id, kind ORDER BY artifact_id").fetchall()
         return [dict(row) for row in rows]
-
-    def forget(self, artifact_id: str) -> int:
-        """Drop a manifest. The artifact itself is someone else's row to remove."""
-        _text(artifact_id, "artifact_id", 100)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = self.db.execute("DELETE FROM derived_citations WHERE artifact_id=?",
-                                     (artifact_id,))
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        return int(cursor.rowcount or 0)
 
 
 def _worst(problems: Sequence[str], *, verified: int, cited: int,

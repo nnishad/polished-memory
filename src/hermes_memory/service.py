@@ -1,4 +1,4 @@
-"""The process the runtime unit starts: an admission endpoint on loopback, nothing else.
+"""The process the runtime unit starts: the admission endpoint, and the background pass.
 
 The gate exists so that one place counts what the machine can actually run. For that to
 be true it has to be a process rather than a library — several Hermes activities, the
@@ -6,6 +6,12 @@ backend and its worker all ask the same device — and a process needs something
 to. So this is the smallest possible server: an ASGI adapter over the standard library,
 bound to loopback, forwarding only the two paths the gate knows, plus one unauthenticated
 health line that proves the socket is answering without spending a token.
+
+Alongside it runs the maintenance pass, on a period the owner sets. It is here rather than
+in a unit of its own because proactive state belongs to this process, and because the pass
+takes no slot, spends no budget and asks no model — the two facts that make it safe to
+start without waiting for an approval this process has no way to carry. A loop that dies is
+reported: the pass writes down each time it runs, and status and doctor read that line.
 
 There is no dependency on an ASGI server here on purpose. ``dependencies`` in this
 package is empty, and an installer that quietly pulled a web framework into a memory
@@ -23,6 +29,7 @@ from typing import Any, Callable
 
 from .config import DEFAULT_ENV_FILENAME, SettingError, env_file_values
 from .processing.gate_server import GateApp
+from .processing.maintenance import Ticker, run as maintenance_run
 from .processing.resource_gate import ResourceGate
 from .processing.routes import RouteTable, build_routes
 from .storage.evidence import EvidenceStore
@@ -253,7 +260,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 def serve(settings, *, store_factory: Callable[[], Any] | None = None,
           upstream: Callable | None = None, host: str | None = None,
-          port: int | None = None, report: Callable[[dict], Any] | None = None) -> int:
+          port: int | None = None, report: Callable[[dict], Any] | None = None,
+          maintenance: Ticker | None = None) -> int:
     """Bind, announce readiness, then block until the manager stops us.
 
     Binding before printing anything is the point: a unit that announced itself and then
@@ -271,15 +279,24 @@ def serve(settings, *, store_factory: Callable[[], Any] | None = None,
         store = getattr(getattr(announcing, "gate", None), "store", None)
         if store is not None and hasattr(store, "close"):
             store.close()
-    bound_host, bound_port = server.bound
-    ready = {"ok": True, "service": "hermes-memory-gate",
-             "listening_on": [bound_host, bound_port], "health_path": HEALTH_PATH,
-             "routes": routes}
-    (report or (lambda payload: print(json.dumps(payload, sort_keys=True))))(ready)
+    # The background pass runs in the process that owns proactive state, per §4, and not
+    # in a unit of its own. It spends nothing — no model, no slot, no budget — which is
+    # what makes it safe to start here rather than to wait for somebody to approve a run.
+    ticker = maintenance or Ticker(runner=lambda: maintenance_run(settings),
+                                   interval_s=getattr(settings, "maintenance_interval_s", 0))
+    ticker.start()
     try:
+        bound_host, bound_port = server.bound
+        ready = {"ok": True, "service": "hermes-memory-gate",
+                 "listening_on": [bound_host, bound_port], "health_path": HEALTH_PATH,
+                 "routes": routes, "maintenance": ticker.state()}
+        (report or (lambda payload: print(json.dumps(payload, sort_keys=True))))(ready)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        # Whatever ended the loop — a signal, a stopped server or a failed announcement —
+        # the scheduler stops with it, so a process that is leaving cannot keep writing.
+        ticker.stop()
         server.server_close()
     return 0

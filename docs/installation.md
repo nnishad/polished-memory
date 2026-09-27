@@ -51,7 +51,7 @@ process environment (process wins, so a systemd drop-in can override the file).
 `deployment/env/hermes-memory.env.example` is the annotated copy; the same for the backend
 at `deployment/env/hindsight.env.example`. Keep both at mode `0600`.
 
-Three rules are enforced at load time rather than left to the operator's memory:
+Five rules are enforced at load time rather than left to the operator's memory:
 
 - **Inference is off until it is named.** `HERMES_MEMORY_INFERENCE_ENABLED=false` is the
   default, and there is no ambient provider or credential discovery.
@@ -66,11 +66,41 @@ Three rules are enforced at load time rather than left to the operator's memory:
   enrolled profile reads its own scoped name, so a second profile cannot sign with the
   first one's key — and a profile with no scoped secret gets no route instead of
   borrowing one.
+- **Delivery needs a destination.** `HERMES_MEMORY_DELIVERY_ENABLED` without
+  `HERMES_MEMORY_DELIVERY_TARGET` refuses to load: an approved address is what makes a
+  message to another person the owner's decision rather than a capability the runtime has
+  on its own, and a broadcast scheme is refused on the same grounds.
+- **An evaluator is a program, not a word on a command line.**
+  `HERMES_MEMORY_EVALUATOR_COMMAND` has to be an absolute path, because it names the only
+  thing that can turn a run into a rule and a bare word resolves from whichever directory
+  `PATH` happens to offer. `HERMES_MEMORY_EVALUATOR_ENV` is checked the same way: entries
+  that are not variable names are refused at load rather than silently dropped later.
 
 `HERMES_MEMORY_OWNER_PRINCIPAL` is left unset on purpose. With no owner named an erasure
 can be previewed but never confirmed, which fails closed instead of accepting any caller
 that claims to be the owner. It has to be a human login; an agent-role credential must
 never be able to confirm a forgetting, a revocation, an identity or a budget.
+
+## Nothing comes from the old installation
+
+This is a fresh installation. The file list in the plan names a `docs/migration.md`, and it
+is deliberately absent: there is no importer, no upgrade path, and no compatibility read of
+the retired framework's databases. Concretely:
+
+- No command reads an old `M/personal_memory` database, its separate deletion ledger, its
+  learning objects, or the contents of its banks.
+- Nothing is re-keyed. A canonical id here is derived by this build alone, from
+  `(source, source_id, revision)`, so a fact or an identity confirmation remembered over
+  there resolves to nothing here — and is not silently trusted if a string happens to match.
+- Identity starts empty. The owner confirms joins again, from evidence this store holds:
+  inheriting a merge decided under somebody else's authority is the exact mistake the
+  owner-only confirmation rule exists to prevent.
+- The old installations were torn down with the owner's approval rather than left
+  half-adopted, which is also what retired the migration code and the door that would have
+  needed it.
+
+What is left of that history is an honest absence: an archive that claims nothing about what
+it did not ingest, and a memory epoch that starts at one.
 
 ## Setup
 
@@ -135,8 +165,21 @@ recursive wizard.
 ```sh
 hermes-memory profiles                      # what this installation serves
 hermes-memory enroll --hermes-home …        # plan
+hermes-memory init --hermes-home …          # open that profile's own store
 hermes-memory retire --profile work --reason "the profile moved"   # unlink
 ```
+
+Enrollment is a mapping and writes no archive: `profiles` reports `store_present` false
+until somebody opens it. `init --hermes-home <home>` does exactly that — creates and
+migrates the store and the blob directory beside it — and refuses a home nobody enrolled,
+because creating one from a shell command is how a second memory appears with no owner
+decision behind it. `setup` performs the same step as part of the installation
+transaction; having `init` for it is what lets a memory exist before, or without, the
+plugin being registered with the host.
+
+A door that reads one memory (`status`, `doctor`, `measure`, `sources list`, `audit`,
+`explain`) answers from the single enrolled profile when there is one, and refuses to
+choose between two.
 
 Retiring a profile unlinks it. It does not forget anything: the plan's rule is that
 disabling a source or a profile revokes authorisation for what comes next, and says
@@ -180,3 +223,14 @@ byte-for-byte alone. Ownership is recorded as a digest of each unit we wrote, in
 `services.json` beside them in the user unit directory (mode `0600` in a `0700` directory),
 so a file edited by hand after we wrote it is named rather than silently taken over.
 `systemctl --user daemon-reload` happens only after one of our own files actually changed.
+
+The units and the compatibility manifest both come from a *release tree* — an unpacked
+release with `deployment/` beside the `bin/` it names, pointed at by
+`HERMES_MEMORY_RELEASE` or by `<instance home>/runtime/current`. A wheel installed on its
+own carries neither, and the doors say so instead of inventing a path inside the venv:
+`services`, `start`, `upgrade` and `uninstall` refuse with the release pointer to set, and
+`doctor`'s `release` finding is a warning that this build states no compatibility claim.
+The reading of that warning is the same one the manifest exists to support: a release that
+ships no manifest of its own is not vouched for by whichever checkout happens to be on the
+disk.
+

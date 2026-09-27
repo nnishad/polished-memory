@@ -336,11 +336,6 @@ class AssertionStore:
         scored.sort(key=lambda item: (item[0], item[1]))
         return [item[3] for item in scored[:max(1, min(limit, 100))]]
 
-    def summarize(self) -> dict[str, int]:
-        rows = self.db.execute("SELECT status, count(*) AS n FROM assertions "
-                               "GROUP BY status").fetchall()
-        return {row["status"]: int(row["n"]) for row in rows}
-
     # -- internals -----------------------------------------------------------
 
     def _target(self, assertion_id: str, *, subject: str | None = None,

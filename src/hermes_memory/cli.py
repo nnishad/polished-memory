@@ -63,6 +63,8 @@ def _capabilities(settings, store_present: bool) -> dict[str, bool]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .processing.maintenance import SECTIONS
+
     parser = argparse.ArgumentParser(prog="hermes-memory")
     parser.add_argument("--env-file",
                         help="owned env file (default: $HERMES_MEMORY_HOME/hermes-memory.env)")
@@ -74,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="report the memory enrolled for this Hermes profile home")
     init = sub.add_parser("init", help="create and migrate the canonical store")
     init.add_argument("--dry-run", action="store_true")
+    init.add_argument("--hermes-home",
+                      help="create the store of the profile enrolled for this Hermes home; "
+                           "without it, this installation's own")
     doctor = sub.add_parser("doctor", help="read-only checks; performs no inference")
     doctor.add_argument("--hermes-home",
                         help="examine the memory enrolled for this Hermes profile home")
@@ -105,7 +110,13 @@ def main(argv: list[str] | None = None) -> int:
     setup.add_argument("--start", action="store_true",
                        help="start the owned services once the units are installed")
 
-    sub.add_parser("profiles", help="list the Hermes profiles this installation serves")
+    profiles = sub.add_parser("profiles",
+                              help="list the Hermes profiles this installation serves, and "
+                                   "what has been decided about them")
+    profiles.add_argument("--profile", help="report the decisions about one profile only")
+    profiles.add_argument("--review",
+                          help="the review digest of a decision already approved, to ask "
+                               "what it actually did")
     inventory = sub.add_parser("inventory",
                                help="read what is already here; opens no socket and runs "
                                     "no model")
@@ -133,19 +144,54 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--object", dest="object_id")
     audit.add_argument("--actor")
     audit.add_argument("--source", help="one connector's own history instead of the ledger")
+    audit.add_argument("--actions", action="store_true",
+                       help="what kinds of thing have happened here, and how often")
+    audit.add_argument("--actors", action="store_true",
+                       help="who has been acting, counted apart from what they did")
+    audit.add_argument("--decisions", metavar="CATEGORY",
+                       choices=("identity", "identity-decisions", "goals", "lessons",
+                                "erasure"),
+                       help="owner-only decisions in one category, counted by decider")
+    audit.add_argument("--timeline", metavar="RECORD",
+                       help="everything this store can say about one record")
+    audit.add_argument("--include-private", action="store_true",
+                       help="quote the record's own text, redacted, in a timeline")
     audit.add_argument("--limit", type=int, default=50)
+    audit.add_argument("--hermes-home", help="read the memory enrolled for this Hermes profile home; without it a single profile is assumed and more than one is refused")
 
     explain = sub.add_parser("explain", help="why an item came back, or why nothing did")
     target = explain.add_mutually_exclusive_group(required=True)
     target.add_argument("--record")
     target.add_argument("--artifact")
     target.add_argument("--goal")
+    target.add_argument("--lesson",
+                        help="every version of a habit, what it cites and what was scored "
+                             "against it")
+    target.add_argument("--summary",
+                        help="why a reading of a scope is on the table, or why it is withheld")
     target.add_argument("--not-told", metavar="TOPIC",
                         help="list the reasons this topic did not interrupt the owner")
     explain.add_argument("--at", help="the moment to judge quiet hours against")
     explain.add_argument("--include-private", action="store_true",
                          help="include payload and goal text, still redacted")
     explain.add_argument("--limit", type=int, default=20)
+    explain.add_argument("--hermes-home", help="read the memory enrolled for this Hermes profile home; without it a single profile is assumed and more than one is refused")
+
+    measure = sub.add_parser("measure",
+                             help="read a typed measurement series the store holds; no model "
+                                  "is consulted")
+    measure.add_argument("--what", help="the measure to read, as the source named it")
+    measure.add_argument("--list", dest="listing", action="store_true",
+                        help="what can be asked: every measure, device and unit the store "
+                             "holds samples for, with its span")
+    measure.add_argument("--device", help="restrict the reading to one device or sensor")
+    measure.add_argument("--source", help="restrict the reading to one registered source")
+    measure.add_argument("--unit", help="the unit to read in; required when the stored "
+                                        "samples disagree")
+    measure.add_argument("--since", help="inclusive lower bound, with a timezone")
+    measure.add_argument("--until", help="inclusive upper bound, with a timezone")
+    measure.add_argument("--hermes-home",
+                         help="read the memory enrolled for this Hermes profile home")
 
     sub.add_parser("serve", help="run the admission endpoint the runtime unit expects")
     services = sub.add_parser("services",
@@ -162,7 +208,11 @@ def main(argv: list[str] | None = None) -> int:
     stop.add_argument("--actor")
     stop.add_argument("--reason", default="the operator stopped the services")
     pause = sub.add_parser("pause", help="hold a stage, and keep holding it across a restart")
-    pause.add_argument("--scope", required=True, choices=("inference", "delivery"))
+    pause.add_argument("--scope", required=True,
+                       choices=("inference", "delivery", "capture"))
+    pause.add_argument("--source",
+                       help="with --scope capture, which connector stops reading; every "
+                            "memory that registers it is held")
     pause.add_argument("--resume", action="store_true",
                        help="lift a hold a previous pause set")
     pause.add_argument("--actor")
@@ -176,6 +226,9 @@ def main(argv: list[str] | None = None) -> int:
     backup.add_argument("--actor")
     backup.add_argument("--list", action="store_true",
                         help="report the backups that exist and take none")
+    backup.add_argument("--keep", type=int, metavar="N",
+                        help="after copying, retain only this many snapshots per profile, "
+                             "newest first")
 
     restore = sub.add_parser(
         "restore", help="take one profile's store back to a snapshot that verifies, "
@@ -205,6 +258,20 @@ def main(argv: list[str] | None = None) -> int:
                        help="let the archive stand behind a claim a pattern produced")
     owner.add_argument("--retract-assertion", metavar="ASSERTION",
                        help="stop asserting a claim that no longer holds")
+    owner.add_argument("--activate-lesson", metavar="LESSON",
+                       help="make a proposed habit a rule this memory applies")
+    owner.add_argument("--retract-lesson", metavar="LESSON",
+                       help="stop applying a lesson, now, without waiting for a review")
+    owner.add_argument("--confirm-lesson", metavar="LESSON",
+                       help="report, as the owner, that applying this lesson worked")
+    owner.add_argument("--contradict-lesson", metavar="LESSON",
+                       help="report, as the owner, that this lesson was wrong in a case "
+                            "you checked")
+    owner.add_argument("--version", type=int, metavar="N",
+                       help="which version of a lesson the decision is about; the id may "
+                            "also carry it as name@N")
+    owner.add_argument("--evidence", action="append", metavar="RECORD",
+                       help="a record that bears on the outcome being reported")
     owner.add_argument("--digest", metavar="PREVIEW_DIGEST",
                        help="the digest of the forgetting preview being confirmed")
     owner.add_argument("--reason")
@@ -233,9 +300,22 @@ def main(argv: list[str] | None = None) -> int:
 
     sources = sub.add_parser("sources", help="what the connectors know, including what "
                                              "they did not get")
-    sources.add_argument("action", choices=("list",))
+    sources.add_argument("action", choices=("list", "reconfigure"))
     sources.add_argument("--gaps", action="store_true", help="include each source's open gaps")
     sources.add_argument("--limit", type=int, default=20)
+    sources.add_argument("--hermes-home",
+                         help="read the connectors one profile's memory knows about")
+    sources.add_argument("--source",
+                         help="with reconfigure, the connector to start a new generation of")
+    sources.add_argument("--policy", default="local-only",
+                         choices=("local-only", "private-api", "disabled"),
+                         help="with reconfigure, the ingestion scope the connector is "
+                              "re-declared under")
+    sources.add_argument("--actor")
+    sources.add_argument("--reason")
+    sources.add_argument("--review", metavar="DIGEST",
+                         help="with reconfigure, the digest of the plan that was actually "
+                              "shown")
 
     importing = sub.add_parser("import",
                                help="read one export directory into the memory that owns it")
@@ -248,6 +328,11 @@ def main(argv: list[str] | None = None) -> int:
                            help="the scope declared for a connector new to this store")
     importing.add_argument("--dry-run", action="store_true",
                            help="ask whether the export can be read, and read nothing else")
+    importing.add_argument("--granularity", choices=("sample", "series"), default=None,
+                           help="what a sample fixture keeps: every row the source wrote "
+                                "(the shape `measure` reads), or one described summary per "
+                                "device+measure+unit group, which is smaller and can never "
+                                "be re-windowed later")
 
     form = sub.add_parser("form",
                           help="project evidence into the derived backend; run without "
@@ -261,6 +346,106 @@ def main(argv: list[str] | None = None) -> int:
                       help="form the memory enrolled for this Hermes profile home")
     form.add_argument("--review", metavar="DIGEST",
                       help="the digest of the list that was actually shown")
+
+    summarize = sub.add_parser(
+        "summarize",
+        help="reflect one scope into a summary; run without --review to see the window and "
+             "perform nothing")
+    summarize.add_argument("--scope", required=True,
+                           help="project:<name>, thread:<name>, account:<id>, source:<name>, "
+                                "day:<date> or week:<date>")
+    summarize.add_argument("--kind", choices=("thread", "day", "week", "project",
+                                              "mental_model"),
+                           help="the shape of the claim (default: from the scope)")
+    summarize.add_argument("--limit", type=int, default=None,
+                           help="the most records the window may hold")
+    summarize.add_argument("--since", metavar="INSTANT",
+                           help="ignore evidence older than this instant")
+    summarize.add_argument("--title", help="headlines the summary instead of the derived one")
+    summarize.add_argument("--actor")
+    summarize.add_argument("--hermes-home",
+                           help="summarize the memory enrolled for this Hermes profile home")
+    summarize.add_argument("--review", metavar="DIGEST",
+                           help="the digest of the window that was actually shown")
+
+    evaluate = sub.add_parser(
+        "evaluate",
+        help="run one lesson's fixture suite through the authorized evaluator, or report "
+             "what the last run said")
+    evaluate.add_argument("--lesson", required=True, help="the lesson to evaluate")
+    evaluate.add_argument("--version", type=int,
+                          help="which version of it; the current one by default")
+    evaluate.add_argument("--suite", metavar="FILE",
+                          help="the JSON fixture suite to run; without this, report only")
+    evaluate.add_argument("--model-version",
+                          help="what the run was about; a verdict with no version beside it "
+                               "can never be found stale")
+    evaluate.add_argument("--code-version", help="defaults to this hermes-memory release")
+    evaluate.add_argument("--no-promote", action="store_true",
+                          help="record the verdict without letting it promote the lesson")
+    evaluate.add_argument("--hermes-home",
+                          help="evaluate the memory enrolled for this Hermes profile home")
+
+    maintain = sub.add_parser(
+        "maintain",
+        help="one bounded pass of the background work: due reminders, invalidated summaries, "
+             "expired identity candidates, the queue and what is still owed")
+    maintain.add_argument("--hermes-home",
+                          help="maintain the memory enrolled for this Hermes profile home")
+    maintain.add_argument("--limit", type=int, default=None,
+                          help="the most items each section may take in this pass")
+    maintain.add_argument("--section", action="append", choices=SECTIONS, metavar="NAME",
+                          dest="sections",
+                          help="run only this section; repeatable (default: all of them)")
+    maintain.add_argument("--at", metavar="INSTANT",
+                          help="speak for a fixed instant instead for now; for a backfill or "
+                               "a rehearsal, never for a live alert")
+
+    cancel = sub.add_parser(
+        "cancel",
+        help="stop work: a queued job and the backend operation behind it, or say what is "
+             "still owed after a restart")
+    what = cancel.add_mutually_exclusive_group(required=True)
+    what.add_argument("--job", metavar="ID", help="the queued job to stop")
+    what.add_argument("--operation", metavar="ID",
+                      help="the backend operation to ask about")
+    what.add_argument("--list", action="store_true", dest="listing",
+                      help="cancellations on file with no answer yet; a reading")
+    cancel.add_argument("--actor", help="who decided; defaults to the owner principal")
+    cancel.add_argument("--reason",
+                        help="why; a cancellation without a stated reason is refused")
+    cancel.add_argument("--hermes-home",
+                        help="cancel within the memory enrolled for this Hermes profile home")
+
+    goal = sub.add_parser(
+        "goal",
+        help="the owner's prospective memory: what is owed, and its revision-checked "
+             "transitions")
+    goal.add_argument("--list", action="store_true", dest="listing",
+                      help="the goals still live, candidates included")
+    goal.add_argument("--due-now", action="store_true", dest="due_now",
+                      help="what is due at this instant, with each promise's conditions "
+                           "answered rather than assumed")
+    goal.add_argument("--id", metavar="GOAL", help="the goal to settle, revise or snooze")
+    move = goal.add_mutually_exclusive_group()
+    move.add_argument("--activate", action="store_true",
+                      help="adopt a candidate the owner recognises as their own")
+    move.add_argument("--complete", action="store_true", help="the thing was done")
+    move.add_argument("--cancel", action="store_true", help="it is not happening after all")
+    move.add_argument("--snooze", metavar="UNTIL",
+                      help="hold the reminders until this instant; the goal stays as owed")
+    move.add_argument("--revise", action="store_true",
+                      help="move or restate it, which opens a new revision (--due, "
+                           "--statement)")
+    goal.add_argument("--due", metavar="INSTANT",
+                      help="with --revise: the new due time, a wall time in the goal's zone")
+    goal.add_argument("--statement", help="with --revise: what the owner now wants said")
+    goal.add_argument("--actor", help="who decided; defaults to the owner principal")
+    goal.add_argument("--reason", help="why; every transition is written down with it")
+    goal.add_argument("--history", action="store_true",
+                      help="with --id: every revision, oldest first")
+    goal.add_argument("--hermes-home",
+                      help="answer for the memory enrolled for this Hermes profile home")
 
     args = parser.parse_args(argv)
 
@@ -280,8 +465,10 @@ def main(argv: list[str] | None = None) -> int:
         return _compatibility_command(args)
     if args.command == "audit":
         return _audit_command(settings, args)
+    if args.command == "measure":
+        return _measure_command(settings, args)
     if args.command == "profiles":
-        return _profiles_command(settings)
+        return _profiles_command(settings, args)
     if args.command == "inventory":
         return _inventory_command(settings, args)
     if args.command == "setup":
@@ -316,6 +503,16 @@ def main(argv: list[str] | None = None) -> int:
         return _import_command(settings, args)
     if args.command == "form":
         return _form_command(settings, args)
+    if args.command == "summarize":
+        return _summarize_command(settings, args)
+    if args.command == "evaluate":
+        return _evaluate_command(settings, args)
+    if args.command == "maintain":
+        return _maintenance_command(settings, args)
+    if args.command == "cancel":
+        return _cancel_command(settings, args)
+    if args.command == "goal":
+        return _goal_command(settings, args)
     return _explain_command(settings, args)
 
 
@@ -328,18 +525,28 @@ def _registry(settings, *, create: bool = True):
     return ProfileRegistry.open(settings) if create else ProfileRegistry.reading(settings)
 
 
-def _profiles_command(settings) -> int:
+def _profiles_command(settings, args) -> int:
+    """The profiles, and the decisions that made them that way.
+
+    The ledger is the instance's own: an enrollment is a review digest and an actor, and
+    an operator who approved one is entitled to ask later what it did and who recorded it.
+    """
     registry = _registry(settings, create=False)
     try:
+        if args.review:
+            return _emit({"review_digest": args.review,
+                          "applied": registry.receipt_for(args.review)})
         enrolled = [item.as_dict(private=True) for item in registry.profiles()]
         retired = [item.as_dict(private=True) for item in registry.profiles(include_retired=True)
                    if item.state != "enrolled"]
         stores = {item.profile: item.db_path.exists() for item in registry.profiles()}
+        changes = registry.receipts(args.profile) if args.profile else registry.receipts()
     finally:
         registry.db.close()
     return _emit({"instance_home": str(settings.home), "profiles": enrolled,
                   "retired": retired,
-                  "store_present": stores,
+                  "store_present": stores, "changes": changes,
+                  "changes_for": args.profile,
                   "note": "each profile has its own store, bank and credential scope; "
                           "nothing here is shared but the machine"})
 
@@ -479,11 +686,30 @@ def _serve_command(settings) -> int:
         return 2
 
 
+def _service_plan(settings) -> dict | None:
+    """The owned units as this installation's layout describes them, or a refusal.
+
+    A wheel installed on its own ships no ``deployment/systemd`` templates, so the plan
+    cannot be built at all. That is a missing precondition, not a crash: the operator has
+    to be told which door to bring the templates to.
+    """
+    from .install.profiles import InstallationError
+    from .install.services import plan
+
+    try:
+        return plan(settings)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return None
+
+
 def _services_command(settings, args) -> int:
     from .install.profiles import InstallationError
-    from .install.services import apply, plan
+    from .install.services import apply
 
-    proposal = plan(settings)
+    proposal = _service_plan(settings)
+    if proposal is None:
+        return 2
     if args.autostart:
         # A separate verb, because "start it now" and "start it at every login" are
         # different decisions and only one of them is reversible by a reboot.
@@ -525,9 +751,10 @@ _HOST_RUNNER: Callable[[Sequence[str]], tuple[int, str]] = subprocess_runner
 
 def _start_command(settings) -> int:
     from .install.profiles import InstallationError
-    from .install.services import plan
 
-    stale = plan(settings)
+    stale = _service_plan(settings)
+    if stale is None:
+        return 2
     if stale["blocked"]:
         print("refused: these units exist but were not written by this installation, so "
               f"they are not ours to start: {', '.join(stale['blocked'])}", file=sys.stderr)
@@ -595,11 +822,21 @@ def _pause_command(settings, args) -> int:
     the event that must not lift it — and an autostart that resumed formation would be the
     machine deciding against its owner. Inference goes in the instance admission ledger,
     which is the one place every profile's queue can see; delivery is a per-profile
-    outbox, so it is held on each profile's own archive.
+    outbox, so it is held on each profile's own archive. Capture is a per-source stage in
+    that archive, and a source may be registered in more than one profile's memory.
     """
     from .processing.instance_gate import instance_gate
     from .storage.evidence import EvidenceStore
 
+    if args.source and args.scope != "capture":
+        print(f"refused: --source names a connector, and --scope {args.scope} holds the "
+              "whole installation or a profile's outbox, not one source; use "
+              "--scope capture to stop reading a single source", file=sys.stderr)
+        return 2
+    if args.scope == "capture" and not args.source:
+        print("refused: --scope capture has to say which connector stops reading; "
+              "`hermes-memory sources list` names what is registered", file=sys.stderr)
+        return 2
     actor = args.actor or settings.owner_principal
     if not actor:
         print("refused: a pause is attributed, and with no owner principal configured "
@@ -612,7 +849,7 @@ def _pause_command(settings, args) -> int:
     if args.scope == "inference":
         with instance_gate(settings) as gate:
             (gate.resume if args.resume else gate.pause)(actor=actor, reason=reason)
-    else:
+    elif args.scope == "delivery":
         for scoped in _archive_targets(settings, None):
             if not scoped.db_path.is_file():
                 continue
@@ -620,9 +857,44 @@ def _pause_command(settings, args) -> int:
                 store.set_control("global", "delivery", state, actor=actor,
                                   reason=reason, policy_version="operator-pause")
             written_to.append(scoped.profile)
+    else:
+        written_to = _hold_capture(settings, source=args.source, state=state,
+                                   actor=actor, reason=reason)
+        if not written_to:
+            print(f"refused: no memory on this installation registers connector "
+                  f"{args.source!r}, so there is nothing to hold; `hermes-memory sources "
+                  "list` says what is", file=sys.stderr)
+            return 2
     return _emit({"ok": True, "scope": args.scope, "state": state, "actor": actor,
-                  "reason": reason, "held": _holds(settings), "written_to": written_to,
-                  "survives_a_restart": True})
+                  "source": args.source, "reason": reason, "held": _holds(settings),
+                  "written_to": written_to, "survives_a_restart": True})
+
+
+def _hold_capture(settings, *, source: str, state: str, actor: str,
+                  reason: str) -> list[str]:
+    """Hold one connector's ingestion in every memory that registers it.
+
+    A hold that stopped one profile polling a mailbox and left the second reading it
+    would be worse than no hold: the operator would believe the source was shut off.
+    Only the capture stage is written, so a source already held from formation stays
+    held from formation.
+    """
+    from .sources.sync import SyncController
+    from .storage.evidence import EvidenceStore
+
+    held: list[str] = []
+    for scoped in _archive_targets(settings, None):
+        if not scoped.db_path.is_file():
+            continue
+        with EvidenceStore(scoped.db_path) as store:
+            if store.db.execute("SELECT 1 FROM connectors WHERE source=?",
+                                (source,)).fetchone() is None:
+                continue
+            sync = SyncController(store)
+            method = sync.resume_capture if state == "active" else sync.pause_capture
+            method(source, actor=actor, reason=reason, policy_version="operator-pause")
+        held.append(scoped.profile)
+    return held
 
 
 def _holds(settings) -> dict[str, Any]:
@@ -630,18 +902,28 @@ def _holds(settings) -> dict[str, Any]:
 
     Reported rather than echoed from the command that was just run: an operator asking
     "is it stopped" wants the machine's answer, not a restatement of their own request.
+    Capture is per source, so it is a list of holds rather than one flag, and the
+    inference hold carries the actor and reason the instance ledger recorded.
     """
     from .processing.instance_gate import instance_gate
 
     with instance_gate(settings) as gate:
         inference = gate.paused
+        # The hold itself is a flag; this is the part that makes it somebody's decision.
+        inference_hold = gate.hold() if inference else None
     delivery = False
+    capture: list[dict[str, Any]] = []
     for scoped in _archive_targets(settings, None):
         if not scoped.db_path.is_file():
             continue
         with ReadOnlyStore(scoped.db_path) as store:
             delivery = delivery or store.stage_is_paused("global", "delivery")
-    return {"inference": inference, "delivery": delivery}
+            rows = store.db.execute(
+                "SELECT scope FROM runtime_controls WHERE stage='capture' AND "
+                "state='paused' ORDER BY scope").fetchall()
+        capture.extend({"profile": scoped.profile, "source": row["scope"]} for row in rows)
+    return {"inference": inference, "inference_hold": inference_hold,
+            "delivery": delivery, "capture": capture}
 
 
 # -- the archive, the release and the sources ----------------------------------
@@ -666,7 +948,11 @@ def _backup_command(settings, args) -> int:
     except Exception as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
-    taken, present = [], []
+    if args.keep is not None and args.keep < 1:
+        print("refused: --keep is how many snapshots to retain, and at least one must stay",
+              file=sys.stderr)
+        return 2
+    taken, present, trimmed = [], [], []
     try:
         for scoped in targets:
             directory = Path(scoped.data_dir) / "snapshots"
@@ -683,14 +969,23 @@ def _backup_command(settings, args) -> int:
                                                   snapshots.list(limit=20)]})
                     continue
                 made = snapshots.create(reason=args.reason, actor=actor)["snapshot"]
-                taken.append({"profile": scoped.profile, "snapshot": made.as_dict(),
-                              "verified": snapshots.verify(made.id)["ok"]})
+                entry = {"profile": scoped.profile, "snapshot": made.as_dict(),
+                         "verified": snapshots.verify(made.id)["ok"]}
+                taken.append(entry)
+                if args.keep is not None:
+                    # Retention happens after the copy and never instead of it: the point of
+                    # `--keep` is a bounded directory, not a shorter history.
+                    pruned = snapshots.prune(keep=args.keep, actor=actor)
+                    pruned["profile"] = scoped.profile
+                    trimmed.append(pruned)
+                    entry["retained"] = pruned["kept"]
     except EvidenceError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     if args.list:
         return _emit({"listing": True, "profiles": present})
     return _emit({"ok": True, "actor": actor, "backups": taken, "skipped": present,
+                  "pruned": trimmed,
                   "note": "a snapshot is one consistent copy of one store, taken while "
                           "the store stayed open; take it back with `hermes-memory restore`"})
 
@@ -786,7 +1081,11 @@ def _owner_command(settings, args) -> int:
                  "identity-rejection": args.reject_identity,
                  "edge-revocation": args.revoke_edge,
                  "assertion": args.confirm_assertion,
-                 "assertion-retraction": args.retract_assertion}
+                 "assertion-retraction": args.retract_assertion,
+                 "lesson-activation": args.activate_lesson,
+                 "lesson-retraction": args.retract_lesson,
+                 "lesson-confirmation": args.confirm_lesson,
+                 "lesson-contradiction": args.contradict_lesson}
     chosen = [name for name, value in decisions.items() if value]
     if args.list and chosen:
         print("refused: --list reads and a decision writes; ask for one or the other",
@@ -829,7 +1128,11 @@ def _owner_command(settings, args) -> int:
                  "identity-rejection": args.reject_identity,
                  "edge-revocation": args.revoke_edge,
                  "assertion": args.confirm_assertion,
-                 "assertion-retraction": args.retract_assertion}[name]
+                 "assertion-retraction": args.retract_assertion,
+                 "lesson-activation": args.activate_lesson,
+                 "lesson-retraction": args.retract_lesson,
+                 "lesson-confirmation": args.confirm_lesson,
+                 "lesson-contradiction": args.contradict_lesson}[name]
     try:
         with EvidenceStore(scoped.db_path) as store:
             if name == "forgetting":
@@ -839,6 +1142,37 @@ def _owner_command(settings, args) -> int:
                 claims = AssertionStore(store, owner_principal=scoped.owner_principal)
                 decide = claims.confirm if name == "assertion" else claims.retract
                 outcome = decide(assertion_id=chosen_id, actor=actor, reason=args.reason)
+            elif name.startswith("lesson"):
+                from .learning.lessons import LessonStore
+                from .learning.outcomes import OutcomeLog
+
+                lessons = LessonStore(store,
+                                      outcomes=OutcomeLog(store, owner_principal=scoped
+                                                          .owner_principal),
+                                      owner_principal=scoped.owner_principal)
+                identifier, number = _lesson_ref(chosen_id, args.version)
+                if number is None and name != "lesson-retraction":
+                    raise EvidenceError(
+                        "a lesson decision names the version it is about — `chase-invoice@3` "
+                        "or --version 3 — because its versions disagree with each other by "
+                        "construction, and withdrawing the newest is a different act from "
+                        "withdrawing the one that was taught")
+                if name == "lesson-activation":
+                    outcome = lessons.activate(lesson_id=identifier, version=number,
+                                               actor=actor, reason=args.reason)
+                elif name == "lesson-retraction":
+                    outcome = lessons.retract(lesson_id=identifier, version=number,
+                                              actor=actor, reason=args.reason)
+                elif name == "lesson-confirmation":
+                    outcome = lessons.record_confirmation(lesson_id=identifier,
+                                                          version=number, note=args.reason,
+                                                          actor=actor,
+                                                          evidence=args.evidence or ())
+                else:
+                    outcome = lessons.record_contradiction(lesson_id=identifier,
+                                                           version=number, note=args.reason,
+                                                           actor=actor,
+                                                           evidence=args.evidence or ())
             else:
                 identities = IdentityStore(store, owner_principal=scoped.owner_principal)
                 if name == "identity":
@@ -859,6 +1193,19 @@ def _owner_command(settings, args) -> int:
                   "actor": actor, **outcome})
 
 
+def _lesson_ref(value: str, version: int | None) -> tuple[str, int | None]:
+    """`name@3` and `--version 3` are one statement; two different numbers are a refusal."""
+    named, _, suffix = str(value).partition("@")
+    if suffix and version is not None and suffix != str(version):
+        raise EvidenceError(f"{value} names version {suffix} while --version names "
+                            f"{version}; a decision cannot be about two revisions")
+    if suffix and not suffix.isdigit():
+        raise EvidenceError(f"{value!r} is not a lesson reference; expected a name, or "
+                            "name@N")
+    number = int(suffix) if suffix.isdigit() and version is None else version
+    return named, number
+
+
 def _awaiting(targets) -> list[dict[str, Any]]:
     """What each enrolled memory is waiting on, counted rather than quoted.
 
@@ -868,6 +1215,8 @@ def _awaiting(targets) -> list[dict[str, Any]]:
     behind it is read with `explain`, by somebody who is allowed to look.
     """
     from .knowledge.assertions import AssertionStore
+    from .learning.lessons import LessonStore
+    from .learning.outcomes import OutcomeLog
     from .lifecycle.erasure import ErasureManager
     from .storage.identity import IdentityStore
 
@@ -875,7 +1224,9 @@ def _awaiting(targets) -> list[dict[str, Any]]:
     for scoped in targets:
         entry = {"profile": scoped.profile, "store": str(scoped.db_path),
                  "awaiting_forgetting": [], "identity_candidates": [],
-                 "candidate_assertions": [], "confirmed_identities": 0}
+                 "candidate_assertions": [], "confirmed_identities": 0,
+                 "lesson_candidates": [], "lessons_for_review": [],
+                 "goal_candidates": []}
         found.append(entry)
         if not scoped.db_path.is_file():
             entry["reason"] = "no store yet"
@@ -900,6 +1251,39 @@ def _awaiting(targets) -> list[dict[str, Any]]:
                  "valid_to": item.valid_to}
                 for item in claims.current(include_candidates=True)
                 if item.status == "candidate"]
+            # A proposed habit is quoted in full, unlike a forgetting preview: the sentence
+            # *is* the decision, and a promotion cannot be read off a digest. What is left
+            # out is the evidence behind it, which `explain` opens for somebody allowed to.
+            habits = LessonStore(store,
+                                 outcomes=OutcomeLog(store,
+                                                     owner_principal=scoped.owner_principal),
+                                 owner_principal=scoped.owner_principal)
+            candidates = []
+            for row in store.db.execute(
+                    "SELECT id, version, text, applicability, created_by, created_kind "
+                    "FROM lessons WHERE status='candidate' ORDER BY created_at, id LIMIT 8"
+            ).fetchall():
+                lesson = habits.get(str(row["id"]), version=int(row["version"]))
+                candidates.append({"lesson": f"{row['id']}@{row['version']}",
+                                   "text": row["text"],
+                                   "applicability": json.loads(str(row["applicability"]
+                                                                   or "[]")),
+                                   "proposed_by": row["created_by"],
+                                   "proposed_kind": row["created_kind"],
+                                   "support": lesson.support, "against": lesson.against})
+            entry["lesson_candidates"] = candidates
+            entry["lessons_for_review"] = habits.needs_review(limit=8)
+            # A proposed reminder is quoted for the same reason a proposed habit is: the
+            # sentence is the decision, and adopting it is not something a count can express.
+            entry["goal_candidates"] = [
+                {"goal": row["id"], "title": row["title"], "statement": row["statement"],
+                 "proposed_by": row["created_by"], "proposed_kind": row["created_kind"],
+                 "proposed_at": row["created_at"],
+                 "wants_a_due_time": row["due_at"] is not None}
+                for row in store.db.execute(
+                    "SELECT id, title, statement, created_by, created_kind, created_at, "
+                    "due_at FROM goals WHERE status='candidate' "
+                    "ORDER BY created_at, id LIMIT 8").fetchall()]
     return found
 
 
@@ -930,11 +1314,12 @@ def _upgrade_command(settings, args) -> int:
     machine, a rehearsal on a restored copy and a validated final state, and an operator
     who has those would not want a flag that guesses at them.
     """
+    from .install.profiles import InstallationError
     from .install.upgrade import UpgradeError, upgrade_plan
 
     try:
         report = upgrade_plan(settings, release=args.version, hermes_home=args.hermes_home)
-    except UpgradeError as error:
+    except (UpgradeError, InstallationError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     return _emit({**report,
@@ -945,11 +1330,12 @@ def _upgrade_command(settings, args) -> int:
 
 def _uninstall_command(settings, args) -> int:
     """Two steps again: the list first, then the removal of exactly that list."""
+    from .install.profiles import InstallationError
     from .install.uninstall import UninstallError, uninstall_apply, uninstall_plan
 
     try:
         proposal = uninstall_plan(settings, hermes_home=args.hermes_home)
-    except UninstallError as error:
+    except (UninstallError, InstallationError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     if not args.review:
@@ -961,7 +1347,7 @@ def _uninstall_command(settings, args) -> int:
             settings, actor=args.actor or settings.owner_principal or "",
             review=args.review, keep_data=args.keep_data,
             hermes_home=args.hermes_home, runner=_HOST_RUNNER))
-    except UninstallError as error:
+    except (UninstallError, InstallationError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
 
@@ -970,7 +1356,15 @@ def _sources_command(settings, args) -> int:
     """Each connector's own account: where it stopped, and what it could not get."""
     from .sources.sync import SyncController
 
-    def read(store):
+    if args.action == "reconfigure":
+        return _reconfigure_command(settings, args)
+    if args.source or args.review:
+        print("refused: --source and --review belong to `sources reconfigure`; a listing "
+              "reports every connector, and naming one would make it a different answer",
+              file=sys.stderr)
+        return 2
+
+    def read(_scoped, store):
         sync = SyncController(store)
         listed = []
         for row in store.db.execute("SELECT source FROM connectors ORDER BY source"):
@@ -989,7 +1383,113 @@ def _sources_command(settings, args) -> int:
                 "note": "coverage is what the source says it has; a gap is what it could "
                         "not hand over, and neither is a claim about what is missing"}
 
-    return _with_store(settings, read)
+    return _with_store(settings, read, args.hermes_home)
+
+
+# The facts a reconfigure is approved against, so an old digest cannot authorise a plan
+# this command no longer shows.
+RECONFIGURE_PLAN_VERSION = "connector-reconfigure-v1"
+
+
+def _reconfigure_command(settings, args) -> int:
+    """Start one connector's generation again, under a declaration the owner signed.
+
+    A reconfigure strands the cursor, so the next read is a full re-read of the source,
+    and it re-records the ingestion scope the connector is filed under. Both are felt
+    longest by whoever comes after this conversation, which is why the command shows the
+    connectors it found, what each one currently holds, and refuses to write without the
+    digest of that exact showing. Nothing here touches the archive: records already stored
+    stay stored, and a re-read of one arrives as a duplicate.
+    """
+    from .ids import digest
+    from .install.profiles import InstallationError
+    from .sources.sync import SyncController
+    from .storage.evidence import EvidenceStore
+
+    if args.gaps:
+        print("refused: --gaps reads and reconfigure writes; ask for one or the other",
+              file=sys.stderr)
+        return 2
+    if not args.source:
+        print("refused: reconfigure has to say which connector starts over; `sources "
+              "list` names what is registered", file=sys.stderr)
+        return 2
+    actor = args.actor or settings.owner_principal
+    if not actor:
+        print("refused: a reconfigure changes what a connector is recorded as allowed to "
+              "ingest, and with no owner principal configured there is nobody to attribute "
+              "it to", file=sys.stderr)
+        return 2
+    if not (args.reason or "").strip():
+        print("refused: re-declaring a connector has to say why — a dropped cursor means a "
+              "full re-read of a source that may hold other people's messages",
+              file=sys.stderr)
+        return 2
+    try:
+        targets = _archive_targets(settings, None)
+    except (InstallationError, EvidenceError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    found: list[dict[str, Any]] = []
+    try:
+        for scoped in targets:
+            if not scoped.db_path.is_file():
+                continue
+            with ReadOnlyStore(scoped.db_path) as store:
+                if store.db.execute("SELECT 1 FROM connectors WHERE source=?",
+                                    (args.source,)).fetchone() is None:
+                    continue
+                sync = SyncController(store)
+                state = sync.state(args.source)
+                found.append({"profile": scoped.profile, "store": str(scoped.db_path),
+                              "generation_now": state["generation"],
+                              "policy_now": state["policy_version"],
+                              "policy_next": args.policy,
+                              "cursor_held": bool(state["cursor"]),
+                              "coverage_now": state["coverage_state"],
+                              "lease": "held" if state["lease_active"] else "free",
+                              "paused_stages": sync.paused_stages(args.source)})
+    except EvidenceError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not found:
+        print(f"refused: no memory on this installation registers connector "
+              f"{args.source!r}, so there is no connector to start over", file=sys.stderr)
+        return 2
+    will = ["a new connector generation, so any writer still holding the old fence is "
+            "refused rather than committed",
+            "the cursor dropped: the next read starts from the beginning of the source",
+            f"the ingestion scope re-recorded as {args.policy!r}",
+            "coverage reset to 'unknown' until a run says otherwise"]
+    review = digest([RECONFIGURE_PLAN_VERSION, args.source, actor, args.reason, found, will])
+    if not args.review:
+        return _emit({"source": args.source, "actor": actor, "reason": args.reason,
+                      "connectors": found, "will": will, "review_digest": review,
+                      "note": "nothing was written. Approve this exact plan by re-running "
+                              "with --review <digest>",
+                      "archive": "records already stored are not touched by this"})
+    if args.review != review:
+        print("refused: the digest is not the one this plan carries, so what is being "
+              "approved is not what was shown; run without --review and read the output",
+              file=sys.stderr)
+        return 2
+    written: list[dict[str, Any]] = []
+    try:
+        for plan in found:
+            with EvidenceStore(plan["store"]) as store:
+                generation = SyncController(store).reconfigure(
+                    args.source, policy_version=args.policy, actor=actor,
+                    reason=args.reason)
+            written.append({"profile": plan["profile"], "generation": generation})
+    except EvidenceError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "source": args.source, "actor": actor, "reason": args.reason,
+                  "reconfigured": written, "will": will, "review_digest": review,
+                  "policy": args.policy,
+                  "held": _holds(settings),
+                  "next": "the next connector run re-reads from the beginning; until it "
+                          "finishes, coverage says 'unknown' and that is the honest answer"})
 
 
 def _import_command(settings, args) -> int:
@@ -1025,7 +1525,19 @@ def _import_command(settings, args) -> int:
               "memory that exists, so run `hermes-memory init` (or enroll) first",
               file=sys.stderr)
         return 2
-    adapter = adapter_class(args.path, source=args.source)
+    offered = getattr(adapter_class, "granularities", ())
+    if args.granularity is None and len(offered) > 1:
+        print("refused: this export can be kept two ways, and the choice decides what can "
+              "be asked of it later. --granularity sample keeps every row the source wrote "
+              f"(the shape `hermes-memory measure` reads); --granularity {offered[-1]} keeps "
+              "one described summary per group and gives the rows up", file=sys.stderr)
+        return 2
+    if args.granularity and args.granularity not in offered:
+        print(f"refused: --granularity {args.granularity!r} is not a choice the reader for "
+              f"source {args.source!r} has; it states one record per item", file=sys.stderr)
+        return 2
+    options = ({"per_sample": args.granularity == "sample"} if args.granularity else {})
+    adapter = adapter_class(args.path, source=args.source, **options)
     if not args.dry_run:
         try:
             with EvidenceStore(scoped.db_path) as store:
@@ -1090,6 +1602,207 @@ def _form_command(settings, args) -> int:
         return 2
 
 
+def _summarize_command(settings, args) -> int:
+    """One reflection, one window, one named author.
+
+    The scope is what the summary will be a claim *about*, and it is listed before the
+    model is asked: approving a digest that says 12 records from one project is not
+    approving a paragraph about whatever else that backend happens to hold. A
+    ``mental_model`` reaches past the evidence, so only the owner principal may write one.
+    """
+    from .install.profiles import InstallationError
+    from .processing.summarization import (DEFAULT_BATCH, SummarizeError,
+                                           summarize_apply, summarize_plan)
+
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    limit = DEFAULT_BATCH if args.limit is None else args.limit
+    actor = args.actor or settings.owner_principal or ""
+    try:
+        proposal = summarize_plan(settings, scope=args.scope, kind=args.kind,
+                                 limit=limit, since=args.since)
+    except SummarizeError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not args.review:
+        return _emit({**proposal, "next": "no request was sent. Approve this exact window "
+                                          "with --review <digest> and an --actor; a summary "
+                                          "costs tokens and is attributed to whoever asked"})
+    try:
+        return _emit(summarize_apply(settings, scope=args.scope, kind=args.kind,
+                                     review=args.review, actor=actor, limit=limit,
+                                     since=args.since, title=args.title))
+    except SummarizeError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
+def _evaluate_command(settings, args) -> int:
+    """The one door that can turn a run into a rule.
+
+    No agent credential reaches this: the evaluator program is configuration the owner
+    wrote, and its answer is weighed case by case by the ledger, which promotes nothing
+    that was scored by the same hand that proposed the lesson. Without ``--suite`` the
+    command only reports what the archive already remembers, and opens no socket.
+    """
+    from .install.profiles import InstallationError
+    from .learning.evaluator import EvaluationError, evaluate, report_on
+
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    try:
+        if not args.suite:
+            return _emit(report_on(settings, lesson=args.lesson, version=args.version))
+        return _emit(evaluate(settings, lesson=args.lesson, suite_path=args.suite,
+                              model_version=args.model_version or "",
+                              code_version=args.code_version, promote=not args.no_promote))
+    except (EvaluationError, EvidenceError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
+# The background door. Nothing here needs an --actor or a --review, because nothing here
+# spends anything: the pass writes only what is already promised, and the first thing it
+# refuses to do is ask a model. That is what lets it sit on a timer; the moment a run
+# wanted tokens it would belong to `form`, which names who authorised the spend.
+def _maintenance_command(settings, args) -> int:
+    from .install.profiles import InstallationError
+    from .processing.maintenance import DEFAULT_LIMIT, MAX_LIMIT, run
+
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    limit = DEFAULT_LIMIT if args.limit is None else args.limit
+    if not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
+        print(f"refused: --limit must be between 1 and {MAX_LIMIT}", file=sys.stderr)
+        return 2
+    try:
+        report = run(settings, limit=limit, at=args.at, sections=tuple(args.sections or ()))
+    except (EvidenceError, ValueError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not report.get("ok"):
+        return _emit(report, 2)
+    return _emit(report)
+
+
+# The stop door. Unlike the background pass this one names a person: a cancelled job is a
+# decision somebody made, and the ledger keeps it beside their name. It never claims the
+# backend stopped — the report says what was asked, what was answered and what is unknown.
+def _cancel_command(settings, args) -> int:
+    from .install.profiles import InstallationError
+    from .processing.cancellation import outstanding, run
+
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    actor = args.actor or settings.owner_principal
+    if args.listing:
+        return _emit(outstanding(settings))
+    try:
+        report = run(settings, job=args.job, operation=args.operation,
+                     actor=actor, reason=args.reason or "")
+    except (EvidenceError, ValueError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not report.get("ok"):
+        return _emit(report, 2)
+    return _emit(report)
+
+
+# The owner's own prospective memory. Every transition here is already owner-gated in the
+# store, so this door's job is to name the goal, carry the reason into the history row, and
+# refuse the ones that would silently destroy a promise: a snooze that suppresses nothing, a
+# revision of something already settled.
+def _goal_command(settings, args) -> int:
+    from .install.profiles import InstallationError
+    from .prospective.due_events import DueEventLog
+    from .prospective.goals import GoalStore
+    from .storage.evidence import EvidenceStore
+
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not settings.db_path.exists():
+        print(f"refused: no canonical store at {settings.db_path}; run `hermes-memory init` "
+              "first", file=sys.stderr)
+        return 2
+    actor = args.actor or settings.owner_principal
+    readings = (args.listing or args.due_now or args.history)
+    moving = (args.activate or args.complete or args.cancel or args.snooze
+              or args.revise)
+    if not readings and not moving:
+        print("refused: name --list, --due-now, --history, or one of --activate/--complete/"
+              "--cancel/--snooze/--revise", file=sys.stderr)
+        return 2
+    if moving and not args.id:
+        print("refused: a transition names the goal it applies to with --id", file=sys.stderr)
+        return 2
+    if readings and moving:
+        print("refused: a reading does not also settle something; run them separately",
+              file=sys.stderr)
+        return 2
+    if len([item for item in (args.listing, args.due_now, args.history) if item]) > 1:
+        print("refused: one reading at a time — each answers a different question",
+              file=sys.stderr)
+        return 2
+    try:
+        with EvidenceStore(settings.db_path) as store:
+            goals = GoalStore(store, events=DueEventLog(store),
+                              owner_principal=settings.owner_principal)
+            if args.listing:
+                return _emit({"goals": [item.as_dict() for item in
+                                        goals.open(include_candidates=True)],
+                              "note": "a candidate is an agent's proposal the owner has not "
+                                      "adopted; nothing reminds for it until --activate"})
+            if args.due_now:
+                # Each condition is answered here rather than assumed: a promise with a
+                # predicate is not late or on time, it is waiting on something the store can
+                # say, or cannot.
+                return _emit({"due": goals.due_now(),
+                              "note": "ready means every condition was satisfied; unknown "
+                                      "names the conditions the store could not answer, which "
+                                      "are held rather than fired or destroyed"})
+            if args.history:
+                return _emit({"goal_id": args.id, "history": goals.history(args.id)})
+            if not (args.reason or "").strip():
+                print("refused: every goal transition is written down with a reason, because "
+                      "it outlives the conversation that made it", file=sys.stderr)
+                return 2
+            if args.activate:
+                answer = goals.activate(goal_id=args.id, actor=actor, reason=args.reason)
+            elif args.complete:
+                answer = goals.complete(goal_id=args.id, actor=actor, reason=args.reason)
+            elif args.cancel:
+                answer = goals.cancel(goal_id=args.id, actor=actor, reason=args.reason)
+            elif args.snooze:
+                answer = goals.snooze(goal_id=args.id, actor=actor, until=args.snooze,
+                                      reason=args.reason)
+            else:
+                if not args.due and not args.statement:
+                    print("refused: --revise needs --due or --statement, otherwise it opens a "
+                          "revision that changes nothing", file=sys.stderr)
+                    return 2
+                answer = goals.revise(goal_id=args.id, actor=actor, reason=args.reason,
+                                      due=args.due, statement=args.statement)
+    except (EvidenceError, ValueError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit(answer)
+
+
 # The file readers only. A live mailbox, an MCP server or the host's own event spool
 # each need an authorisation this command cannot carry, so they are not in the map.
 def _export_readers() -> dict[str, Any]:
@@ -1127,7 +1840,7 @@ def _status_command(settings, args) -> int:
     from .operations.status import StatusReporter
 
     try:
-        settings = _memory_for_home(settings, args.hermes_home)
+        settings = _reading_settings(settings, args.hermes_home)
     except InstallationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -1150,15 +1863,22 @@ def _status_command(settings, args) -> int:
 
 
 def _init_command(settings, args) -> int:
+    from .install.profiles import InstallationError
+
+    try:
+        settings = _memory_for_home(settings, args.hermes_home)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     if args.dry_run:
         return _emit({"would_create": [str(settings.data_dir), str(settings.blob_dir)],
-                      "store": str(settings.db_path),
+                      "store": str(settings.db_path), "profile": settings.profile,
                       "migrations": "applied when the store is opened for writing"})
     settings.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     settings.blob_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     with EvidenceStore(settings.db_path) as store:
         store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    return _emit({"initialized": str(settings.db_path)})
+    return _emit({"initialized": str(settings.db_path), "profile": settings.profile})
 
 
 def _doctor_command(settings, args) -> int:
@@ -1166,7 +1886,7 @@ def _doctor_command(settings, args) -> int:
     from .operations.doctor import Doctor, unreachable_store_report
 
     try:
-        settings = _memory_for_home(settings, args.hermes_home)
+        settings = _reading_settings(settings, args.hermes_home)
     except InstallationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -1198,7 +1918,7 @@ def _compatibility_command(args) -> int:
         return _emit({"written": str(written), "facts": compatibility.facts(),
                       "note": "ship this file with the release it describes"})
     checked = compatibility.verify(digests=args.digests)
-    if not checked["ok"]:
+    if not checked["ok"] and not checked.get("absent"):
         checked["next"] = ("hermes-memory compatibility --write, and ship what it prints "
                            "beside the code that produced it")
     return _emit(checked, 0 if checked["ok"] else 1)
@@ -1207,40 +1927,107 @@ def _compatibility_command(args) -> int:
 def _audit_command(settings, args) -> int:
     from .operations.audit import AuditTrail
 
-    def read(store):
+    def read(_scoped, store):
         trail = AuditTrail(store)
+        if args.timeline:
+            return trail.timeline(args.timeline, include_text=args.include_private,
+                                 limit=args.limit)
+        if args.actions:
+            return {"actions": trail.actions()}
+        if args.actors:
+            return {"actors": trail.by_actor()}
+        if args.decisions:
+            return {"category": args.decisions, "decided_by": trail.decided_by(args.decisions)}
         if args.source:
             return trail.source_history(args.source, limit=args.limit)
         return trail.recent(action=args.action, object_id=args.object_id,
                             actor=args.actor, limit=args.limit)
 
-    return _with_store(settings, read)
+    return _with_store(settings, read, args.hermes_home)
 
 
 def _explain_command(settings, args) -> int:
     from .operations.explanations import Explanations
 
-    def read(store):
-        explained = Explanations(store, settings=settings)
+    def read(scoped, store):
+        explained = Explanations(store, settings=scoped)
         if args.record:
             return explained.retrieval(args.record, limit=args.limit)
         if args.artifact:
             return explained.notification(args.artifact, include_private=args.include_private)
         if args.goal:
             return explained.goal(args.goal, include_private=args.include_private)
+        if args.lesson:
+            return explained.lesson(args.lesson, include_private=args.include_private)
+        if args.summary:
+            return explained.summary(args.summary, include_private=args.include_private)
         return explained.suppressed(topic=args.not_told, at=args.at, limit=args.limit)
 
-    return _with_store(settings, read)
+    return _with_store(settings, read, args.hermes_home)
 
 
-def _with_store(settings, read: Callable[[Any], Any]) -> int:
+def _measure_command(settings, args) -> int:
+    """Typed measurements, computed from the samples rather than recalled about them.
+
+    A number that does not say what it measured, in what unit, from which device, and
+    when, is not a memory — so the reading carries all four, reports the samples it
+    could not place in time or could not read, and refuses to average across a unit
+    disagreement instead of producing a plausible wrong figure.
+    """
+    from .storage.measurements import Measurements
+
+    asked = (args.what or args.device or args.source or args.unit or args.since
+             or args.until)
+    if args.listing and asked:
+        print("refused: --list answers 'what can I ask?'; name the measure alone to ask it",
+              file=sys.stderr)
+        return 2
+
+    def read(_scoped, store):
+        subject = Measurements(store)
+        if args.listing:
+            return {"series": subject.available(),
+                    "ask": "hermes-memory measure --what <measure> [--device D] "
+                           "[--since <timestamp> --until <timestamp>]"}
+        if not args.what:
+            raise EvidenceError("measure has to say what to read; --list names what is held")
+        return subject.series(args.what, device=args.device, source=args.source,
+                              unit=args.unit, since=args.since, until=args.until)
+
+    return _with_store(settings, read, args.hermes_home)
+
+
+def _with_store(settings, read: Callable[[Any], Any], hermes_home: str | None = None) -> int:
+    """Open one memory read-only and answer from it, refusing rather than guessing.
+
+    ``hermes_home`` decides when it is given. Otherwise a single enrolled profile is
+    unambiguous — that store is the one the imports have been writing into — and more
+    than one is a question for the operator, because a reading about one person that came
+    quietly out of another person's memory is the failure the profile map exists to stop.
+    """
+    from .install.profiles import InstallationError
+
     try:
-        with ReadOnlyStore(settings.db_path) as store:
-            payload = read(store)
-    except (EvidenceError, ValueError) as error:
+        scoped = _reading_settings(settings, hermes_home)
+        with ReadOnlyStore(scoped.db_path) as store:
+            payload = read(scoped, store)
+    except (EvidenceError, ValueError, InstallationError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     return _emit(payload)
+
+
+def _reading_settings(settings, hermes_home: str | None = None):
+    from .install.profiles import InstallationError
+
+    if hermes_home:
+        return _memory_for_home(settings, hermes_home)
+    targets = _archive_targets(settings, None)
+    if len(targets) == 1:
+        return targets[0]
+    raise InstallationError(
+        f"{len(targets)} memories are enrolled in this installation, so a reading has to "
+        "name one of them; --profile or --hermes-home says whose store is being read")
 
 
 def _emit(payload, code: int = 0) -> int:

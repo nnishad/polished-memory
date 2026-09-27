@@ -23,7 +23,8 @@ from ..backend.capabilities import CAPABILITIES, PINNED_VERSION
 from ..ids import content_digest
 from ..storage.migrations import MIGRATIONS
 
-__all__ = ["MANIFEST_VERSION", "facts", "manifest_path", "read_shipped", "verify", "write"]
+__all__ = ["MANIFEST_VERSION", "facts", "manifest_path", "read_shipped", "source_checkout",
+           "verify", "write"]
 
 MANIFEST_VERSION = "compatibility-v1"
 REPO = Path(__file__).resolve().parents[3]
@@ -120,7 +121,18 @@ def facts() -> dict[str, Any]:
                             "host compatibility is the plugin's own floor, not a tested list"]}
 
 
-def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path:
+def source_checkout() -> Path | None:
+    """The working tree this module was imported from, when it is one.
+
+    A package installed into a venv has no checkout either side of it: the two
+    directories that would have to be present are what makes a tree a source tree
+    rather than a site-packages parent.
+    """
+    return REPO if all((REPO / part).exists() for part in ("pyproject.toml",
+                                                           "src/hermes_memory")) else None
+
+
+def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path | None:
     """Where this release's manifest lives: the release tree, then this checkout.
 
     An installed tree carries ``deployment/compatibility.json`` beside the ``bin/`` it was
@@ -128,7 +140,9 @@ def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path:
     instance home — the same two answers the service layout reads. Falling back to the tree
     this module was imported from keeps a source run honest without pretending to be a
     release: a release tree that ships no manifest of its own is not vouched for by whichever
-    checkout happens to be on the disk.
+    checkout happens to be on the disk. ``None`` is an answer — this build carries no
+    statement of what it is compatible with — and the checks say that rather than naming a
+    path that never existed.
     """
     source = os.environ if environ is None else environ
     roots = []
@@ -141,7 +155,8 @@ def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path:
         candidate = root / RELATIVE
         if candidate.is_file():
             return candidate
-    return SHIP_AT
+    checkout = source_checkout()
+    return checkout / RELATIVE if checkout else None
 
 
 def write(*, path: Path | None = None) -> Path:
@@ -153,7 +168,7 @@ def write(*, path: Path | None = None) -> Path:
 
 def read_shipped(*, path: Path | None = None, settings=None) -> dict[str, Any]:
     target = path or manifest_path(settings)
-    if not target.is_file():
+    if target is None or not target.is_file():
         raise ValueError(f"no compatibility manifest at {target}")
     return json.loads(target.read_text(encoding="utf-8"))
 
@@ -165,8 +180,21 @@ def verify(*, path: Path | None = None, settings=None,
     remedy = ("regenerate deployment/compatibility.json with `hermes-memory compatibility "
               "--write` as part of the release, because the code and its stated "
               "compatibility have already diverged")
+    if target is None:
+        # Not a divergence: this build says nothing about what it is compatible with, and
+        # no fix on this machine can make it say so. A wheel installed on its own is the
+        # ordinary case, so the remedy names the release tree rather than a write command.
+        return {"ok": False, "absent": True, "checked": None,
+                "differences": ["no compatibility manifest is carried by this installation, "
+                                "so nothing here states what it is compatible with"],
+                "remedy": ("run from a release tree, or name one with HERMES_MEMORY_RELEASE "
+                           "(or <instance home>/runtime/current); `compatibility --write` "
+                           "belongs to packaging, where the source is"),
+                "digests": None}
     if not target.is_file():
-        return {"ok": False, "checked": str(target),
+        # Named and missing: this tree was supposed to carry the file and does not, which
+        # is the one case where regenerating it is the operator's fix.
+        return {"ok": False, "absent": False, "checked": str(target),
                 "differences": [f"{target} does not exist"], "remedy": remedy,
                 "digests": None}
     try:

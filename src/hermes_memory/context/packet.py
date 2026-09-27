@@ -89,6 +89,10 @@ class Packet:
     facts: tuple[dict[str, Any], ...] = ()
     lessons: tuple[dict[str, Any], ...] = ()
     commitments: tuple[dict[str, Any], ...] = ()
+    # The archive's own readings of the scopes this answer touches. Deliberately a separate
+    # section from `items`: a summary is derived from evidence and must never be quoted as
+    # if it were a second, independent sighting of it.
+    summaries: tuple[dict[str, Any], ...] = ()
     channels: Channels = field(default_factory=Channels)
     coverage: str = UNKNOWN
     truncated: tuple[str, ...] = ()
@@ -103,13 +107,14 @@ class Packet:
     @property
     def empty(self) -> bool:
         return not (self.items or self.assertions or self.facts or self.lessons
-                    or self.commitments)
+                    or self.commitments or self.summaries)
 
     def as_dict(self) -> dict[str, Any]:
         return {"id": self.packet_id, "query": self.query,
                 "items": [item.as_dict() for item in self.items],
                 "assertions": [dict(item) for item in self.assertions],
                 "facts": [dict(fact) for fact in self.facts],
+                "summaries": [dict(item) for item in self.summaries],
                 "lessons": len(self.lessons), "commitments": len(self.commitments),
                 "channels": self.channels.as_dict(),
                 "semantic_channel": self.channels.derived,
@@ -143,6 +148,9 @@ class Packet:
                          + "; ".join(self.conflicts[:3]))
         if self.withheld:
             notes.append(f"{self.withheld} item(s) were withheld as outside the caller's scope")
+        if self.summaries:
+            notes.append("summaries are this archive's own readings of the evidence, not a "
+                         "second sighting of it; quote the record, not the digest")
         return notes
 
     def render(self) -> str:
@@ -167,6 +175,12 @@ class Packet:
             when = item.occurred_at or "time unknown"
             cut = "…" if item.span_truncated else ""
             lines.append(f"- [{item.source} @ {when}] {item.text[:600]}{cut}")
+        for summary in self.summaries:
+            text = str(summary.get("body") or "")[:600]
+            if text:
+                lines.append(f"- summary of {summary.get('scope')} ({summary.get('kind')}, "
+                             f"rev {summary.get('revision')} covering "
+                             f"{summary.get('window_from') or 'an undated span'}): {text}")
         for fact in self.facts:
             text = str(fact.get("text") or fact.get("content") or "")[:600]
             if text:

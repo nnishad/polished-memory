@@ -109,5 +109,5 @@ class Budgets:
                 "calls_used": int(spent["calls"]), "call_budget": budget.calls,
                 "seconds_used": round(spent["seconds"], 2),
                 "enabled": budget.tokens > 0,
-                "headroom": max(0, budget.tokens - int(spent["tokens"]))}
+                "headroom": self.remaining(resource)}
         return out

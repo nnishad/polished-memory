@@ -88,6 +88,9 @@ class Prepared:
     parents: tuple[str, ...]
     receipt: str
     receipt_id: str
+    # Already-validated payloads, held here so the write happens in the commit's own
+    # transaction. Empty for a record that only names its attachments.
+    attachments: tuple[Any, ...] = ()
 
 
 def prepare_envelope(envelope: dict[str, Any]) -> Prepared:
@@ -125,9 +128,21 @@ def prepare_envelope(envelope: dict[str, Any]) -> Prepared:
         raise EvidenceError("parent_record_ids must be a list of at most 100 IDs")
     parents = tuple(_required_text(parent, "parent_record_id", 100) for parent in parents)
 
-    fingerprint = digest([occurred_at, kind, text, metadata])
+    # Validated before anything is written and before the bytes are named anywhere:
+    # an unbounded or untypable payload must not cost a caller a locked database.
+    from .blobs import split_attachments
+
+    held, references = split_attachments(envelope.get("attachments") or [])
+    # The attachments are part of what a revision *is*. Left out of the fingerprint,
+    # replaying one revision with different bytes would be acknowledged as a duplicate
+    # and the new file silently dropped.
+    fingerprint = digest([occurred_at, kind, text, metadata, references])
     primary_key = make_record_id(source, source_id, revision)
     receipt = {k: v for k, v in envelope.items() if k != "_contract"}
+    if "attachments" in receipt:
+        # The receipt is a plain JSON row and is shown to people and models: it
+        # carries what was attached, never the attachment.
+        receipt["attachments"] = references
     return Prepared(
         id=primary_key, source=source, source_id=source_id, revision=revision,
         occurred_at=occurred_at, occurred_precision=precision, observed_at=observed_at,
@@ -136,6 +151,7 @@ def prepare_envelope(envelope: dict[str, Any]) -> Prepared:
         fingerprint=fingerprint, parents=parents,
         receipt=json.dumps(receipt, ensure_ascii=False),
         receipt_id=digest([primary_key, fingerprint]),
+        attachments=tuple(held),
     )
 
 
@@ -299,22 +315,6 @@ class EvidenceStore:
         ).fetchall()
         return [Evidence.from_row(row) for row in rows]
 
-    def parents(self, record_pk: str) -> list[str]:
-        return [
-            row[0]
-            for row in self.db.execute(
-                "SELECT parent_id FROM record_dependencies WHERE child_id=?", (record_pk,)
-            )
-        ]
-
-    def dependents(self, record_pk: str) -> list[str]:
-        return [
-            row[0]
-            for row in self.db.execute(
-                "SELECT child_id FROM record_dependencies WHERE parent_id=?", (record_pk,)
-            )
-        ]
-
     # -- writes --------------------------------------------------------------
 
     def commit(self, envelope: dict[str, Any], *, fence: Any = None) -> dict[str, Any]:
@@ -339,6 +339,19 @@ class EvidenceStore:
             self.db.execute("ROLLBACK")
             raise
 
+    def _attach(self, db: sqlite3.Connection, record_pk: str, prepared: Prepared) -> None:
+        """Store the payloads this envelope brought, in the commit's own transaction.
+
+        One transaction is the whole point: a record that names a file the database
+        does not have is a lie either way round, and a crash between the two leaves
+        neither.
+        """
+        if not prepared.attachments:
+            return
+        from .blobs import BlobStore
+
+        BlobStore(self).attach_staged(record_pk, list(prepared.attachments), db=db)
+
     def write_prepared(self, db: sqlite3.Connection, prepared: Prepared, *, generation: int = 0) -> tuple[str, bool]:
         """Write one prepared envelope. Requires an ambient transaction."""
         existing = db.execute(
@@ -351,6 +364,10 @@ class EvidenceStore:
                 "VALUES(?, ?, ?, ?)",
                 (prepared.receipt_id, existing["id"], prepared.observed_at, prepared.receipt),
             )
+            # Replayed, not ignored: the record was accepted, and a page that failed
+            # between this commit and its blob write gets its bytes back on the next
+            # read of the same revision rather than keeping a reference to nothing.
+            self._attach(db, existing["id"], prepared)
             return existing["id"], True
         if existing:
             raise EvidenceError(
@@ -401,6 +418,7 @@ class EvidenceStore:
             self._audit("evidence_supersede", replaced, {"actor": prepared.source,
                                                           "replacement": prepared.id})
             journal(db, replaced, "supersede", source=prepared.source, generation=generation)
+        self._attach(db, prepared.id, prepared)
         self._audit("evidence_commit", prepared.id, {"source": prepared.source})
         journal(db, prepared.id, "add", source=prepared.source, generation=generation)
         return prepared.id, False
@@ -450,68 +468,6 @@ class EvidenceStore:
             self.db.execute("ROLLBACK")
             raise
 
-    def show(self, record_pk: str, *, reason: str, actor: str) -> None:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            row = self.db.execute("SELECT * FROM records WHERE id=?", (record_pk,)).fetchone()
-            if row is None or row["deleted"]:
-                raise EvidenceError(f"unknown or forgotten record {record_pk!r}")
-            self.db.execute("DELETE FROM record_visibility WHERE record_id=?", (record_pk,))
-            self.db.execute("DELETE FROM record_fts WHERE id=?", (record_pk,))
-            self.db.execute("INSERT INTO record_fts(id, text) VALUES(?, ?)", (record_pk, row["text"]))
-            self._audit("evidence_show", record_pk, {"actor": actor, "reason": reason})
-            journal(self.db, record_pk, "show")
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-
-    def project(self, record_pk: str, revision: str, *, backend: str, bank_id: str, document_id: str) -> None:
-        """Record that a canonical revision has a derived backend document.
-
-        The mapping is explicit rather than derived by string parsing, and the
-        backend document ID is underscore-free so chunk IDs stay reversible.
-        """
-        _required_text(backend, "backend", 100)
-        _required_text(bank_id, "bank_id", 500)
-        _required_text(document_id, "document_id", 200)
-        if "_" in document_id or "~" in document_id:
-            raise EvidenceError(
-                "backend document_id must not contain '_' or '~': Hindsight's chunk-id "
-                "escaping makes such ids ambiguous"
-            )
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            if not self.db.execute("SELECT 1 FROM records WHERE id=?", (record_pk,)).fetchone():
-                raise EvidenceError(f"unknown record {record_pk!r}")
-            epoch = self.epoch()
-            self.db.execute(
-                """
-                INSERT INTO backend_documents(record_id, revision, backend, bank_id, document_id,
-                                              desired_epoch, state)
-                VALUES(?,?,?,?,?,?, 'pending')
-                ON CONFLICT(record_id, revision, backend, bank_id) DO UPDATE SET
-                    desired_epoch=excluded.desired_epoch, state='pending',
-                    operation_id=NULL, confirmed_at=NULL, error=NULL
-                """,
-                (record_pk, revision, backend, bank_id, document_id, epoch),
-            )
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-
-    def pending_projections(self, *, backend: str, bank_id: str, limit: int = 50) -> list[sqlite3.Row]:
-        limit = _bounded_limit(limit, maximum=500)
-        return self.db.execute(
-            """
-            SELECT * FROM backend_documents
-            WHERE backend=? AND bank_id=? AND state IN ('pending', 'retry')
-            ORDER BY desired_epoch, record_id LIMIT ?
-            """,
-            (backend, bank_id, limit),
-        ).fetchall()
-
     def set_control(self, scope: str, stage: str, state: str, *, actor: str, reason: str, policy_version: str) -> None:
         """Persist an operator pause/resume with its authority and reason."""
         if state not in {"active", "paused"}:
@@ -534,6 +490,16 @@ class EvidenceStore:
             "SELECT state FROM runtime_controls WHERE scope=? AND stage=?", (scope, stage)
         ).fetchone()
         return bool(row and row[0] == "paused")
+    def control(self, scope: str, stage: str) -> dict[str, Any] | None:
+        """Who wrote the current state of one stage down, and why.
+
+        A hold that cannot be attributed is a hold nobody can be asked about, so both
+        ledgers answer this the same way.
+        """
+        row = self.db.execute(
+            "SELECT state, actor, reason, policy_version, changed_at FROM runtime_controls "
+            "WHERE scope=? AND stage=?", (scope, stage)).fetchone()
+        return dict(row) if row else None
 
     def _audit(self, action: str, object_id: str, metadata: dict[str, Any]) -> None:
         # Never log raw evidence bodies; ids and fingerprints are enough to diagnose.

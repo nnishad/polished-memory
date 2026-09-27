@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import shlex
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse
@@ -35,6 +36,30 @@ DEFAULT_BANK = "hermes"
 # refused at startup rather than discovered on the first slow turn.
 HOST_PREFETCH_STOP_S = 8.0
 DEFAULT_FOREGROUND_DEADLINE_S = 4.0
+# How often the runtime process takes a background pass. A day is the ceiling because a
+# slower loop is not a loop; zero is the owner saying "I will run it myself".
+# An evaluation is a claim about a version. Without one to compare against, a passed run
+# could never be found stale, which is the hole C11 exists to close.
+DEFAULT_EVALUATOR_TIMEOUT_S = 120.0
+DEFAULT_MAINTENANCE_INTERVAL_S = 900
+MAX_MAINTENANCE_INTERVAL_S = 86_400
+
+
+def _maintenance_interval(value: str | None) -> int:
+    """The scheduler's own period, or zero for "nothing runs by itself here"."""
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise SettingError(
+            "HERMES_MEMORY_MAINTENANCE_INTERVAL_S must be a whole number of seconds, "
+            f"got {value!r}"
+        ) from None
+    if not 0 <= seconds <= MAX_MAINTENANCE_INTERVAL_S:
+        raise SettingError(
+            f"HERMES_MEMORY_MAINTENANCE_INTERVAL_S={value} is outside the admissible range "
+            f"(0 to {MAX_MAINTENANCE_INTERVAL_S}); 0 means the pass never runs unattended"
+        )
+    return seconds
 
 
 def _deadline(value: str | None) -> float:
@@ -170,6 +195,19 @@ class Settings:
     # destination. Nothing else can authorise it, and no default is "on".
     delivery_enabled: bool = False
     delivery_target: str | None = None
+    # The runtime unit owns the background pass, per §4: proactive state and scheduling
+    # live in the framework process, not in a fourth unit. Zero hands the timer back to
+    # the owner, who then runs `hermes-memory maintain` from wherever they choose.
+    maintenance_interval_s: int = DEFAULT_MAINTENANCE_INTERVAL_S
+    # The program that is allowed to decide whether a lesson's fixtures passed. Named by
+    # the owner, run with no shell and a scrubbed environment. Unset means procedural
+    # learning can be proposed, contradicted and retracted but never promoted by a run.
+    evaluator_command: tuple[str, ...] = ()
+    evaluator_timeout_s: float = DEFAULT_EVALUATOR_TIMEOUT_S
+    # Environment names the evaluator is additionally allowed to see. The scrubbed set is
+    # fixed; this is the owner's short list, read from the owned file like every other knob
+    # rather than from whatever the invoking shell happened to export.
+    evaluator_env: tuple[str, ...] = ()
 
     @property
     def capture_only(self) -> bool:
@@ -233,6 +271,8 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         )
 
     foreground = _deadline(get("FOREGROUND_DEADLINE_S", str(DEFAULT_FOREGROUND_DEADLINE_S)))
+    interval = _maintenance_interval(get("MAINTENANCE_INTERVAL_S",
+                                         str(DEFAULT_MAINTENANCE_INTERVAL_S)))
     delivery_target = (get("DELIVERY_TARGET") or "").strip() or None
     delivery_enabled = flag("DELIVERY_ENABLED")
     if delivery_enabled and not delivery_target:
@@ -267,6 +307,10 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         gate_token=(get("GATE_TOKEN") or "").strip() or None,
         delivery_enabled=delivery_enabled,
         delivery_target=delivery_target,
+        maintenance_interval_s=interval,
+        evaluator_command=_command(get, "EVALUATOR_COMMAND"),
+        evaluator_timeout_s=_seconds(get, "EVALUATOR_TIMEOUT_S", DEFAULT_EVALUATOR_TIMEOUT_S),
+        evaluator_env=_names(get, "EVALUATOR_ENV"),
     )
 
 
@@ -327,6 +371,51 @@ def _route(get, allowed: frozenset[str], key: str, *, default_resource: str):
             f"not {resource!r}: slots are per device, not per endpoint")
     return ModelRoute(base_url=base_url, resource=resource,
                       model=(get(f"{key}_MODEL") or "").strip() or None)
+
+
+def _command(get, key: str) -> tuple[str, ...]:
+    """The evaluator program, split into argv. A shell is never involved."""
+    raw = (get(key) or "").strip()
+    if not raw:
+        return ()
+    try:
+        parts = shlex.split(raw)
+    except ValueError as error:
+        raise SettingError(f"{key} cannot be parsed: {error}") from None
+    if not parts or not str(parts[0]).startswith("/"):
+        raise SettingError(
+            f"{key} must name an absolute path: an evaluation runs whatever it names, and "
+            "a bare word resolves from whichever directory PATH happens to offer")
+    return tuple(parts)
+
+
+def _names(get, key: str) -> tuple[str, ...]:
+    """A comma-separated list of environment names, validated at load time.
+
+    Checked here rather than where they are used: an entry that is not a variable name can
+    never be allowed through, and finding that out mid-evaluation wastes a run.
+    """
+    raw = (get(key) or "").strip()
+    if not raw:
+        return ()
+    items = [item.strip() for item in raw.split(",")]
+    for item in items:
+        if not item.isidentifier():
+            raise SettingError(f"{key} must list environment names, not {item!r}")
+    return tuple(dict.fromkeys(items))
+
+
+def _seconds(get, key: str, default: float) -> float:
+    raw = (get(key) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SettingError(f"{key} must be a number of seconds") from None
+    if not 1 <= value <= 3600:
+        raise SettingError(f"{key} must be between 1 and 3600 seconds")
+    return value
 
 
 def _cap(get, key: str) -> int:

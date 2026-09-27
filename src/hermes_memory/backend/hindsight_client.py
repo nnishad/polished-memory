@@ -235,6 +235,45 @@ class HindsightClient:
                                        capability="recall"), "recall")
         return RecallOutcome.from_body(body)
 
+    def reflect(self, query: str, *, max_tokens: int = 2048, budget: str = "low",
+                tags: list[str] | None = None,
+                fact_types: list[str] | None = None) -> dict[str, Any]:
+        """Ask the backend to synthesize an answer, and take its sourcing report with it.
+
+        ``include.facts`` is asked for always. A synthesized paragraph whose supporting
+        memories are not named is a claim with no way back to evidence, which is the one
+        thing a summary is not allowed to be.
+        """
+        self.capabilities.require("reflect")
+        if not isinstance(query, str) or not query.strip():
+            raise HindsightError("a reflection needs a question; reflecting over nothing "
+                                 "produces prose about nothing")
+        if len(query) > 4000:
+            raise HindsightError("reflect query is too long; narrow the scope instead of "
+                                 "over-asking")
+        if not isinstance(max_tokens, int) or not 1 <= max_tokens <= 8192:
+            raise HindsightError("max_tokens must be between 1 and 8192")
+        payload: dict[str, Any] = {"query": query.strip(), "budget": budget,
+                                   "max_tokens": int(max_tokens),
+                                   "include": {"facts": {}}}
+        if tags:
+            payload["tags"] = list(tags)
+        if fact_types:
+            payload["fact_types"] = list(fact_types)
+        body = self._unwrap(self._call("POST", self._path_for("reflect"), payload,
+                                       capability="reflect"), "reflect")
+        answer = str(body.get("text") or body.get("answer") or "").strip()
+        based_on = body.get("based_on") or {}
+        memories = list(based_on.get("memories") or [])
+        usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+        return {"text": answer, "facts": memories,
+                "mental_models": list(based_on.get("mental_models") or []),
+                "directives": list(based_on.get("directives") or []),
+                "cited_memories": len(memories),
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "truncated": bool(body.get("truncated"))}
+
     def operation(self, operation_id: str) -> dict[str, Any]:
         self.capabilities.require("get_operation")
         result = self._call("GET", self._path_for("get_operation", operation_id=operation_id),
@@ -280,11 +319,9 @@ class HindsightClient:
         return self._capabilities
 
     def _path_for(self, capability_name: str, **extra: str) -> str:
-        cap = next((item for item in CAPABILITIES if item.name == capability_name), None)
-        if cap is None:
-            raise UnsupportedCapability(f"no such capability {capability_name!r}")
-        values = {"bank_id": self.bank_id, **extra}
-        return cap.path.format(**values)
+        # One formatter only. Deriving the path here as well as in the capability table
+        # would let a request be built for a route the negotiated backend does not serve.
+        return self.capabilities.endpoint(capability_name, bank_id=self.bank_id, **extra)
 
     def _call(self, method: str, path: str, payload: dict | None, *,
               capability: str | None) -> TransportResult:

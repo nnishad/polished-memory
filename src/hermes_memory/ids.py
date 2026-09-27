@@ -1,8 +1,8 @@
 """ID and timestamp helpers.
 
-``digest`` is byte-for-byte compatible with the retired framework so that
-canonical record IDs computed from the same (source, source_id, revision)
-triple continue to resolve across a migration.
+``digest`` is the one derivation every identifier in the system comes from, so a
+record id, a citation, a review digest and an operation id are all reproducible
+from their inputs and none of them depends on a process-local hash.
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-__all__ = ["digest", "content_digest", "now", "record_id", "backend_document_id",
-           "timestamp", "intervals_overlap", "interval_contains"]
+__all__ = ["digest", "content_digest", "now", "record_id", "record_pk",
+           "backend_document_id", "timestamp", "intervals_overlap", "interval_contains"]
 
 _INVALID_BACKEND_CHARS = re.compile(r"[~_]")
 
@@ -61,10 +61,21 @@ def interval_contains(start: str | None, end: str | None, at: str) -> bool:
 def record_id(source: str, source_id: str, revision: str) -> str:
     """Stable canonical record ID: rec_<32 hex>.
 
-    Canonical IDs intentionally keep the legacy underscore prefix; only
-    backend document IDs are underscore-free (see backend_document_id).
+    The underscore stays because it is what every stored id, citation and tombstone
+    in this schema carries. Only backend document IDs avoid the character, because
+    Hindsight's own chunk parser cannot reversible-split it (see backend_document_id).
     """
     return "rec_" + digest([source, source_id, revision])[:32]
+
+
+def record_pk(citation: str) -> str:
+    """The record a citation names, ignoring the revision or span it was quoted at.
+
+    A citation is written `rec_…@revision#char` and read as often as it is written,
+    so the one place that decides what the record is has to be here rather than in
+    each reader's string handling.
+    """
+    return str(citation).split("@", 1)[0].split("#", 1)[0]
 
 
 def backend_document_id(record: str, revision: str) -> str:

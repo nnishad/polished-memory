@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from ..ids import timestamp
 from ..storage.evidence import EvidenceError
@@ -76,12 +76,23 @@ class Page:
 class SourceAdapter:
     """Base contract every adapter implements.
 
-    Fetching and committing stay separate: an adapter normalises bytes into
-    envelopes and never opens a store, a lease or a network transaction itself.
+    Fetching and committing stay separate: an adapter turns bytes into envelopes and
+    never opens a store, a lease or a network transaction itself.
+
+    There is deliberately no ``normalize(raw)`` callback on this contract. Normalization
+    is shared code — ``normalize_text``, ``normalize_time``, ``redact_secrets`` — that an
+    adapter calls from wherever its own format actually arrives, rather than a hook the
+    framework could claim to have run while every adapter quietly did its shaping inside
+    ``read_page`` anyway.
     """
 
     source: str = ""
     capabilities: Capabilities = Capabilities()
+    # What this reader can be asked to keep. Most sources state one thing per record and
+    # have no choice to make; a reader of sample fixtures can either keep every row or
+    # collapse them into one described series, and only the operator gets to decide which
+    # question they will still be able to ask next year.
+    granularities: tuple[str, ...] = ()
 
     def check(self) -> dict[str, Any]:
         """Cheap reachability and permission probe. Never reads content."""
@@ -89,9 +100,6 @@ class SourceAdapter:
 
     def read_page(self, cursor: str | None) -> Page:
         """Return one bounded page. ``next_cursor`` None means the end."""
-        raise NotImplementedError
-
-    def normalize(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
     def envelope(self, **values: Any) -> dict[str, Any]:

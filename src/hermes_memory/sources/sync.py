@@ -456,13 +456,6 @@ class SyncController:
             [*arguments, limit]).fetchall()
         return [dict(row) for row in rows]
 
-    def journal_tail(self, seq: int) -> dict[str, Any]:
-        row = self.db.execute(
-            "SELECT source, record_id, change, epoch, committed_at FROM change_journal "
-            "WHERE seq=(SELECT MAX(seq) FROM change_journal WHERE seq<=?)", (seq,)
-        ).fetchone()
-        return dict(row) if row else {}
-
     # -- pause semantics -----------------------------------------------------
 
     def pause(self, source: str, *, actor: str, reason: str, policy_version: str,
@@ -479,6 +472,17 @@ class SyncController:
     def pause_capture(self, source: str, *, actor: str, reason: str, policy_version: str) -> list[str]:
         """The explicitly named ingestion stop, separate from a normal pause."""
         return self._set_stages(source, "paused", actor=actor, reason=reason,
+                                policy_version=policy_version, stages=("capture",))
+
+    def resume_capture(self, source: str, *, actor: str, reason: str,
+                       policy_version: str) -> list[str]:
+        """Lift the ingestion stop and nothing else.
+
+        A source held from capture usually still has its downstream stages paused, and
+        resuming all three because somebody typed ``--resume`` would speak on evidence
+        whose reading was never the thing being restarted.
+        """
+        return self._set_stages(source, "active", actor=actor, reason=reason,
                                 policy_version=policy_version, stages=("capture",))
 
     def _set_stages(self, source, state, *, actor, reason, policy_version, stages) -> list[str]:

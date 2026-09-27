@@ -19,11 +19,26 @@ from typing import Any, Sequence
 from ..ids import timestamp
 from ..storage.evidence import EvidenceError
 
-__all__ = ["ProactiveEngine", "Sweep"]
+__all__ = ["ProactiveEngine", "Sweep", "DEFERRALS", "DEFERRED", "AWAITING"]
 
 # An intention in this state was handed over but never decided: the process that
 # owned it died between the two writes.
 AWAITING = "awaiting_analysis"
+
+# Refusals that mean *not now* rather than *not at all*. A suppression is durable: it
+# closes the event, stamps it decided and removes it from the queue for good. That is the
+# right answer for a topic the owner opted out of and a wrong one for an installation that
+# has not gone live yet — shadow mode is the default state, so a timer pass that suppressed
+# on it would consume every reminder a person ever asked for before anyone could turn the
+# delivery on. The same goes for an operator pause, a spent budget and a snooze, all three
+# of which end by themselves.
+# A promise whose condition has not been reached, or cannot be checked, is a *not now* in the
+# same family as a snooze: the event stays due and the next pass asks again. A condition that
+# was checked and failed is not in this list — that is a durable no, and reminding about it
+# every fifteen minutes is the failure mode the predicate exists to prevent.
+DEFERRALS = ("shadow", "paused", "budget", "snooze", "condition")
+# The outcome state for one of those: the promise stands and the next pass looks again.
+DEFERRED = "deferred"
 
 
 @dataclass(frozen=True)
@@ -33,6 +48,7 @@ class Sweep:
     suppressed: int = 0
     analysed: int = 0
     refused: int = 0
+    deferred: int = 0
     expired: int = 0
     recovered: int = 0
     notes: Sequence[str] = ()
@@ -40,8 +56,9 @@ class Sweep:
     def as_dict(self) -> dict[str, Any]:
         return {"decided": self.decided, "prepared": self.prepared,
                 "suppressed": self.suppressed, "analysed": self.analysed,
-                "refused": self.refused, "expired": self.expired,
-                "recovered": self.recovered, "notes": list(self.notes)[:12]}
+                "refused": self.refused, "deferred": self.deferred,
+                "expired": self.expired, "recovered": self.recovered,
+                "notes": list(self.notes)[:12]}
 
 
 class ProactiveEngine:
@@ -71,39 +88,61 @@ class ProactiveEngine:
         recovered = self.outbox.recover(at=None if moment is None else _epoch(moment))
         finished = self._finish_awaiting(moment=moment, topic_for=topic_for,
                                          limit=limit, notes=notes)
-        fresh = self._take_due(moment=moment, limit=limit, topic_for=topic_for,
-                               notes=notes)
+        fresh, held_over = self._take_due(moment=moment, limit=limit, topic_for=topic_for,
+                                          notes=notes)
         outcomes = [self._one(goal_id, revision, event_id, intent_id, moment, topic_for,
                               notes)
                     for goal_id, revision, event_id, intent_id in finished + fresh]
+        deferred = held_over + sum(1 for item in outcomes if item["state"] == DEFERRED)
         return Sweep(decided=sum(1 for item in outcomes if item["decided"]),
                      prepared=sum(1 for item in outcomes if item["prepared"]),
                      suppressed=sum(1 for item in outcomes if item["state"] == "suppressed"),
                      analysed=sum(1 for item in outcomes if item["analysed"]),
-                     refused=sum(1 for item in outcomes if not item["decided"]),
+                     refused=sum(1 for item in outcomes
+                                 if not item["decided"] and item["state"] != DEFERRED),
+                     deferred=deferred,
                      expired=len(expired), recovered=len(recovered),
                      notes=tuple(notes)).as_dict()
 
     # -- the pass ------------------------------------------------------------
 
-    def _take_due(self, *, moment, limit: int, topic_for, notes: list[str]) -> list[tuple]:
+    def _take_due(self, *, moment, limit: int, topic_for,
+                  notes: list[str]) -> tuple[list[tuple], int]:
+        """Claim what is due, handing over only what could be decided now.
+
+        Returns the handed-off intentions and the count of events put back untouched.
+        """
         found: list[tuple] = []
         if moment is None:
             notes.append("no instant was given, so nothing is due yet as far as this pass "
                          "is concerned")
-            return found
+            return found, 0
+        held_over = 0
         for event in self.events.due(moment, limit=limit):
             claim = self.events.claim(event.id, holder=self.holder, lease_s=self.lease_s)
             if claim is None:
                 notes.append(f"{event.id} was taken by another worker")
                 continue
             topic = (topic_for(event.as_dict()) if topic_for else None) or "general"
+            # Asked while the claim can still be given back, because this is the last
+            # moment a *not now* costs nothing. A suppression closes an event for good, so
+            # a pass that ran on a timer while the installation was still in shadow mode
+            # would have destroyed the reminders it was meant to deliver.
+            early = self.eligibility.for_event(goal_id=event.goal_id, revision=event.revision,
+                                               topic=topic, intent_id=None, at=moment)
+            if not early.eligible and early.stage in DEFERRALS:
+                self.events.release(event_id=event.id, token=claim.token,
+                                    reason=f"{early.stage}: {early.reason}")
+                held_over += 1
+                notes.append(f"{event.id}: still due, not decided — {early.stage}: "
+                             f"{early.reason}")
+                continue
             # Hand off first. From here the event cannot be re-claimed, so a crash
             # leaves an unfinished intention rather than a second reminder.
             handed = self.events.ack(event_id=event.id, token=claim.token,
                                     decision=AWAITING, policy_version=self.policy_version())
             found.append((event.goal_id, event.revision, event.id, handed["intent"]))
-        return found
+        return found, held_over
 
     def _finish_awaiting(self, *, moment, topic_for, limit: int,
                          notes: list[str]) -> list[tuple]:
@@ -132,6 +171,16 @@ class ProactiveEngine:
         verdict = self.eligibility.for_event(goal_id=goal_id, revision=revision,
                                             topic=topic, intent_id=intent_id, at=moment)
         if not verdict.eligible:
+            if verdict.stage in DEFERRALS:
+                # Left exactly as it was: an unfinished intention, an event that is still
+                # due. This branch is only reachable for an intention a previous pass
+                # handed over, since a fresh event is asked before it is taken. The wait
+                # has to be visible in the report rather than recorded as a decision
+                # nobody made.
+                outcome["state"] = DEFERRED
+                notes.append(f"{event_id}: promised and waiting, not refused — "
+                             f"{verdict.stage}: {verdict.reason}")
+                return outcome
             self.events.suppress(event_id, reason=f"eligibility: {verdict.reason}")
             outcome["state"] = "suppressed"
             notes.append(f"{event_id}: {verdict.stage}: {verdict.reason}")

@@ -16,10 +16,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..ids import now
+from ..ids import digest, now, record_pk
 from ..storage.evidence import EvidenceError
+from ..storage.identity import citations_in_scope
+from .evaluation import PASSED
+
+# How a decision on a lesson is attributed. A promotion names the program that scored the
+# run rather than a person, because no person decided it; the bound is enforced where the
+# attribution is written, so a name has to fit before it gets here.
+ACTOR_LIMIT = 120
 
 __all__ = ["Lesson", "LessonStore", "STATUSES", "APPLICABLE", "match"]
 
@@ -186,11 +194,14 @@ class LessonStore:
             raise EvidenceError(
                 f"{evaluation_id} is no longer a verdict about {lesson_id}@{version}: "
                 "the code, model, fixtures or the lesson itself have moved since it ran")
-        return self._set(lesson_id, int(version), "active",
-                         actor=f"evaluation:{evaluation.runner}",
+        runner = str(evaluation.runner or "")
+        actor = f"evaluation:{runner}"
+        if len(actor) > ACTOR_LIMIT:
+            # The run row keeps the whole path; an activation only has to name the program
+            # unambiguously, and a deep install directory is not part of its identity.
+            actor = f"evaluation:{Path(runner).name}:{digest([runner])[:12]}"
+        return self._set(lesson_id, int(version), "active", actor=actor,
                          reason=f"promoted by {evaluation_id}", evaluation_id=evaluation_id)
-        return {"id": f"{lesson_id}@{version}", "status": "active",
-                "by": f"evaluation:{evaluation.runner}"}
 
     def record_contradiction(self, *, lesson_id: str, version: int, note: str,
                             actor: str, evidence: Iterable[str] = ()) -> dict[str, Any]:
@@ -292,15 +303,26 @@ class LessonStore:
 
     def _still_supported(self, lesson: Lesson) -> tuple[bool, tuple[int, int, str]]:
         for span in lesson.evidence:
-            if not self.store.live_and_visible(_record_pk(span)):
+            if not self.store.live_and_visible(record_pk(span)):
                 return False, (0, 0, "evidence gone")
         tally = self.outcomes.tally("lesson", f"{lesson.id}@{lesson.version}")
         bad, reason = self._support_state(lesson, tally)
         if bad:
             return False, (tally["support"], tally["against"], reason)
-        if self.evaluations is not None and lesson.evaluation_id:
-            current = self.evaluations.is_current(str(lesson.evaluation_id), lesson)
-            if not current:
+        if lesson.evaluation_id:
+            # The verdict is read from the row, not from a caller's assurance: a run that
+            # was invalidated — by an upgrade, a retraction or a fixture that turned out to
+            # be wrong — stops licensing anything the moment it is marked, and that fact is
+            # in the archive rather than in whoever is asking.
+            verdict = self.db.execute("SELECT verdict FROM evaluations WHERE id=?",
+                                      (lesson.evaluation_id,)).fetchone()
+            if verdict is None or str(verdict["verdict"]) != PASSED:
+                return False, (tally["support"], tally["against"], "evaluation withdrawn")
+            if self.evaluations is not None and not self.evaluations.is_current(
+                    str(lesson.evaluation_id), lesson):
+                # The stricter question — is this verdict about *this* code, model and
+                # lesson text — can only be asked by a caller that knows which versions it
+                # is running. A status read does not, so it asks the one above and stops.
                 return False, (tally["support"], tally["against"], "evaluation stale")
         return True, (tally["support"], tally["against"], "")
 
@@ -330,20 +352,17 @@ class LessonStore:
                 raise EvidenceError(
                     f"{span} is a derived artifact; a lesson is learned from evidence, "
                     "not from this system's own summary of it")
-            if not self.store.live_and_visible(_record_pk(span)):
+            if not self.store.live_and_visible(record_pk(span)):
                 raise EvidenceError(f"{span} is not live evidence this store can read")
 
     def _visible_to(self, lesson: Lesson, account_id: str) -> bool:
-        if self.identities is None:
+        """Practice drawn from someone's records is not portable to another person.
+
+        """
+        if self.identities is None or not lesson.evidence:
             return True
-        if not lesson.evidence:
-            return True
-        from ..storage.identity import evidence_accounts
-        allowed = set(self.identities.group(account_id, "accounts") or [])
-        spans = [span for span in lesson.evidence
-                 if self.store.live_and_visible(_record_pk(span))]
-        return bool(spans) and all(item in allowed
-                                   for item in evidence_accounts(self.identities, spans))
+        return citations_in_scope(self.store, self.identities, lesson.evidence,
+                                  identifiers=set(self.identities.group(account_id)))
 
     def _current(self, lesson_id: str) -> int | None:
         row = self.db.execute("SELECT max(version) FROM lessons WHERE id=?",
@@ -358,7 +377,7 @@ class LessonStore:
                 "UPDATE lessons SET status=?, decided_by=?, decided_at=?, retraction_reason=?"
                 + (", evaluation_id=?" if evaluation_id else "") +
                 " WHERE id=? AND version=?",
-                (status, _text(actor, "actor", 120), now(),
+                (status, _text(actor, "actor", ACTOR_LIMIT), now(),
                  _text(reason, "reason", 400),
                  *(([evaluation_id] if evaluation_id else [])), lesson_id, int(version)))
             if not int(cursor.rowcount or 0):
@@ -474,10 +493,6 @@ def _check_citation(value: Any) -> str:
         raise EvidenceError(f"{value!r} is not a citation; a lesson names the record it "
                             "came from, not a feeling about it")
     return span
-
-
-def _record_pk(span: str) -> str:
-    return str(span).split("@", 1)[0].split("#", 1)[0]
 
 
 def _json(value: Any, default):

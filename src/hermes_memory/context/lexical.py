@@ -32,10 +32,6 @@ class LexicalOutcome:
     detail: str = ""
     dropped_terms: int = 0
 
-    @property
-    def available(self) -> bool:
-        return self.state == AVAILABLE
-
 
 def fts_expression(query: str) -> str:
     """Turn free text into a safe FTS5 conjunction of quoted terms, or '' if unmatchable."""

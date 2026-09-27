@@ -81,12 +81,28 @@ class EvaluationLedger:
         self.model_version = _text(model_version, "model_version", 80)
         self._tokens: dict[str, str] = {}
 
+    @classmethod
+    def reading(cls, store, *, owner_principal: str | None = None) -> "EvaluationLedger":
+        """A ledger that can read every verdict and start none.
+
+        Reports and housekeeping need to ask what a run said; only an authorized runner
+        may say what a case scored. The distinction lives in this object rather than in
+        whoever remembers to pass ``runner=None``.
+        """
+        return cls(store, runner=None, code_version="reading", model_version="reading",
+                   owner_principal=owner_principal)
+
     # -- the protocol --------------------------------------------------------
 
     def begin(self, *, lesson_id: str, version: int, cases: Sequence[Mapping[str, Any]],
               baseline: Mapping[str, Any] | None = None,
               runner: str | None = None) -> dict[str, Any]:
         """Declare the exact suite that will be run. This is what fixes its identity."""
+        if self.runner is None:
+            raise EvidenceError(
+                "this ledger can read evaluations and cannot start one: no runner is "
+                "authorized here, and a promotion has to rest on a run somebody else "
+                "agreed to pay for")
         declared = _check_cases(cases)
         lesson = self._lesson(lesson_id, version)
         if str(lesson["status"]) != "candidate":
@@ -239,18 +255,33 @@ class EvaluationLedger:
         # shape, so a different lesson or a different version cannot collide here.
         return digest(_lesson_shape(lesson)) == evaluation.lesson_digest
 
-    def invalidate(self, evaluation_id: str, *, reason: str) -> dict[str, Any]:
-        """Mark a run as no longer licensing anything, without deleting what happened."""
-        self.db.execute("BEGIN IMMEDIATE")
+    def invalidate(self, evaluation_id: str, *, reason: str,
+                   db=None) -> dict[str, Any]:
+        """Mark a run as no longer licensing anything, without deleting what happened.
+
+        ``db`` lets an erasure stale the verdict in the same transaction as the tombstones,
+        so there is no moment in which forgotten evidence still has a passed run behind a
+        lesson that cites it.
+        """
+        _text(reason, "reason", 400)
+        connection = db or self.db
+        if db is not None and not db.in_transaction:
+            raise EvidenceError("an invalidation writes need an ambient transaction")
+        owns_transaction = db is None
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("UPDATE evaluations SET verdict='stale', detail=?, "
-                            "finished_at=COALESCE(finished_at, ?) WHERE id=? AND "
-                            "verdict='passed'", (_clip(reason, 400), now(), evaluation_id))
+            connection.execute(
+                "UPDATE evaluations SET verdict='stale', detail=?, "
+                "finished_at=COALESCE(finished_at, ?) WHERE id=? AND "
+                "verdict='passed'", (_clip(reason, 400), now(), evaluation_id))
             self.store._audit("evaluation_invalidate", evaluation_id,
                               {"reason": reason[:200]})
-            self.db.execute("COMMIT")
+            if owns_transaction:
+                connection.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            if owns_transaction:
+                connection.execute("ROLLBACK")
             raise
         return {"id": evaluation_id, "verdict": self.get(evaluation_id).verdict}
 

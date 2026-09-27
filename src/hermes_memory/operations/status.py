@@ -112,6 +112,7 @@ class StatusReporter:
             erasure = self.erasure_backlog()
             waiting = self.pending_confirmations()
             queue = self.queue_age()
+            background = self.background_pass()
             epoch = self.store.epoch()
         states = {stage.name: stage.state for stage in stages}
         return {
@@ -125,7 +126,9 @@ class StatusReporter:
             "erasure_backlog": erasure,
             "awaiting_owner": waiting,
             "queue": queue,
-            "notes": _notes(stages, erasure=erasure, waiting=waiting, queue=queue),
+            "background_pass": background,
+            "notes": _notes(stages, erasure=erasure, waiting=waiting, queue=queue,
+                            background=background),
         }
 
     def stage(self, name: str) -> StageReport:
@@ -223,7 +226,8 @@ class StatusReporter:
         # decision over hardware every profile shares, and it lives in the instance
         # admission ledger. Nothing can be formed while it stands, whatever the
         # connector-level fences and the queue say.
-        held = bool(self.gate is not None and self.gate.paused)
+        hold = self.gate.hold() if self.gate is not None else None
+        held = bool(hold and hold["state"] == "paused")
         stuck = {state: int(queue.get(state, 0)) for state in STUCK_JOBS
                  if queue.get(state)}
         # Two different things a queue can say. ``running`` means a lease has a name on
@@ -241,7 +245,7 @@ class StatusReporter:
                   f"{counts.get('candidate', 0)} candidate assertion(s); "
                   f"queue {_flatten(queue)}")
         if held:
-            detail += ", and the owner is holding inference for this installation"
+            detail += _hold_note(hold, "inference")
         elif waiting:
             detail += ("; only `hermes-memory form` works this queue — nothing drains it "
                        "by itself")
@@ -249,6 +253,8 @@ class StatusReporter:
             "observations", state, detail,
             {"assertions": dict(counts), "queue": dict(queue), "stuck": stuck,
              "paused_sources": sorted(paused), "instance_hold": held,
+             "instance_hold_by": (hold or {}).get("actor"),
+             "instance_hold_reason": (hold or {}).get("reason"),
              "formation_unattended": False, "draining": running,
              "journal": self._journal()})
 
@@ -345,9 +351,8 @@ class StatusReporter:
             "AND expires_at <= ?".format(",".join("?" * len(IN_FLIGHT))),
             [*IN_FLIGHT, now()]).fetchone()[0])
         paused = self._pauses("proactivity")
-        held = self.db.execute(
-            "SELECT 1 FROM runtime_controls WHERE scope='global' AND stage='delivery' "
-            "AND state='paused'").fetchone()
+        hold = self.store.control("global", "delivery")
+        held = bool(hold and hold["state"] == "paused")
         # An artifact past its own expiry is not "in flight": it is a transport that
         # stopped coming, and the report says so rather than counting it as busy work.
         state = (DEGRADED if unproven or overdue else
@@ -357,10 +362,10 @@ class StatusReporter:
             "delivery", state,
             f"{in_flight} artifact(s) waiting on the transport, {unproven} without a "
             f"delivery proof, {counts.get('confirmed', 0)} confirmed"
-            + (", and the owner is holding delivery for this installation" if held else ""),
+            + (_hold_note(hold, "delivery") if held else ""),
             {"by_state": dict(counts), "in_flight": in_flight, "unproven": unproven,
              "past_expiry": overdue, "paused_sources": sorted(paused),
-             "instance_hold": bool(held),
+             "instance_hold": held, "instance_hold_by": (hold or {}).get("actor"),
              "owner_principal": getattr(self.settings, "owner_principal", None)})
 
     def backend(self) -> StageReport:
@@ -400,7 +405,7 @@ class StatusReporter:
                                {"occupancy": {}, "held": [], "uncertain": 0,
                                 "waiting": 0, "blocked": [], "usage": None,
                                 "operations": {"by_state": {}, "unattributed": 0,
-                                               "unresolved": 0}})
+                                               "unresolved": 0, "cancellations_owed": 0}})
         held = self.gate.held()
         occupancy = {resource: dict(states)
                      for resource, states in self.gate.occupancy().items()}
@@ -414,7 +419,8 @@ class StatusReporter:
         operations = OperationLedger(self.gate.store).report()
         # A pause on a gate nobody has used yet is still somebody's decision, so it is
         # reported before the "never reserved" case rather than hidden behind it.
-        state = (DEGRADED if uncertain or operations["unattributed"] else
+        owed = int(operations.get("cancellations_owed", 0))
+        state = (DEGRADED if uncertain or operations["unattributed"] or owed else
                  PAUSED if self.gate.paused else
                  OPERATIONAL if taken or self.gate.ever_used() else UNCONFIGURED)
         return StageReport(
@@ -422,7 +428,11 @@ class StatusReporter:
             f"{taken} slot(s) occupied, {waiting} waiting"
             + (f", {uncertain} unresolved reservation(s)" if uncertain else "")
             + (f", {operations['unresolved']} backend operation(s) unaccounted"
-               if operations["unresolved"] or operations["unattributed"] else ""),
+               if operations["unresolved"] or operations["unattributed"] else "")
+            # An asked-for stop with no answer is not a detail about the past: the operation
+            # may still be spending a slot, and `hermes-memory cancel --list` is the queue
+            # that says which ones.
+            + (f", {owed} cancellation(s) asked for with no answer" if owed else ""),
             {"occupancy": occupancy,
              "held": [{"resource": row["resource"], "route": row["route"],
                        "holder": row["holder"], "priority": int(row["priority"]),
@@ -451,6 +461,13 @@ class StatusReporter:
 
     def pending_confirmations(self) -> dict[str, Any]:
         """Decisions that are only ever the owner's to make, and are still waiting."""
+        from ..learning.lessons import LessonStore
+        from ..learning.outcomes import OutcomeLog
+
+        lessons = LessonStore(self.store,
+                              outcomes=OutcomeLog(self.store, owner_principal=getattr(
+                                  self.settings, "owner_principal", None)),
+                              owner_principal=getattr(self.settings, "owner_principal", None))
         return {
             "identity_candidates": int(self.db.execute(
                 "SELECT count(*) FROM identity_candidates WHERE state='pending'"
@@ -460,6 +477,30 @@ class StatusReporter:
             "erasure_intents": int(self.db.execute(
                 "SELECT count(*) FROM erasure_ledger WHERE state='awaiting_confirmation'"
             ).fetchone()[0]),
+            # A habit the system proposes is not a rule until a person says so, and a rule
+            # that stopped holding up is withdrawn by the same kind of act. Retrieval
+            # already stops teaching either one; this is the half that says so out loud.
+            "lesson_candidates": int(self.db.execute(
+                "SELECT count(*) FROM lessons WHERE status='candidate'").fetchone()[0]),
+            "lessons_for_review": len(lessons.needs_review()),
+            "lessons_awaiting_promotion": [
+                {"id": f"{row['id']}@{row['version']}", "proposed_by": row["created_by"],
+                 "proposed_kind": row["created_kind"], "proposed_at": row["created_at"]}
+                for row in self.db.execute(
+                    "SELECT id, version, created_by, created_kind, created_at FROM lessons "
+                    "WHERE status='candidate' ORDER BY created_at, id LIMIT 8").fetchall()],
+            # A reminder an agent proposed schedules nothing until the owner adopts it, so
+            # the waiting list is the only place its existence is visible. Counted, not
+            # quoted: the title is the owner's business and `goal --list` reads it.
+            "goal_candidates": int(self.db.execute(
+                "SELECT count(*) FROM goals WHERE status='candidate'").fetchone()[0]),
+            "goals_awaiting_adoption": [
+                {"goal": row["id"], "proposed_by": row["created_by"],
+                 "proposed_kind": row["created_kind"], "proposed_at": row["created_at"],
+                 "wants_a_due_time": row["due_at"] is not None}
+                for row in self.db.execute(
+                    "SELECT id, created_by, created_kind, created_at, due_at FROM goals "
+                    "WHERE status='candidate' ORDER BY created_at, id LIMIT 8").fetchall()],
         }
 
     def unsupported_artifacts(self) -> dict[str, Any]:
@@ -499,6 +540,41 @@ class StatusReporter:
         limit = self.stale_queue_minutes * 60
         return {"oldest_seconds": None if age is None else round(age, 1),
                 "stale": age is not None and age > limit, "limit_seconds": limit}
+
+    def background_pass(self) -> dict[str, Any]:
+        """The zero-inference pass: whether it is scheduled, and when it last said so.
+
+        The scheduler is a thread in another process, so the only evidence available to a
+        reading is the heartbeat the pass itself recorded. Absence is reported as absence
+        rather than as health: three days of due reminders and no heartbeat is the failure
+        this line exists to make visible, and it looks exactly like a healthy report
+        without it.
+        """
+        from ..processing.maintenance import Maintenance
+
+        last = Maintenance.last_pass(self.store)
+        interval = int(getattr(self.settings, "maintenance_interval_s", 0) or 0)
+        waiting = int(self.db.execute(
+            "SELECT count(*) AS n FROM due_events WHERE state='pending' AND fire_at<=?",
+            (now(),)).fetchone()["n"])
+        age = None if last is None else _age_from_text(last["created_at"])
+        # Three periods: one missed pass is a restart, two is a busy machine, three is a
+        # loop that is not running.
+        behind = age is not None and interval and age > interval * 3
+        never = last is None and interval > 0
+        return {"scheduled": interval > 0, "interval_seconds": interval,
+                "last_pass_at": None if last is None else last["created_at"],
+                "seconds_since_last_pass": None if age is None else round(age, 1),
+                "last_report": None if last is None else {
+                    key: value for key, value in last.items() if key != "created_at"},
+                "waiting": waiting, "behind": bool(behind or never),
+                "note": ("nothing is scheduled to run by itself; `hermes-memory maintain` "
+                         "is the pass, and the owner decides when" if interval <= 0 else
+                         "no pass has been recorded since this installation started"
+                         if never else
+                         "the last pass is older than three periods, so the runtime unit's "
+                         "scheduler is not running" if behind else
+                         "the background pass is running on schedule")}
 
     # -- primitives ----------------------------------------------------------
 
@@ -598,6 +674,19 @@ def _any(counts: dict[str, int], states: Sequence[str]) -> bool:
     return any(counts.get(state) for state in states)
 
 
+def _hold_note(hold: dict[str, Any] | None, stage: str) -> str:
+    """Name whoever is holding a stage, rather than saying that something is.
+
+    Both holds are owner decisions by construction — no other credential can write
+    them — but the reading that says "the owner" without saying which one, or why, is
+    the one an operator cannot act on.
+    """
+    if not hold:
+        return f", and the owner is holding {stage} for this installation"
+    return (f", and the owner is holding {stage} for this installation"
+            f" ({hold['actor']}: {hold['reason']})")
+
+
 def _flatten(counts: dict[str, int]) -> str:
     if not counts:
         return "nothing queued"
@@ -618,7 +707,8 @@ def _overall(states: dict[str, str]) -> str:
 
 
 def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
-           waiting: dict[str, Any], queue: dict[str, Any]) -> list[str]:
+           waiting: dict[str, Any], queue: dict[str, Any],
+           background: dict[str, Any] | None = None) -> list[str]:
     """What an operator would ask next, from the stages that already answered."""
     notes = [f"{stage.name}: {stage.detail}" for stage in stages if stage.state == DEGRADED]
     if queue.get("stale"):
@@ -630,8 +720,17 @@ def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
     if waiting["identity_candidates"]:
         notes.append(f"identity: {waiting['identity_candidates']} candidate(s) awaiting the "
                      "owner; no agent may confirm them")
+    if waiting.get("lessons_for_review"):
+        notes.append(f"learning: {waiting['lessons_for_review']} lesson(s) the archive no "
+                     "longer stands behind are still marked active; they are taught to "
+                     "nothing, and only the owner can withdraw or re-promote them")
+    if waiting.get("goal_candidates"):
+        notes.append(f"prospective: {waiting['goal_candidates']} reminder(s) an agent "
+                     "proposed are waiting to be adopted; they schedule nothing until the "
+                     "owner says so with `hermes-memory goal --activate`")
     deciding = (waiting["identity_candidates"] + waiting["candidate_assertions"]
-                + waiting["erasure_intents"])
+                + waiting["erasure_intents"] + waiting["lesson_candidates"]
+                + waiting["lessons_for_review"] + waiting["goal_candidates"])
     if deciding:
         # Named as a command, because a count with no door behind it is how a queue of
         # decisions ends up waited on by nobody.
@@ -641,4 +740,9 @@ def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
     if delivery is not None and delivery.evidence.get("in_flight"):
         notes.append("delivery: the framework prepared artifacts that the host transport "
                      "has not claimed")
+    if background is not None and background.get("behind") and background.get("waiting"):
+        # Only said when something is actually waiting: a loop that has never run on an
+        # installation with nothing due is not a problem an operator has to fix tonight.
+        notes.append(f"background: {background['waiting']} reminder(s) are due and the pass "
+                     f"that takes them has not been recorded — {background['note']}")
     return notes

@@ -1,0 +1,215 @@
+{
+  "generated_for": "hermes-memory 0.1.0 (the build the tests and harness were run against)",
+  "python": {
+    "requires": ">=3.11",
+    "tested_with": "3.12.13"
+  },
+  "runtime_dependencies": [],
+  "runtime_statement": "The memory core depends on the standard library alone: sqlite3, json, hashlib, hmac, threading, subprocess-free HTTP through urllib, and nothing else. No cloud SDK, no model client and no embedding library is importable at runtime, which is what makes 'inference only on endpoints this installation named' a structural fact rather than a policy somebody has to remember.",
+  "optional_extras": {
+    "hindsight": [
+      "hindsight-client (async client used by the optional bridge only)"
+    ],
+    "dev": [
+      "pytest (the suite; also used by the synthetic harness)"
+    ]
+  },
+  "packages_in_lock": [
+    {
+      "name": "aiohappyeyeballs",
+      "version": "2.7.1",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "PSF-2.0"
+    },
+    {
+      "name": "aiohttp",
+      "version": "3.14.3",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Apache-2.0 AND MIT"
+    },
+    {
+      "name": "aiohttp-retry",
+      "version": "2.9.1",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "not inspected in this build"
+    },
+    {
+      "name": "aiosignal",
+      "version": "1.4.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Apache 2.0"
+    },
+    {
+      "name": "annotated-types",
+      "version": "0.8.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "attrs",
+      "version": "26.1.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "colorama",
+      "version": "0.4.6",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "not inspected in this build"
+    },
+    {
+      "name": "frozenlist",
+      "version": "1.8.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "hermes-memory",
+      "version": "0.1.0",
+      "source": "editable = \".\"",
+      "summary": "",
+      "license": "not inspected in this build"
+    },
+    {
+      "name": "hindsight-client",
+      "version": "0.10.1",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "not inspected in this build"
+    },
+    {
+      "name": "idna",
+      "version": "3.20",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "iniconfig",
+      "version": "2.3.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "multidict",
+      "version": "6.9.1",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "not inspected in this build"
+    },
+    {
+      "name": "packaging",
+      "version": "26.3",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Apache-2.0 OR BSD-2-Clause"
+    },
+    {
+      "name": "pluggy",
+      "version": "1.6.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "propcache",
+      "version": "0.5.4",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "pydantic",
+      "version": "2.13.5",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "pydantic-core",
+      "version": "2.46.5",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "pygments",
+      "version": "2.21.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "BSD-2-Clause"
+    },
+    {
+      "name": "pytest",
+      "version": "9.1.1",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "python-dateutil",
+      "version": "2.9.0.post0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Dual License"
+    },
+    {
+      "name": "six",
+      "version": "1.17.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "PSF-2.0"
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.4",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "urllib3",
+      "version": "2.8.0",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "MIT"
+    },
+    {
+      "name": "yarl",
+      "version": "1.25.1",
+      "source": "registry = \"https://pypi.org/simple\"",
+      "summary": "",
+      "license": "Apache-2.0"
+    }
+  ],
+  "license_source": "read from the metadata of the exact versions uv resolved into uv.lock (installed distributions where this build has them, otherwise the unpacked cache); no network was used and nothing was installed",
+  "own_package": {
+    "name": "hermes-memory",
+    "version": "0.1.0",
+    "source": "editable = \".\"",
+    "summary": "",
+    "license": "not inspected in this build"
+  },
+  "model_downloads": {
+    "performed_by_this_framework": false,
+    "note": "Nothing here downloads a package or a model as part of a health check. Model servers are addressed by configuration (HERMES_MEMORY_TEXT_BASE_URL and companions) and must resolve to an approved loopback or LAN host; what is installed and what it costs to run is the operator's, shown by `hermes-memory setup --plan` before anything is written.",
+    "report_command": "hermes-memory setup --plan"
+  },
+  "how_to_regenerate": "uv run python /path/to/inventory.py"
+}

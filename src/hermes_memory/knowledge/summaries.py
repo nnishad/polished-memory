@@ -157,22 +157,35 @@ class SummaryStore:
         return {"id": summary_id, "published": True, "revision": revision,
                 "verdict": self.verdict(summary_id)}
 
-    def withdraw(self, summary_id: str, *, actor: str, reason: str) -> dict[str, Any]:
-        """Take a summary out of circulation. Its evidence and its history stay."""
+    def withdraw(self, summary_id: str, *, actor: str, reason: str,
+                 db=None) -> dict[str, Any]:
+        """Take a summary out of circulation. Its evidence and its history stay.
+
+        ``db`` lets an erasure withdraw the summaries it invalidated inside the same
+        transaction as the tombstones, so there is no window in which forgotten
+        evidence still has a published reading of it on file.
+        """
         if self.owner_principal is None or actor != self.owner_principal:
             raise EvidenceError(f"only the owner may withdraw a summary, not {actor!r}")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
             raise EvidenceError("reason must be nonempty text of at most 1000 characters")
-        self.db.execute("BEGIN IMMEDIATE")
+        connection = db or self.db
+        if db is not None and not db.in_transaction:
+            raise EvidenceError("withdraw writes need an ambient transaction")
+        owns_transaction = db is None
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         try:
-            cursor = self.db.execute(
+            cursor = connection.execute(
                 "UPDATE summaries SET status='withdrawn', withdrawn_at=? WHERE id=? "
                 "AND status='published'", (now(), summary_id))
             self.store._audit("summary_withdraw", summary_id,
                               {"actor": actor, "reason": reason[:200]})
-            self.db.execute("COMMIT")
+            if owns_transaction:
+                connection.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            if owns_transaction:
+                connection.execute("ROLLBACK")
             raise
         return {"id": summary_id, "withdrawn": int(cursor.rowcount or 0) > 0}
 
@@ -202,10 +215,15 @@ class SummaryStore:
                     "reason": "withdrawn"}
         provenance = self.ledger.resolve(summary_id, account_id=account_id)
         if provenance.verdict == INVALID:
+            # Withheld synthesis hands back the canonical evidence instead, bounded by the
+            # ledger rather than by whatever the reading happened to cite: the counts are
+            # reported beside the ids so a short list is never read as the whole story.
+            shown = self.ledger.safe_evidence(summary.id, account_id=account_id)
             return {"id": summary.id, "found": True, "available": False, "body": None,
                     "verdict": provenance.verdict, "problems": list(provenance.problems),
                     "reason": "its evidence is no longer complete",
-                    "evidence": [item.id for item in provenance.evidence]}
+                    "evidence": [item.id for item in shown],
+                    "evidence_shown": len(shown), "evidence_cited": provenance.cited}
         return {"id": summary.id, "found": True, "available": True,
                 **summary.as_dict(), "verdict": provenance.verdict,
                 "usable_for_decision": provenance.usable_for_decision,
@@ -289,23 +307,36 @@ class SummaryStore:
 
     # -- refresh bookkeeping -------------------------------------------------
 
-    def request_refresh(self, scope: str, *, kind: str, through_at: str) -> dict[str, Any]:
-        """Queue one refresh for a scope up to a point. Repeated requests coalesce."""
+    def request_refresh(self, scope: str, *, kind: str, through_at: str,
+                        db=None) -> dict[str, Any]:
+        """Queue one refresh for a scope up to a point. Repeated requests coalesce.
+
+        An erasure books one for every summary it withdraws, so the debt is recorded
+        where the reading was: the scope is not merely un-summarized, it is owed.
+        """
         _checked_scope(scope)
         if kind not in KINDS:
             raise EvidenceError(f"unknown summary kind {kind!r}; admissible are {KINDS}")
         moment = timestamp(through_at)
-        self.db.execute("BEGIN IMMEDIATE")
+        connection = db or self.db
+        if db is not None and not db.in_transaction:
+            raise EvidenceError("a refresh request writes need an ambient transaction")
+        owns_transaction = db is None
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute(
+            cursor = connection.execute(
                 "INSERT INTO summary_refreshes(scope, kind, through_at, requested_at, state) "
                 "VALUES(?,?,?,?, 'pending') ON CONFLICT(scope, kind, through_at) DO NOTHING",
                 (scope, kind, moment, now()))
-            self.db.execute("COMMIT")
+            if owns_transaction:
+                connection.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            if owns_transaction:
+                connection.execute("ROLLBACK")
             raise
-        return {"scope": scope, "kind": kind, "through_at": moment}
+        return {"scope": scope, "kind": kind, "through_at": moment,
+                "booked": int(cursor.rowcount or 0) > 0}
 
     def pending_refreshes(self, *, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -315,22 +346,25 @@ class SummaryStore:
 
     def settle_refresh(self, *, scope: str, kind: str, through_at: str, ok: bool,
                        detail: str = "") -> dict[str, Any]:
+        """Answer every promise this reading covers, not just the one with a matching key.
+
+        A refresh is booked *through* a moment, and a summary whose window reaches that
+        moment has answered it. Matching on the exact timestamp instead would leave a
+        promise booked by one pass outstanding forever because the pass that did the work
+        measured the window a second differently.
+        """
+        moment = timestamp(through_at)
         self.db.execute("BEGIN IMMEDIATE")
         try:
             cursor = self.db.execute(
                 "UPDATE summary_refreshes SET state=?, detail=? WHERE scope=? AND kind=? "
-                "AND through_at=? AND state='pending'",
-                ("done" if ok else "failed", detail[:200], scope, kind, timestamp(through_at)))
+                "AND state='pending' AND through_at<=?",
+                ("done" if ok else "failed", detail[:200], scope, kind, moment))
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
         return {"settled": int(cursor.rowcount or 0)}
-
-    def summarize(self) -> dict[str, Any]:
-        rows = self.db.execute("SELECT kind, status, count(*) AS n FROM summaries "
-                               "GROUP BY kind, status").fetchall()
-        return {f"{row['kind']}.{row['status']}": int(row["n"]) for row in rows}
 
     # -- internals -----------------------------------------------------------
 

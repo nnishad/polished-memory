@@ -35,6 +35,10 @@ CANCELLED = "cancelled"
 TERMINAL = frozenset({SUCCEEDED, CANCELLED, QUARANTINED})
 # States that hold an in-flight claim on a physical resource.
 _INFLIGHT = frozenset({LEASED, SUBMITTING, RUNNING, UNCERTAIN})
+# States a holder's lease is still worth something in: the row moves LEASED → SUBMITTING →
+# RUNNING under one claim, so the token and its expiry have to survive those changes. The
+# only thing that ends the claim is the work ending, or the expiry passing unnoticed.
+_HELD = frozenset({LEASED, SUBMITTING, RUNNING})
 
 
 @dataclass(frozen=True)
@@ -57,18 +61,25 @@ class Job:
     token_budget: int
     deadline: float | None
     last_error: str | None = None
+    # A lease is a holder's claim, and `lease_until` is its ticking promise to keep saying so.
+    # A reader has to be able to tell "running, and somebody answers for it" from "running,
+    # and the process that said so is gone" — the second is unreconciled work.
+    lease: str | None = None
+    lease_until: float | None = None
 
-    @property
-    def exhausted(self) -> bool:
-        return self.attempts >= self.max_attempts
 
-    @property
-    def overdue(self) -> bool:
-        return self.deadline is not None and self.deadline < time.time()
+# Whether a job is overdue is asked of the queue, not of the row: `claim` compares a deadline
+# against the queue's own (often injected) clock, and a property reading wall time would
+# disagree with it under a fake clock. The attempt ceiling lives in `retry()` for the same
+# reason — one place decides when work stops being retried.
 
 
 class JobQueue:
     """Durable dispatch work, one writer at a time per job via a lease."""
+
+    #: How long a renewal vouches for a job. A pass over one input is far shorter, so a
+    #: worker that is still writing has plenty of room to say so again.
+    DEFAULT_RENEWAL = 300.0
 
     def __init__(self, store, *, clock: Callable[[], float] = time.time):
         self.store = store
@@ -197,7 +208,13 @@ class JobQueue:
         self._transition(job.id, SUBMITTING, submission_id=submission_id,
                          operation_id=operation_id)
 
-    def mark_running(self, job: Job, *, operation_id: str) -> None:
+    def mark_running(self, job: Job, *, operation_id: str | None = None) -> None:
+        """The work is with the backend now.
+
+        ``operation_id`` is recorded only when the backend named one. A synchronous retain
+        answers with content and no operation identity, and inventing an id here would give
+        ``cancel --job`` a thing to ask a backend about that the backend never heard of.
+        """
         self._transition(job.id, RUNNING, operation_id=operation_id)
 
     def complete(self, job: Job, *, covered: list[str], tokens: int = 0,
@@ -281,14 +298,35 @@ class JobQueue:
             if row["state"] == SUCCEEDED:
                 raise EvidenceError("a succeeded job cannot be cancelled; retract its output")
             self.db.execute(
-                "UPDATE processing_jobs SET state=?, last_error=?, lease=NULL, updated_at=? "
-                "WHERE id=?",
+                "UPDATE processing_jobs SET state=?, last_error=?, lease=NULL, "
+                "lease_until=NULL, updated_at=? WHERE id=?",
                 (CANCELLED, f"{actor}: {reason}"[:500], now(), job_id))
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
         return CANCELLED
+
+    def reap_overdue(self, *, at: float | None = None, limit: int = 50) -> list[str]:
+        """Give an overdue job an ending instead of leaving it unclaimable and unseen.
+
+        ``claim()`` refuses work past its deadline, which is right: a result nobody wanted by
+        then is not a result. But the row then stops appearing as anything at all.
+        Quarantining it is the same decision written where a person and a report can find it.
+        Only work that never reached a backend is reaped — a job that is submitting, running
+        or uncertain has an outcome nobody knows yet, and that is a different list.
+        """
+        moment = self.clock() if at is None else float(at)
+        rows = self.db.execute(
+            "SELECT id FROM processing_jobs WHERE deadline IS NOT NULL AND deadline <= ? "
+            "AND state IN (?,?,?) ORDER BY deadline LIMIT ?",
+            (moment, QUEUED, LEASED, RETRY_WAIT, limit)).fetchall()
+        reaped = []
+        for row in rows:
+            self._transition(row["id"], QUARANTINED,
+                             error="deadline passed before a worker took it")
+            reaped.append(row["id"])
+        return reaped
 
     def ready_for_retry(self, *, limit: int = 50) -> list[Job]:
         rows = self.db.execute(
@@ -325,8 +363,8 @@ class JobQueue:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             cursor = self.db.execute(
-                "UPDATE processing_jobs SET state=?, last_error=?, lease=NULL, updated_at=? "
-                "WHERE epoch < ? AND state NOT IN (?,?)",
+                "UPDATE processing_jobs SET state=?, last_error=?, lease=NULL, "
+                "lease_until=NULL, updated_at=? WHERE epoch < ? AND state NOT IN (?,?)",
                 (QUARANTINED, f"epoch superseded (now {current})", now(), current,
                  SUCCEEDED, QUARANTINED))
             self.db.execute("COMMIT")
@@ -350,15 +388,16 @@ class JobQueue:
                 # A cancelled job that later reports success would resurrect work
                 # the operator explicitly stopped.
                 raise EvidenceError(f"job {job_id} is cancelled; refusing {state}")
+            keep = state in _HELD and not release_lease
             self.db.execute(
                 "UPDATE processing_jobs SET state=?, "
                 "submission_id=COALESCE(?, submission_id), "
                 "backend_operation_id=COALESCE(?, backend_operation_id), "
-                "tokens_used=tokens_used+?, lease=?, lease_until=?, last_error=?, updated_at=?, "
-                "completed_at=? WHERE id=?",
-                (state, submission_id, operation_id, tokens,
-                 None if release_lease or state == SUCCEEDED else row["state"],
-                 None, error, now(),
+                "tokens_used=tokens_used+?, "
+                "lease=CASE WHEN ? THEN lease ELSE NULL END, "
+                "lease_until=CASE WHEN ? THEN lease_until ELSE NULL END, "
+                "last_error=?, updated_at=?, completed_at=? WHERE id=?",
+                (state, submission_id, operation_id, tokens, keep, keep, error, now(),
                  now() if state == SUCCEEDED else None, job_id))
             # tokens_used on the row is bookkeeping for the job. The shared
             # budget_usage ledger is written by the gate, which is the physical
@@ -369,12 +408,43 @@ class JobQueue:
             raise
 
     def _reclaim_expired_leases(self, *, at: float | None = None) -> int:
-        """An expired lease becomes uncertain work, never a free retry."""
+        """An expired lease becomes uncertain work, never a free retry.
+
+        This covers a job that had already reached the backend, not only one that was
+        claimed and abandoned: a worker that dies between the request and the answer leaves a
+        row saying SUBMITTING or RUNNING, and the honest ending for that is uncertain work
+        somebody has to reconcile — not a requeue that sends the same private text twice.
+        """
         moment = self.clock() if at is None else float(at)
         return self.db.execute(
             "UPDATE processing_jobs SET state=?, last_error='lease expired', lease=NULL, "
-            "updated_at=? WHERE state=? AND lease_until < ?",
-            (UNCERTAIN, now(), LEASED, moment)).rowcount
+            "lease_until=NULL, updated_at=? WHERE state IN (?,?,?) AND lease_until IS NOT NULL "
+            "AND lease_until < ?",
+            (UNCERTAIN, now(), LEASED, SUBMITTING, RUNNING, moment)).rowcount
+
+    def renew(self, job: Job, *, ttl: float | None = None) -> bool:
+        """Say, while the work is still in flight, that this holder still holds it.
+
+        Refuses quietly when the row has moved on — released, re-claimed under another
+        lease, or finished. A dying worker's last write must not extend a lease somebody
+        else now owns.
+        """
+        window = self.DEFAULT_RENEWAL if ttl is None else ttl
+        if not 1 <= window <= 3600:
+            raise EvidenceError("ttl must be between 1 and 3600 seconds")
+        if not job.lease:
+            return False
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.db.execute(
+                "UPDATE processing_jobs SET lease_until=?, updated_at=? WHERE id=? AND lease=?"
+                " AND state IN (?,?,?)",
+                (self.clock() + window, now(), job.id, job.lease, LEASED, SUBMITTING, RUNNING))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return int(cursor.rowcount or 0) > 0
 
     def reconcile(self, *, at: float | None = None) -> dict[str, int]:
         """Startup pass over the queue, before any worker claims.
@@ -389,6 +459,11 @@ class JobQueue:
         expired = self._reclaim_expired_leases(at=at)
         if expired:
             report["lease_expired"] = expired
+        # A job whose deadline passed while the worker was down will never be claimed again,
+        # so it is closed here rather than left to look like a queue with nothing in it.
+        overdue = self.reap_overdue(at=at)
+        if overdue:
+            report["overdue"] = len(overdue)
         superseded = self.abandon_stale_epoch()
         if superseded:
             report["stale_epoch"] = superseded
@@ -414,4 +489,5 @@ def _job(row) -> Job:
                backend_operation_id=row["backend_operation_id"], attempts=row["attempts"],
                max_attempts=row["max_attempts"], tokens_used=row["tokens_used"],
                token_budget=row["token_budget"], deadline=row["deadline"],
-               last_error=row["last_error"])
+               last_error=row["last_error"], lease=row["lease"],
+               lease_until=row["lease_until"])

@@ -95,24 +95,31 @@ class DocumentMap:
     def confirm(self, record_id: str, revision: str) -> None:
         self._set(record_id, revision, VERIFIED, error=None)
 
-    def mark_absent(self, record_id: str, revision: str) -> None:
-        self._set(record_id, revision, ABSENT, error=None)
+    def mark_absent(self, record_id: str, revision: str, *, db=None) -> None:
+        """The backend says this document is gone, so stop counting it as coverage.
+
+        Pass *db* to write inside a transaction the caller already holds, which is how an
+        erasure verification and the mapping it settles become one atomic fact.
+        """
+        self._set(record_id, revision, ABSENT, error=None, db=db)
 
     def fail(self, record_id: str, revision: str, *, error: str) -> None:
         self._set(record_id, revision, FAILED, error=error[:500])
 
-    def record_submission(self, record_id: str, revision: str, submission_id: str) -> None:
-        self._set(record_id, revision, SUBMITTED, operation_id=submission_id)
-
     def _set(self, record_id: str, revision: str, state: str, *, error: str | None,
-             operation_id: str | None = None) -> None:
+             operation_id: str | None = None, db=None) -> None:
         # Confirming is a statement about the epoch that is current *now*. A row that
         # kept the epoch it was queued under would go on reporting superseded coverage
         # as though the reset before it had never happened.
         epoch = self.store.epoch() if state == VERIFIED else None
-        self.db.execute("BEGIN IMMEDIATE")
+        if db is not None and not db.in_transaction:
+            raise EvidenceError("a mapping written inside a transaction needs one open")
+        connection = db if db is not None else self.db
+        owns = db is None
+        if owns:
+            connection.execute("BEGIN IMMEDIATE")
         try:
-            cursor = self.db.execute(
+            cursor = connection.execute(
                 "UPDATE backend_documents SET state=?, error=?, "
                 "desired_epoch=COALESCE(?, desired_epoch), "
                 "operation_id=COALESCE(?, operation_id), confirmed_at=? "
@@ -122,9 +129,11 @@ class DocumentMap:
                  record_id, revision, self.backend, self.bank_id))
             if not cursor.rowcount:
                 raise EvidenceError(f"no mapping for {record_id}@{revision}")
-            self.db.execute("COMMIT")
+            if owns:
+                connection.execute("COMMIT")
         except BaseException:
-            self.db.execute("ROLLBACK")
+            if owns:
+                connection.execute("ROLLBACK")
             raise
 
     # -- reconciliation ------------------------------------------------------
@@ -145,11 +154,26 @@ class DocumentMap:
         have completed, failed, or never arrived, and only the backend knows.
         Guessing either way produces a store that disagrees with itself.
         """
-        settled = verified = still_pending = unknown = 0
+        settled = verified = still_pending = unknown = absent = 0
         for row in self.outstanding(limit=limit):
             submission = row["operation_id"]
             if not submission:
-                still_pending += 1
+                # No operation id means a synchronous retain whose answer never reached
+                # us. The document itself can still be asked about, and only the backend
+                # can say whether it is there.
+                answer = self._probe(client, row["document_id"])
+                state = str(answer.get("state") or "")
+                if state in {"present", "absent"}:
+                    settled += 1
+                    if state == "present":
+                        self.confirm(row["record_id"], row["revision"])
+                        verified += 1
+                    else:
+                        self.mark_absent(row["record_id"], row["revision"])
+                        absent += 1
+                else:
+                    unknown += 1
+                    self._note(row, answer.get("reason") or "the backend could not be asked")
                 continue
             try:
                 operation = client.operation(submission)
@@ -172,7 +196,34 @@ class DocumentMap:
             else:
                 still_pending += 1
         return {"settled": settled, "verified": verified, "pending": still_pending,
-                "unreachable": unknown}
+                "absent": absent, "unreachable": unknown}
+
+    def _probe(self, client, document_id: str) -> dict[str, Any]:
+        """What the backend says about one document, with the reason when it cannot say.
+
+        ``unknown`` and ``absent`` are deliberately different answers: the first leaves the
+        mapping outstanding, the second is a fact about the derived copy that has to be
+        recorded rather than retried forever.
+        """
+        if not hasattr(client, "document_state"):
+            return {"state": "unknown", "reason": "this backend answers no document probe"}
+        try:
+            answer = client.document_state(document_id)
+        except Exception as error:  # noqa: BLE001 - an unreachable backend is not an outcome
+            return {"state": "unknown", "reason": str(error)[:500]}
+        state = str(answer.get("state") or "")
+        if state not in {"present", "absent", "unknown"}:
+            return {"state": "unknown",
+                    "reason": f"an answer nobody recognises: {state[:80]}"}
+        return {"state": state, "reason": (str(answer.get("reason") or "")[:500] or None)}
+
+    def _note(self, row: dict[str, Any], reason: str) -> None:
+        """Record why a question went unanswered, without changing what is claimed."""
+        self.db.execute(
+            "UPDATE backend_documents SET error=? WHERE record_id=? AND revision=?"
+            " AND backend=? AND bank_id=?",
+            (str(reason)[:500], row["record_id"], row["revision"], self.backend,
+             self.bank_id))
 
     def as_dict(self) -> dict[str, Any]:
         rows = self.db.execute(

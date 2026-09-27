@@ -376,11 +376,6 @@ class GoalStore:
                                     if item["state"] == P.UNKNOWN]})
         return out
 
-    def summarize(self) -> dict[str, int]:
-        rows = self.db.execute("SELECT status, count(*) AS n FROM goals GROUP BY status") \
-            .fetchall()
-        return {row["status"]: int(row["n"]) for row in rows}
-
     # -- internals -----------------------------------------------------------
 
     def _schedule(self, goal_id, *, revision, instant, zone, precision,

@@ -58,6 +58,11 @@ TYPE_KEYS = ("operation_type", "type")
 
 TERMINAL = frozenset({"finished", "cancelled", "refused"})
 
+# One predicate, so the count a report gives and the list an operator works from cannot
+# quietly become two different questions. A cancellation still in this state was asked for
+# and never answered.
+CANCELLATION_OWED = "cancellation='requested'"
+
 
 class LauncherRefused(Exception):
     """The composition this launcher would perform is not safe to perform."""
@@ -192,17 +197,52 @@ class OperationLedger:
     # -- cancellation --------------------------------------------------------
 
     def request_cancellation(self, operation_id: str, *, actor: str) -> dict[str, Any]:
-        """Ask that an operation not start. Already-running work is never killed here."""
+        """Ask that an operation not start. Already-running work is never killed here.
+
+        A settled row keeps ``cancellation='none'`` rather than accruing an intent nothing
+        can ever answer, so the same :data:`TERMINAL` set that closes ``mark()`` closes the
+        request: an operator's list of owed cancellations cannot hold a question with no
+        possible answer.
+        """
         if not isinstance(actor, str) or not actor.strip():
             raise LauncherRefused("a cancellation has to be attributed")
-        if not self.get(operation_id):
+        current = self.get(operation_id)
+        if not current:
             raise LauncherRefused(f"no record of operation {operation_id!r}")
+        if current["state"] in TERMINAL:
+            return current
         self.db.execute("BEGIN IMMEDIATE")
         try:
             self.db.execute(
                 "UPDATE backend_operations SET cancellation='requested', updated_at=? "
-                "WHERE operation_id=? AND state NOT IN ('finished', 'cancelled')",
-                (now(), operation_id))
+                "WHERE operation_id=?", (now(), operation_id))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return self.get(operation_id)
+
+    def confirm_cancellation(self, operation_id: str) -> dict[str, Any]:
+        """Mark an asked-for stop as acknowledged by the backend, and only then.
+
+        ``cancellation`` is the durable statement of somebody's intent. Confirming one that
+        was never requested would invent an intent nobody wrote, so the transition is
+        one-way and refuses from ``none``; an already-confirmed row answers with itself.
+        """
+        current = self.get(operation_id)
+        if not current:
+            raise LauncherRefused(f"no record of operation {operation_id!r}")
+        if current["cancellation"] == "confirmed":
+            return current
+        if current["cancellation"] != "requested":
+            raise LauncherRefused(
+                f"operation {operation_id!r} was never asked to stop; refusing to confirm a "
+                "cancellation nobody requested")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute(
+                "UPDATE backend_operations SET cancellation='confirmed', updated_at=? "
+                "WHERE operation_id=?", (now(), operation_id))
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
@@ -210,6 +250,18 @@ class OperationLedger:
         return self.get(operation_id)
 
     # -- reporting -----------------------------------------------------------
+
+    def cancellation_owed(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Operations somebody asked to stop with no answer yet.
+
+        Durable on purpose: the intent survives the process that wrote it, so this is the
+        queue an operator works from after a restart rather than a memory of a request.
+        """
+        rows = self.db.execute(
+            "SELECT operation_id, kind, bank_id, resource, state, cancellation, updated_at "
+            "FROM backend_operations WHERE " + CANCELLATION_OWED +
+            " ORDER BY updated_at LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
 
     def unresolved(self, *, limit: int = 50) -> list[dict[str, Any]]:
         rows = self.db.execute(
@@ -236,12 +288,16 @@ class OperationLedger:
 
     def report(self) -> dict[str, Any]:
         if not self.present:
-            return {"ledger": "absent", "by_state": {}, "unattributed": 0, "unresolved": 0}
+            return {"ledger": "absent", "by_state": {}, "unattributed": 0, "unresolved": 0,
+                    "cancellations_owed": 0}
         rows = self.db.execute(
             "SELECT state, count(*) AS n FROM backend_operations GROUP BY state").fetchall()
         return {"ledger": "present", "by_state": {row[0]: int(row[1]) for row in rows},
                 "unattributed": self.unattributed(),
-                "unresolved": len(self.unresolved())}
+                "unresolved": len(self.unresolved()),
+                "cancellations_owed": int(self.db.execute(
+                    "SELECT count(*) FROM backend_operations WHERE "
+                    + CANCELLATION_OWED).fetchone()[0])}
 
 
 # -- the wrapped executor ----------------------------------------------------

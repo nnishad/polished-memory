@@ -23,7 +23,8 @@ from typing import Any, Iterable, Sequence
 from ..ids import digest, now
 from .evidence import EvidenceStore
 
-__all__ = ["BlobStore", "BlobError", "Attachment", "Staged", "MAX_ATTACHMENT_BYTES",
+__all__ = ["BlobStore", "BlobError", "Attachment", "Staged", "split_attachments",
+           "MAX_ATTACHMENT_BYTES",
            "MAX_ATTACHMENTS_PER_RECORD"]
 
 # An attachment is a document, not a disk image. Past this the source is either
@@ -142,12 +143,19 @@ class BlobStore:
         Idempotent per (record, position, content): replaying the same page of a
         source must not double-count a reference or fork a second attachment row.
         """
+        held, _ = split_attachments(payloads)
+        return self.attach_staged(record_pk, held, db=db)
+
+    def attach_staged(self, record_pk: str, staged: Sequence[Staged], *,
+                      db: sqlite3.Connection | None = None) -> list[Attachment]:
+        """Write already-validated payloads.
+
+        Separate from ``attach`` because an ingress that validates a whole page
+        before opening a lock must not have to validate it twice, and the bytes it
+        rejected are the reason nothing was written.
+        """
         if not isinstance(record_pk, str) or not record_pk.startswith("rec_"):
             raise BlobError(f"attachment target must be a canonical record id, got {record_pk!r}")
-        if len(payloads) > MAX_ATTACHMENTS_PER_RECORD:
-            raise BlobError(
-                f"{len(payloads)} attachments exceed the {MAX_ATTACHMENTS_PER_RECORD} per "
-                "record ceiling")
         connection = db or self.db
         _require_transaction(connection)
         # Read on the caller's connection: in a combined commit the record was
@@ -155,12 +163,7 @@ class BlobStore:
         if not connection.execute("SELECT 1 FROM records WHERE id=?",
                                   (record_pk,)).fetchone():
             raise BlobError(f"cannot attach to unknown record {record_pk!r}")
-        staged = [
-            stage_bytes(item.get("data"), filename=item.get("filename"),
-                        mime=item.get("mime"), position=item.get("position"))
-            for item in _as_mapping_list(payloads)
-        ]
-        return self._write(connection, record_pk, staged)
+        return self._write(connection, record_pk, list(staged))
 
     def _write(self, connection: sqlite3.Connection, record_pk: str,
                staged: Sequence[Staged]) -> list[Attachment]:
@@ -252,11 +255,17 @@ class BlobStore:
             raise BlobError(f"attachment {attachment_id!r} has the wrong length")
         return raw
 
-    def summarize(self, record_pk: str) -> dict[str, int]:
-        """Byte totals for a blast radius. Counts what exists, visible or not."""
+    def totals_for(self, record_pks: Sequence[str]) -> dict[str, int]:
+        """How much attachment material these records hold. Counts what exists, not what
+        is visible: a hidden record's bytes are still bytes somebody could recover, which
+        is exactly what a blast radius has to state before it is confirmed.
+        """
+        if not record_pks:
+            return {"files": 0, "bytes": 0}
+        placeholders = ",".join("?" * len(record_pks))
         row = self.db.execute(
-            "SELECT count(*) AS files, COALESCE(sum(size), 0) AS bytes FROM attachments "
-            "WHERE record_id=?", (record_pk,)).fetchone()
+            f"SELECT count(*) AS files, COALESCE(sum(size), 0) AS bytes FROM attachments "
+            f"WHERE record_id IN ({placeholders})", list(record_pks)).fetchone()
         return {"files": int(row["files"] or 0), "bytes": int(row["bytes"] or 0)}
 
     # -- destruction ---------------------------------------------------------
@@ -326,6 +335,36 @@ class BlobStore:
         chunks = self.db.execute("SELECT count(*) FROM blob_chunks").fetchone()[0]
         return {"contents_collected": collected, "contents": int(left),
                 "chunks": int(chunks)}
+
+
+def split_attachments(payloads: Sequence[dict[str, Any]]) -> tuple[list[Staged], list[dict]]:
+    """Separate the bytes to store from the references to keep.
+
+    An entry with ``data`` is an attachment; one without it is a source saying a file
+    exists that this store was not given. Both are recorded, but only the first has
+    bytes anywhere: a reference is what the record may claim, never an argument for
+    storing something nobody authorised. Validation happens here, before any lock, so
+    an oversized or untyped payload leaves no half-written record behind.
+    """
+    items = _as_mapping_list(payloads)
+    if len(items) > MAX_ATTACHMENTS_PER_RECORD:
+        raise BlobError(
+            f"{len(items)} attachments exceed the {MAX_ATTACHMENTS_PER_RECORD} per "
+            "record ceiling")
+    held: list[Staged] = []
+    references: list[dict] = []
+    for item in items:
+        body = {key: value for key, value in item.items() if key != "data"}
+        data = item.get("data")
+        if data is not None:
+            staged = stage_bytes(data, filename=item.get("filename"),
+                                 mime=item.get("mime"), position=item.get("position"))
+            held.append(staged)
+            body = {"filename": staged.filename, "mime": staged.mime, "size": staged.size,
+                    "sha256": staged.sha256,
+                    **({"position": staged.position} if staged.position is not None else {})}
+        references.append(body)
+    return held, references
 
 
 def _attachment_id(record_pk: str, position: int, sha256: str) -> str:

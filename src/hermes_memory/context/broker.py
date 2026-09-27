@@ -19,7 +19,8 @@ from dataclasses import replace
 from typing import Any, Callable, Iterable
 
 from ..ids import digest
-from ..storage.identity import IdentityStore, evidence_accounts
+from ..storage.identity import (citations_in_scope, evidence_accounts, IdentityStore,
+                           in_scope)
 from .cache import PacketCache
 from .lexical import AVAILABLE, LexicalChannel
 from .packet import (CONFLICTING, PARTIAL, SUPPORTED, UNKNOWN, Channels, EvidenceItem,
@@ -34,6 +35,13 @@ _ATTEMPTED_FAILED = {"unavailable", "timeout", "partial", "unreachable", "paused
 # Below this, a prefix of an answer carries more risk of misleading than any
 # chance of helping, so the budget is left unused instead.
 _MIN_PREFIX_TOKENS = 40
+# Readings of a scope, not a fourth retrieval channel: a few of them, each quoted at
+# arm's length, so a digest never occupies the room the evidence needs.
+_SUMMARY_SPAN = 600
+_MAX_SUMMARIES = 3
+# The metadata fields that name a scope a summary can be written about, in the same
+# grammar `hermes-memory summarize --scope` accepts.
+_SCOPE_FIELDS = ("project", "thread", "account")
 
 
 def _item(evidence, *, text: str | None = None, span_truncated: bool = False) -> EvidenceItem:
@@ -49,7 +57,8 @@ class ContextBroker:
     """Assemble a packet within a token ceiling and a wall-clock deadline."""
 
     def __init__(self, store: Any, *, client: Any = None, identity: IdentityStore | None = None,
-                 assertions: Any = None, budget_tokens: int = 1800,
+                 assertions: Any = None, summaries: Any = None,
+                 budget_tokens: int = 1800,
                  derived_timeout_s: float = 4.0,
                  cache: PacketCache | None | bool = True, account_id: str | None = None,
                  clock: Callable[[], float] = time.monotonic, estimator=None):
@@ -59,8 +68,15 @@ class ContextBroker:
             raise ValueError("derived_timeout_s must be between 0 and 30 seconds")
         self.store = store
         self.client = client
-        self.identity = identity
+        # Identity resolution needs only the store, so a broker built without an
+        # injected IdentityStore still cannot answer for a named account out of
+        # somebody else's evidence. An injected one (a profile's own, with its owner
+        # principal) is used as given.
+        self.identity = IdentityStore(store) if identity is None else identity
         self.assertions = assertions
+        # A SummaryStore, or None. Read-only here: the packet may quote a reading, and the
+        # broker never publishes, withdraws or refreshes one.
+        self.summaries = summaries
         self.budget_tokens = budget_tokens
         self.derived_timeout_s = float(derived_timeout_s)
         self.account_id = account_id
@@ -92,7 +108,8 @@ class ContextBroker:
         limit = limit if isinstance(limit, int) and 1 <= limit <= 50 else 8
         caller = self.account_id if account_id is None else account_id
         scope = self._scope(query, limit=limit, include_derived=include_derived,
-                            sources=sources, window=window, account_id=caller)
+                            sources=sources, window=window, account_id=caller,
+                            commitments=commitments, lessons=lessons)
         started = self.clock()
         if self.cache is not None:
             cached = self.cache.get(query, account_id=caller, scope=scope)
@@ -114,10 +131,16 @@ class ContextBroker:
 
         spent = 0
         items: list[EvidenceItem] = []
+        # A lesson is a conclusion drawn from someone's records, so it carries the same
+        # scoping as the records it names: teaching it across an identity boundary
+        # repeats that person's evidence in someone else's answer.
+        teachable, lessons_withheld = self._authorize_lessons(lessons, account_id=caller)
+        if lessons_withheld:
+            truncated.append("lessons")
         # Commitments and lessons are short and always worth their lines, so they
         # reserve first; a long evidence list must not crowd out a due obligation.
         kept_commitments, spent = self._bounded(commitments, spent, key="title", cap=4)
-        kept_lessons, spent = self._bounded(lessons, spent, key="text", cap=4)
+        kept_lessons, spent = self._bounded(teachable, spent, key="text", cap=4)
 
         # Typed claims are checked, attributable and short, so they go in before
         # the raw spans that would crowd them out.
@@ -141,6 +164,12 @@ class ContextBroker:
                 break
             spent += cost
             items.append(_item(evidence))
+
+        # Readings of the scopes this answer touched, taken after the evidence so a digest
+        # never crowds out the record it was written from.
+        readings, spent, dropped_readings, reading_note = self._summaries(considered, spent)
+        if dropped_readings:
+            truncated.append("summaries")
 
         facts: tuple[dict[str, Any], ...] = ()
         derived_state, derived_detail = "not_attempted", ""
@@ -168,9 +197,13 @@ class ContextBroker:
             # The packet still says what it found, but it cannot be reused.
             truncated.append("store_moved")
 
-        notes = [text for text in (outcome.detail, derived_detail, assertion_note) if text]
+        notes = [text for text in (outcome.detail, derived_detail, assertion_note,
+                                   reading_note) if text]
         if revoked:
             notes.append(f"{revoked} item(s) were forgotten or hidden during retrieval")
+        if lessons_withheld:
+            notes.append(f"{lessons_withheld} lesson(s) belong to evidence this caller "
+                         "is not joined to")
         if store_moved:
             notes.append("the archive changed during retrieval; this packet is not cached")
         channels = Channels(lexical=outcome.state, derived=derived_state,
@@ -178,6 +211,7 @@ class ContextBroker:
 
         packet = Packet(
             query=query, items=tuple(items), assertions=asserted, facts=facts,
+            summaries=readings,
             lessons=kept_lessons, commitments=kept_commitments,
             channels=channels,
             coverage=self._coverage(items=items, facts=facts, conflicts=conflicts,
@@ -252,19 +286,30 @@ class ContextBroker:
         acting on it as if it were true would expose one person's evidence in
         another's context. A record that claims no account at all is shared,
         because it is not account-scoped evidence; withholding unscoped notes
-        would empty the store without protecting anyone. Where an account is
-        named but identity is unavailable, scoped evidence is withheld rather
-        than guessed at.
+        would empty the store without protecting anyone. An account with no
+        confirmed join therefore sees exactly the evidence that names it, or
+        names nobody.
         """
-        if self.identity is None:
-            return list(matches), 0
         identifiers = set(self.identity.group(account_id)) if account_id else set()
-        allowed = []
-        for evidence in matches:
-            claims = evidence_accounts(self.identity, evidence)
-            if not claims or (identifiers and claims & identifiers):
-                allowed.append(evidence)
+        allowed = [evidence for evidence in matches
+                   if in_scope(evidence_accounts(self.identity, evidence), identifiers)]
         return allowed, len(matches) - len(allowed)
+
+    def _authorize_lessons(self, lessons, *, account_id):
+        """Which of this caller's practice it may be told, and what was dropped.
+
+        The rule is the evidence rule, applied one step back: every span a lesson
+        cites has to be a span this caller could be shown. A caller the installation
+        cannot identify therefore gets the practice derived from unscoped evidence
+        only, exactly as the evidence list itself does.
+        """
+        given = list(lessons or ())
+        identifiers = set(self.identity.group(account_id)) if account_id else set()
+        kept = [lesson for lesson in given
+                if citations_in_scope(self.store, self.identity,
+                                      (lesson or {}).get("evidence") or (),
+                                      identifiers=identifiers)]
+        return kept, len(given) - len(kept)
 
     def _coverage(self, *, items, facts, conflicts, channels, truncated):
         """How much of the question this packet answers — never how true it is."""
@@ -274,7 +319,8 @@ class ContextBroker:
                     or channels.derived in _ATTEMPTED_FAILED
                     or bool(set(truncated) & {"packet", "terms", "store_moved",
                                               "revoked_during_recall", "assertions",
-                                              "source_facts", "chunks", "results"}))
+                                              "source_facts", "chunks", "results",
+                                              "lessons", "summaries"}))
         if not items and not facts:
             # "Nothing here" and "we could not look" are different answers, and
             # only the first entitles the agent to say the archive is empty.
@@ -310,6 +356,54 @@ class ContextBroker:
                 values = " vs ".join(sorted({item.value for item in clash.assertions})[:3])
                 conflicts.append(f"{clash.subject} {clash.predicate} is disputed: {values}")
         return tuple(kept), tuple(dict.fromkeys(conflicts)), "", spent
+
+    def _summaries(self, considered, spent):
+        """The current reading of each scope this answer touches, if one is on file.
+
+        Scopes are read off the authorized evidence rather than guessed from the query's
+        wording, so a summary can only reach a caller who was already shown evidence in its
+        window. ``latest`` withholds a summary whose evidence fell away, and an unsupported
+        reading is absent here rather than replaced by the older one that still is on file.
+        """
+        if self.summaries is None or not considered:
+            return (), spent, 0, ""
+        dropped = 0
+        kept: list[dict[str, Any]] = []
+        for scope in self._scopes(considered):
+            try:
+                current = self.summaries.latest(scope)
+            except Exception as error:
+                # A section that could not be read is missing, not empty: the caller is
+                # told, and the readings that were already paid for stay in.
+                return tuple(kept), spent, dropped + 1, (
+                    f"summaries could not be read: {error}"[:160])
+            for summary in current[:1]:
+                text = summary.body[:_SUMMARY_SPAN]
+                cost = self.estimate(text) + 20
+                if spent + cost > self.budget_tokens:
+                    dropped += 1
+                    continue
+                spent += cost
+                kept.append({"id": summary.id, "scope": summary.scope, "kind": summary.kind,
+                             "title": summary.title, "revision": summary.revision,
+                             "window_from": summary.window_from, "window_to": summary.window_to,
+                             "stale": self.summaries.is_stale(summary), "body": text,
+                             "truncated": len(summary.body) > len(text)})
+        return tuple(kept), spent, dropped, ""
+
+    def _scopes(self, considered):
+        """Which readings this evidence belongs to, most specific first."""
+        named, sourced = [], []
+        for evidence in considered:
+            metadata = getattr(evidence, "metadata", None) or {}
+            for field in _SCOPE_FIELDS:
+                value = str(metadata.get(field) or "").strip()
+                if value and f"{field}:{value}" not in named:
+                    named.append(f"{field}:{value}")
+            source = f"source:{evidence.source}"
+            if evidence.source and source not in sourced:
+                sourced.append(source)
+        return (named + sourced)[:_MAX_SUMMARIES]
 
     def _conflicts(self, candidates):
         """Live accounts that declare incompatible values for the same attribute.
@@ -382,8 +476,33 @@ class ContextBroker:
                  f"sources={','.join(sorted(options['sources'] or ())) or '-'}",
                  f"window={options['window'] or '-'}",
                  f"account={options['account_id'] or '-'}",
-                 f"budget={self.budget_tokens}"]
+                 f"budget={self.budget_tokens}",
+                 # Whether readings are on changes the answer, so a packet warmed without
+                 # them is never handed to a caller that expects them.
+                 f"readings={int(self.summaries is not None)}",
+                 # The caller's own material changes the answer as much as a filter does:
+                 # a packet warmed for one task must not be handed to a different task that
+                 # earned different practice, and a due obligation is not interchangeable.
+                 f"lessons={_fingerprint(options.get('lessons'))}",
+                 f"commitments={_fingerprint(options.get('commitments'))}"]
         return tuple(parts)
+
+
+def _fingerprint(items: Iterable[Any] | None) -> str:
+    """A short digest of caller-supplied material, or "-" when there was none.
+
+    The identity of a lesson is its id and version, and of a commitment its title and due
+    time: enough to tell two different sets apart, short enough to be a cache key."""
+    found = sorted(_identity(item) for item in (items or ()))
+    return "-" if not found else digest(found)[:16]
+
+
+def _identity(item: Any) -> str:
+    if not isinstance(item, dict):
+        return str(item)[:120]
+    named = item.get("id") or item.get("lesson") or item.get("title") or item.get("text")
+    version = item.get("version")
+    return f"{str(named)[:100]}@{version}" if version is not None else str(named)[:120]
 
 
 def _usable(evidence, *, sources, window) -> bool:
@@ -409,5 +528,6 @@ def _with_id(packet: Packet) -> Packet:
     packet_id = "ctx_" + digest([packet.query, packet.epoch, packet.revision,
                                  [item.id for item in packet.items],
                                  [str(fact)[:80] for fact in packet.facts],
+                                 [str(item.get("id")) for item in packet.summaries],
                                  list(packet.conflicts), packet.coverage])[:24]
     return replace(packet, packet_id=packet_id)

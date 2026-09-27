@@ -19,10 +19,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path[:0] = [str(Path(__file__).resolve().parent / "cases"),
+                str(Path(__file__).resolve().parent / "fixtures")]
 
-import checks                      # noqa: E402 - the harness lives beside this file
-import corpus                      # noqa: E402
+import checks                      # noqa: E402 - the question set, beside this runner
+import corpus                      # noqa: E402 - the generator that answers to it
 
 # Order matters: the corpus is ingested once and later rows read the store the earlier ones
 # wrote, so a reorder is a different measurement rather than a faster one.
@@ -30,6 +31,7 @@ SUITE: list[Callable[[checks.Environment], list[dict[str, Any]]]] = [
     checks.check_corpus,
     checks.check_capture,
     checks.check_corrections,
+    checks.check_measurements,
     checks.check_retrieval,
     checks.check_retrieval_ablation,
     checks.check_latency,

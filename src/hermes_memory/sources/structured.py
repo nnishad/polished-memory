@@ -17,14 +17,14 @@ import csv
 import json
 import posixpath
 import re
-import statistics
 from pathlib import Path
 from typing import Any, Iterable
 
 from ..ids import now
+from ..storage.measurements import summarise
 from .base import Capabilities, Page, Skipped, SourceAdapter, normalize_time
 
-__all__ = ["StructuredSource", "summarise", "MEASUREMENT_KEYS"]
+__all__ = ["StructuredSource", "MEASUREMENT_KEYS"]
 
 MEASUREMENT_KEYS = ("value", "reading", "amount", "measurement")
 TIME_KEYS = ("time", "timestamp", "date", "at", "observed_at")
@@ -38,6 +38,7 @@ class StructuredSource(SourceAdapter):
     """``.csv`` / ``.jsonl`` / ``.json`` sample fixtures, one record per series."""
 
     source = "structured"
+    granularities = ("sample", "series")
     capabilities = Capabilities(history=True, live=False, deletion_events=False,
                                 revision_history=False, max_records_per_page=40,
                                 max_bytes_per_page=4_000_000)
@@ -221,38 +222,6 @@ class StructuredSource(SourceAdapter):
         return out
 
 
-def summarise(values: Iterable[float], *,
-              moments: Iterable[str | None] = ()) -> dict[str, Any]:
-    """Deterministic description of a sample series.
-
-    Every number here is reproducible from the same rows, which is the whole reason
-    the statistics are computed in code: a model's summary of a heart rate cannot be
-    checked against the heart rate.
-    """
-    numbers = [float(value) for value in values]
-    out: dict[str, Any] = {"count": len(numbers), "min": None, "max": None, "mean": None,
-                           "median": None, "stdev": None, "interval_seconds": None,
-                           "gaps": []}
-    if not numbers:
-        return out
-    out["min"], out["max"] = min(numbers), max(numbers)
-    out["mean"] = round(statistics.fmean(numbers), 6)
-    out["median"] = round(statistics.median(numbers), 6)
-    if len(numbers) > 1:
-        out["stdev"] = round(statistics.stdev(numbers), 6)
-    times = [value for value in moments if value]
-    if len(times) > 1:
-        steps = _steps(times)
-        out["interval_seconds"] = round(statistics.median(steps), 3)
-        expected = out["interval_seconds"] or 0
-        # A gap is a stretch where the device went quiet for more than twice its own
-        # cadence: that is a statement about the missing data, not a rounding error.
-        out["gaps"] = [{"after": times[index], "seconds": round(step, 3)}
-                       for index, step in enumerate(steps)
-                       if expected and step > expected * 2][:50]
-    return out
-
-
 def path_measure(key: str) -> str | None:
     stem = Path(key).stem.lower()
     return stem if re.fullmatch(r"[a-z0-9_+-]{1,60}", stem) else None
@@ -310,14 +279,6 @@ def _qualities(samples: list[dict[str, Any]]) -> dict[str, int]:
         quality = str(item["metadata"]["quality"])
         counts[quality] = counts.get(quality, 0) + 1
     return counts
-
-
-def _steps(times: list[str]) -> list[float]:
-    from datetime import datetime
-
-    parsed = [datetime.fromisoformat(value) for value in times]
-    return [abs((second - first).total_seconds()) for first, second in zip(parsed, parsed[1:])
-            if (second - first).total_seconds() >= 0]
 
 
 def _records(raw: str, path: Path) -> list[dict[str, Any]]:

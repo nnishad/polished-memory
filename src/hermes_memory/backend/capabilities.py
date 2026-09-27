@@ -97,9 +97,6 @@ class Capabilities:
                 f"pinned to {PINNED_VERSION} and will not send a request it cannot answer")
         return next(cap for cap in CAPABILITIES if cap.name == name)
 
-    def has(self, name: str) -> bool:
-        return name in self.supported
-
     def endpoint(self, name: str, **path_values: str) -> str:
         cap = self.require(name)
         try:

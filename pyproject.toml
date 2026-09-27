@@ -24,3 +24,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The suite is split into responsibility directories, so the shared fixtures at
+# tests/ stay importable from any of them.
+pythonpath = ["tests"]

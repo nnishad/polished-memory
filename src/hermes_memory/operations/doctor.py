@@ -80,9 +80,9 @@ class Doctor:
         backend is not something to attempt against a backend that is down.
         """
         checks = [self.layout, self.database, self.schema, self.configuration,
-                  self.coverage, self.queue, self.provenance, self.erasure,
-                  self.delivery, self.gate, self.credentials_in_records, self.leases,
-                  self.backend_ledger, self.release]
+                  self.coverage, self.queue, self.background, self.provenance, self.lineage,
+                  self.erasure, self.delivery, self.gate, self.credentials_in_records,
+                  self.leases, self.backend_ledger, self.release]
         with snapshot(self.db):
             findings = [check() for check in checks]
         if connectivity or synthetic:
@@ -235,6 +235,28 @@ class Doctor:
                        evidence={"queue": counts, "age": age,
                                  "state": observations.state})
 
+    def background(self) -> Finding:
+        """The zero-inference pass: is it scheduled, and is it actually running?
+
+        Separate from ``queue`` because the two fail differently. An empty job queue with
+        reminders going unswept is a loop that died, and a machine with nothing to do looks
+        the same from the queue alone.
+        """
+        report = self.status.background_pass()
+        if not report["scheduled"]:
+            return Finding("background", WARN,
+                           "nothing runs the background pass on its own, so due reminders "
+                           "wait for somebody to notice them",
+                           "start the runtime unit, or set "
+                           "HERMES_MEMORY_MAINTENANCE_INTERVAL_S to how often it should "
+                           "look; `hermes-memory maintain` is the pass itself", report)
+        if report["behind"] and report["waiting"]:
+            return Finding("background", WARN,
+                           f"{report['waiting']} reminder(s) are due and {report['note']}",
+                           "check the runtime unit is up, or run `hermes-memory maintain` "
+                           "once by hand", report)
+        return Finding("background", OK, report["note"], evidence=report)
+
     def provenance(self) -> Finding:
         summaries = self.status.summaries()
         unsupported = summaries.evidence.get("unsupported") or {}
@@ -246,6 +268,34 @@ class Doctor:
                            "not support", {"details": unsupported.get("details")})
         return Finding("provenance", _severity_for(summaries.state), summaries.detail,
                        evidence={"state": summaries.state})
+
+    def lineage(self) -> Finding:
+        """Edges that point at nothing, and evidence nothing can reach.
+
+        A dependency row whose parent record is absent entirely is a write that happened
+        outside the transaction that owns it — a restore that skipped a parent, or an erase
+        that took a row and left its edges. Both are the provenance gap §14 names, and both
+        are countable without opening a record, so no private text reaches a report on the way
+        to saying that something is missing.
+        """
+        from ..storage.lineage import Lineage
+
+        lineage = Lineage(self.store)
+        edges = lineage.dangling(limit=25)
+        orphans = lineage.orphans(limit=25)
+        if edges:
+            return Finding("lineage", FAIL,
+                           f"{len(edges)} lineage edge(s) cite a record that is not in this "
+                           "store",
+                           "`hermes-memory explain` the artifact each edge belongs to; a "
+                           "restore re-verifies them and an erasure should have taken the "
+                           "edge with the row",
+                           {"edges": edges[:5], "orphans": len(orphans)})
+        return Finding("lineage", OK, "every recorded dependency resolves",
+                       evidence={"orphans": len(orphans),
+                                 "note": "an unreachable record is not a fault — most "
+                                         "evidence is a leaf — but a large count means a "
+                                         "connector committed without its participants"})
 
     def erasure(self) -> Finding:
         backlog = self.status.erasure_backlog()
@@ -295,6 +345,12 @@ class Doctor:
             remedy = ("a backend operation matched no route; run "
                       "`python -m hermes_memory.backend.worker_launcher --check` in the "
                       "backend environment and read the revision contract")
+        if operations.get("cancellations_owed"):
+            # Somebody asked work to stop and no answer came back. The intent is durable, so
+            # this is a queue with a name on it rather than a general airlessness.
+            remedy = ("a cancellation was asked for with no answer; `hermes-memory "
+                      "cancel --list` names the operations, and asking again is the way to "
+                      "settle each one")
         return Finding("gate", _severity_for(report.state), report.detail, remedy,
                        {"usage": report.evidence.get("usage"),
                         "blocked": report.evidence.get("blocked"),
@@ -324,6 +380,15 @@ class Doctor:
                                      "framework_digest": shipped["framework_digest"],
                                      "pinned": shipped["hindsight"]["engine_pinned"],
                                      "schema": shipped["schema"]["evidence_migrations"]})
+        if checked.get("absent"):
+            # A wheel installed on its own carries no manifest, which is a fact about the
+            # installation rather than a broken memory: nothing here contradicts this build,
+            # there is simply nothing that states what it is compatible with. Worth a WARN
+            # and a remedy that names a release tree, not a FAIL that tells somebody to
+            # regenerate a file their machine has no source for.
+            return Finding("release", WARN,
+                           "; ".join(checked["differences"])[:300], checked["remedy"],
+                           {"manifest": None, "differences": checked["differences"]})
         return Finding("release", FAIL,
                        f"{path.name} no longer says what this build does: "
                        + "; ".join(checked["differences"])[:300],
@@ -410,9 +475,33 @@ class Doctor:
                            "start the backend, then re-run with --synthetic-probe to "
                            "exercise the routes",
                            {"error": str(error)[:300]})
-        return Finding("backend-connectivity", OK, "the backend answered",
-                       evidence={"reported_version": report.get("version"),
-                                 "observed_at": now()})
+        # Liveness alone would let the report say "backend available" while the pinned
+        # revision it depends on routes none of the work. What matters is the set.
+        try:
+            observed = client.negotiate(probe_routes=True).as_dict()
+        except Exception as error:
+            return Finding("backend-connectivity", WARN,
+                           f"the backend answered but its capabilities are unconfirmed: "
+                           f"{error}"[:400],
+                           "re-run with the backend reachable; a capability the running "
+                           "build does not route makes a stage refuse work rather than "
+                           "fail at request time",
+                           {"reported_version": report.get("version"),
+                            "error": str(error)[:300]})
+        missing = list(observed["unsupported"]) + list(observed["mismatches"])
+        return Finding("backend-connectivity", OK if not missing else WARN,
+                       "the backend answered" + ("" if not missing else
+                                                 f", with {len(missing)} pinned "
+                                                 f"capability/capabilities it does not route"),
+                       None if not missing else
+                       "the pinned version and the running build disagree; check the "
+                       "backend's tag before enabling a stage that needs the missing route",
+                       {"reported_version": report.get("version"),
+                        "observed_via": observed["observed_via"],
+                        "pinned_to": observed["pinned_to"],
+                        "supported": sorted(observed["supported"]),
+                        "not_routed": missing,
+                        "observed_at": now()})
 
     def backend_synthetic_round_trip(self) -> Finding:
         """One bounded, synthetic write and read, in a bank of its own.

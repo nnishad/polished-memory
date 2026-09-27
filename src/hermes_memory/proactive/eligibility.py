@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..ids import timestamp
+from ..prospective import predicates as P
 from ..storage.evidence import EvidenceError
 
 __all__ = ["Eligibility", "Verdict", "CONSUMER"]
@@ -111,6 +112,9 @@ class Eligibility:
             # Not a suppression: the intention already has its answer, and a second
             # analysis of one promise is how duplicates reach an inbox.
             return Verdict(False, "duplicate", "this intention already has a recorded decision")
+        conditions = self._conditions(goal_id, int(revision), moment)
+        if not conditions.eligible:
+            return conditions
         decision = self.policy.decide(topic=topic, urgency="proactive", at=moment)
         return self._gate(decision, topic)
 
@@ -133,20 +137,60 @@ class Eligibility:
 
     # -- internals -----------------------------------------------------------
 
+    def _conditions(self, goal_id: str, revision: int, moment: str | None) -> Verdict:
+        """Every condition of the promise, answered against the store before anything is said.
+
+        "At nine o'clock" and "if nobody replies by Friday" are not the same kind of promise,
+        and only the first one is settled by a clock. A predicate has to be evaluated at the
+        moment the event fires, or a reminder goes out for a thing that already happened — or
+        never could.
+
+        The states split the way the rest of this module splits everything: *not now* holds
+        the event, *not at all* consumes it. `pending` and `unknown` are both not-now — the
+        first because the instant has not arrived, the second because the store cannot say,
+        and an unanswerable question is not a licence to act — while `failed` is the durable
+        no: the check was made against current coverage and the premise is simply not true,
+        which is the case an owner would otherwise be reminded about forever.
+        """
+        if self.goals is None:
+            return Verdict(True, "conditions", "no goal ledger is wired here, so a promise's "
+                                               "conditions are checked where they are owned")
+        checks = self.goals.conditions(goal_id, revision=revision, now_iso=moment)
+        if not checks:
+            return Verdict(True, "conditions", "this promise carries no conditions")
+        failed = [item for item in checks if item["state"] == P.FAILED]
+        if failed:
+            return Verdict(False, "predicate",
+                           f"the condition did not hold: {failed[0]['detail']}"[:400])
+        waiting = [item for item in checks if item["state"] in (P.PENDING, P.UNKNOWN)]
+        if waiting:
+            kind = "cannot be checked" if waiting[0]["state"] == P.UNKNOWN else "not reached"
+            return Verdict(False, "condition",
+                           f"{waiting[0]['kind']} {kind}: {waiting[0]['detail']}"[:400])
+        return Verdict(True, "conditions", "every condition of this promise is satisfied")
+
     def _gate(self, decision, topic: str) -> Verdict:
         """The attention gate is also the model's permission slip."""
         settings = self.policy.settings(topic)
         if settings["state"] == "opted_out":
             return Verdict(False, "opt_out", "the owner opted this topic out")
+        if self.store.stage_is_paused(f"topic:{topic}", "attention"):
+            # An operator pause is a *not now* with an expiry the operator controls: the
+            # moment it is lifted, what was due is owed again. Under the generic policy
+            # stage a caller reading the verdict cannot tell the two apart, and a no that
+            # consumes the promise is a very expensive kind of caution.
+            return Verdict(False, "paused", "an operator paused this topic's attention")
         if decision.action == "silent":
             return Verdict(False, "policy", f"the policy stayed silent: {decision.reason}")
         if decision.shadow:
             # The expensive question here is not "is this interesting?" but "is it
             # worth a call at all": a shadowed run has no audience, so analysing it
-            # would spend the budget twice and deliver neither.
-            return Verdict(False, "shadow", "shadow mode records the gate's answer and does "
-                                            "not spend a model call on an undeliverable "
-                                            "message")
+            # would spend the budget twice and deliver neither. This is a *not yet*,
+            # and the engine treats it as one — an installation defaults to shadow, and
+            # consuming its owner's reminders to prove a point nobody has tested yet is
+            # data loss, not caution.
+            return Verdict(False, "shadow", "shadow mode spends no model call on an "
+                                            "undeliverable message")
         budget = self.model_budget()
         if not budget.eligible:
             return budget

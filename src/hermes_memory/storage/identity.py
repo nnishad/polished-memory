@@ -13,11 +13,12 @@ import json
 import re
 from typing import Any, Sequence
 
-from ..ids import digest, intervals_overlap, now, timestamp
+from ..ids import digest, intervals_overlap, now, record_pk, timestamp
 from .evidence import EvidenceError
 
-__all__ = ["IdentityStore", "evidence_accounts", "PENDING", "CONFIRMED", "REJECTED",
-           "STALE", "RULES"]
+__all__ = ["IdentityStore", "evidence_accounts", "in_scope",
+           "citations_in_scope", "PENDING",
+           "CONFIRMED", "REJECTED", "STALE", "RULES"]
 
 PENDING = "pending"
 CONFIRMED = "confirmed"
@@ -99,7 +100,12 @@ class IdentityStore:
     def propose(self, *, account_a: str, account_b: str, rule: str, basis: str,
                 evidence: Sequence[str], proposed_by: str, proposed_kind: str = "agent",
                 rule_version: str | None = None) -> dict[str, Any]:
-        """Open a candidate join. Deterministic rules only; idempotent per pair."""
+        """Open a candidate join. Deterministic rules only; one candidate per pair.
+
+        A second proposal about accounts the owner already joined — directly or through
+        someone else — is not queued: there is nothing left for them to decide, and the
+        list they read is the thing worth protecting here.
+        """
         if rule in _REFUSED_RULES:
             raise EvidenceError(f"rule {rule!r} cannot propose an identity: {_REFUSED_RULES[rule]}")
         if rule not in RULES:
@@ -118,17 +124,28 @@ class IdentityStore:
             raise EvidenceError("evidence must be a list of record ids")
         if not evidence or len(evidence) > 200:
             raise EvidenceError("a candidate cites between 1 and 200 evidence records")
-        for record_pk in evidence:
-            if not isinstance(record_pk, str) or not record_pk.startswith("rec_"):
-                raise EvidenceError(f"evidence must be canonical record ids, got {record_pk!r}")
-            if not self.store.live_and_visible(record_pk):
+        for citation in evidence:
+            if not isinstance(citation, str) or not citation.startswith("rec_"):
+                raise EvidenceError(f"evidence must be canonical record ids, got {citation!r}")
+            if not self.store.live_and_visible(citation):
                 raise EvidenceError(
-                    f"evidence record {record_pk!r} does not resolve to live evidence; a "
+                    f"evidence record {citation!r} does not resolve to live evidence; a "
                     "candidate must be supportable by something retrievable")
         if not isinstance(basis, str) or not basis.strip() or len(basis) > 1000:
             raise EvidenceError("basis must be nonempty text of at most 1000 characters")
 
-        candidate_id = "cand_" + digest([pair[0], pair[1], rule])[:32]
+        if self.same_person(pair[0], pair[1]):
+            # The owner has already decided these are one person, so there is no
+            # question to put in front of them. A candidate row here would sit on the
+            # list the owner reads, asking to confirm what is already true.
+            return {"candidate_id": None, "state": CONFIRMED, "reopened": False,
+                    "already_joined": True,
+                    "note": "these accounts are already one person by a confirmed decision"}
+
+        # The pair, not the pair and the rule: the schema allows one candidate per pair,
+        # so a second rule pointing at the same two accounts reopens the same row
+        # rather than colliding with it.
+        candidate_id = "cand_" + digest([pair[0], pair[1]])[:32]
         self.db.execute("BEGIN IMMEDIATE")
         try:
             existing = self.db.execute(
@@ -141,10 +158,10 @@ class IdentityStore:
                     return {"candidate_id": candidate_id, "state": existing["state"],
                             "reopened": False}
                 self.db.execute(
-                    "UPDATE identity_candidates SET basis=?, evidence=?, proposed_by=?, "
-                    "proposed_kind=?, proposed_at=? WHERE id=?",
-                    (basis, json.dumps(list(evidence), sort_keys=True), proposed_by,
-                     proposed_kind, now(), candidate_id),
+                    "UPDATE identity_candidates SET rule=?, rule_version=?, basis=?, "
+                    "evidence=?, proposed_by=?, proposed_kind=?, proposed_at=? WHERE id=?",
+                    (rule, version, basis, json.dumps(list(evidence), sort_keys=True),
+                     proposed_by, proposed_kind, now(), candidate_id),
                 )
                 self.db.execute("COMMIT")
                 return {"candidate_id": candidate_id, "state": PENDING, "reopened": False}
@@ -309,7 +326,7 @@ class IdentityStore:
                 f"an active edge already links this pair over an overlapping interval "
                 f"({duplicate['id']}); revoke it before confirming another")
 
-        group_a, group_b = self.group(account_a), self.group(account_b)
+        group_a, group_b = self._group(account_a, None), self._group(account_b, None)
         placeholders_a = ",".join("?" * len(group_a))
         placeholders_b = ",".join("?" * len(group_b))
         rejected = self.db.execute(
@@ -324,12 +341,29 @@ class IdentityStore:
 
     # -- queries -------------------------------------------------------------
 
+    def group(self, account_id: str, *, at: str | None = None) -> list[str]:
+        """The accounts one person, as confirmed for a moment (by default, now).
+
+        The validity interval is honoured and not merely the ``active`` state. An
+        edge confirmed "these were the same person through 2024" that keeps joining
+        after 2025 has turned a time-limited decision into a permanent one, and
+        every later read inherits the widening.
+        """
+        return self._group(account_id, _moment(at))
+
     def same_person(self, account_a: str, account_b: str, *, at: str | None = None) -> bool:
         """Confirmed, active, time-valid edges only. Nothing else joins accounts."""
-        if account_a == account_b:
-            return True
-        seen = {account_a}
-        frontier = [account_a]
+        return account_b in self.group(account_a, at=at)
+
+    def _group(self, account_id: str, at: str | None) -> list[str]:
+        """One walk, shared by the set form and the pairwise form.
+
+        ``at=None`` ignores the calendar. Only the conflict check may do that:
+        merging two groups the owner separated is the thing they decided against,
+        however the validity intervals happen to fall.
+        """
+        seen = {account_id}
+        frontier = [account_id]
         while frontier:
             placeholders = ",".join("?" * len(frontier))
             rows = self.db.execute(
@@ -337,28 +371,10 @@ class IdentityStore:
                 f"WHERE state='active' AND (account_a IN ({placeholders}) "
                 f"OR account_b IN ({placeholders}))",
                 frontier + frontier).fetchall()
-            nxt = []
+            frontier = []
             for row in rows:
                 if not _interval_contains(row["valid_from"], row["valid_until"], at):
                     continue
-                for candidate in (row["account_a"], row["account_b"]):
-                    if candidate not in seen:
-                        seen.add(candidate)
-                        nxt.append(candidate)
-            frontier = nxt
-        return account_b in seen
-
-    def group(self, account_id: str) -> list[str]:
-        seen = {account_id}
-        frontier = [account_id]
-        while frontier:
-            placeholders = ",".join("?" * len(frontier))
-            rows = self.db.execute(
-                f"SELECT account_a, account_b FROM identity_edges WHERE state='active' "
-                f"AND (account_a IN ({placeholders}) OR account_b IN ({placeholders}))",
-                frontier + frontier).fetchall()
-            frontier = []
-            for row in rows:
                 for candidate in (row["account_a"], row["account_b"]):
                     if candidate not in seen:
                         seen.add(candidate)
@@ -488,6 +504,56 @@ def _interval_contains(start, end, at) -> bool:
         return False
     if end and at and at > end:
         return False
+    return True
+
+
+def _moment(at: str | None) -> str:
+    """A query moment in the form the stored intervals are written in.
+
+    A naive or unparseable stamp is refused rather than compared as text: "2024-06-01"
+    sorts below every stored timestamp of that year, so a loose guess would silently
+    answer as if it were asked at the very start of the interval.
+    """
+    if at is None:
+        return now()
+    try:
+        return timestamp(at)
+    except ValueError as error:
+        raise EvidenceError(
+            f"a query moment must be a timezone-aware timestamp: {error}") from error
+
+
+def in_scope(claims: set[str], identifiers: set[str]) -> bool:
+    """The one rule every account-scoped read applies to a set of claims.
+
+    Evidence that names nobody is shared, because quarantining unscoped notes would
+    empty the archive without protecting anyone in it. Evidence that names someone is
+    shown only to that someone's confirmed group — and a caller the installation knows
+    nothing about (an empty group) therefore sees the unscoped part of the archive.
+    """
+    return not claims or bool(identifiers and claims & identifiers)
+
+
+def citations_in_scope(store, identity: "IdentityStore | None", citations, *,
+                       identifiers: set[str]) -> bool:
+    """May this caller be shown everything a derived artifact is standing on?
+
+    A lesson cites where it came from and the record says who it is about, so the
+    scope is read from the store rather than stored with the lesson: a join the owner
+    confirms later widens what a lesson may be taught to, and one they revoke narrows
+    it, without anyone editing the lesson. Each citation is judged by ``in_scope`` on
+    its own, which is the same judgment the record would face if it were retrieved
+    directly — a lesson must not be able to carry a span across a boundary the span
+    could not cross by itself.
+    """
+    for citation in citations or ():
+        record = store.get(record_pk(str(citation)))
+        if record is None:
+            # Gone evidence is not this check's business: whether a lesson still has
+            # its support is decided where support is checked.
+            continue
+        if not in_scope(evidence_accounts(identity, record), identifiers):
+            return False
     return True
 
 

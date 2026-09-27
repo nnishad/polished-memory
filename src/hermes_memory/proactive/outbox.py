@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from ..ids import digest, new_id, now, timestamp
+from ..learning.lessons import record_pk
 from ..storage.evidence import EvidenceError
 
 __all__ = ["Outbox", "Artifact", "ArtifactClaim", "DELIVERABLE", "OPEN_STATES",
@@ -458,7 +459,7 @@ class Outbox:
         projection map; either way an erased record revokes the artifact that quoted
         it, and the artifact is suppressed rather than delivered on stale support.
         """
-        pk = _record_pk(span)
+        pk = record_pk(span)
         if self.store.live_and_visible(pk):
             return True
         row = self.db.execute("SELECT record_id FROM backend_documents WHERE document_id=? "
@@ -531,11 +532,6 @@ def _policy_version(db, decision_id: str) -> str:
     row = db.execute("SELECT policy_version FROM proactive_decisions WHERE id=?",
                      (decision_id,)).fetchone()
     return str(row["policy_version"]) if row else ""
-
-
-def _record_pk(span: str) -> str:
-    """A citation may be a record, a record@revision, or a span inside one."""
-    return str(span).split("@", 1)[0].split("#", 1)[0]
 
 
 def _payload_text(payload: Any) -> str:

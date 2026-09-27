@@ -123,6 +123,7 @@ class FormationWorker:
                 return AttemptOutcome(job.id, state, f"mapping failed: {error}")
             self.jobs.begin_submission(job, submission_id=mappings[0]["document_id"])
             covered: list[str] = []
+            running = False
             for record_id, mapping in zip(job.inputs, mappings):
                 # live_and_visible, not include_hidden: a record deleted by an
                 # erasure or hidden by a supersession must never be re-projected
@@ -132,11 +133,28 @@ class FormationWorker:
                 evidence = self.store.get(record_id)
                 if evidence is None:
                     continue
+                # The lease is a promise that keeps being made, not a one-time gift: a pass
+                # over several inputs outlives the ttl it was claimed under, and a row that
+                # stops being vouched for is what reconciliation reads as abandoned work.
+                self.jobs.renew(job)
+                if not running:
+                    # The job is with the backend from the first request onwards, which is
+                    # the one state a reader cannot recover afterwards: a worker that died
+                    # here leaves a row saying `submitting`, and `running` says the slot was
+                    # paid for. The operation identity stays empty unless this backend names
+                    # one — a synchronous retain answers with content and no name, and
+                    # inventing an id would hand `cancel --job` an operation the backend
+                    # never heard of.
+                    self.jobs.mark_running(job)
+                    running = True
                 body = self.client.retain(document_id=mapping["document_id"],
                                           content=evidence.text,
                                           timestamp=evidence.occurred_at,
                                           metadata={"source": evidence.source,
                                                     "record_id": record_id})
+                operation = body.get("operation_id") if isinstance(body, dict) else None
+                if operation and not job.backend_operation_id:
+                    self.jobs.mark_running(job, operation_id=str(operation))
                 self.documents.confirm(record_id, job.input_revision)
                 covered.append(record_id)
                 tokens += _tokens_from(body)

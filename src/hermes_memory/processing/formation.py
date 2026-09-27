@@ -142,7 +142,7 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
             tracker = Budgets(reading.store, daily={resource: Budget(
                 tokens=int(settings.background_budget_tokens))}, scope=BUDGET_SCOPE)
             spent = tracker.report()["resources"].get(resource, {})
-            budget.update({"ledger": "instance",
+            budget.update({"ledger": "instance", "period": tracker.period,
                            "tokens_used": int(spent.get("tokens_used", 0)),
                            "remaining": int(spent.get("headroom", 0))})
         # One request may not be larger than the whole day, so a small allowance is a

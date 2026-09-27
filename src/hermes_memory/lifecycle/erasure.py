@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, Sequence
 
+from ..backend.document_map import DocumentMap
 from ..ids import digest, new_id, now, timestamp
 from ..storage.blobs import BlobStore
 from ..storage.evidence import EvidenceError, journal
@@ -127,6 +128,9 @@ class ErasureManager:
                     "this preview; confirm the new preview instead")
 
             destroyed = self._erase(record_ids, intent_id, payload["dependents"])
+            withdrawn = self._withdraw_summaries(payload.get("artifacts", []),
+                                                 intent_id=intent_id, actor=actor)
+            staled = self._stale_evaluations(intent_id=intent_id)
             for item in payload["obligations"]:
                 self.db.execute(
                     "INSERT INTO erasure_targets(intent_id, kind, reference, state) "
@@ -150,7 +154,8 @@ class ErasureManager:
             self.db.execute("ROLLBACK")
             raise
         return {"intent_id": intent_id, "state": state, "erased": len(record_ids),
-                "obligations_outstanding": outstanding, "attachments": destroyed}
+                "obligations_outstanding": outstanding, "attachments": destroyed,
+                "summaries_withdrawn": withdrawn, "evaluations_staled": staled}
 
     def _erase(self, record_ids: Iterable[str], intent_id: str,
                dependents: Sequence[str]) -> dict[str, int]:
@@ -173,14 +178,17 @@ class ErasureManager:
                 released[key] = released.get(key, 0) + value
             journal(self.db, record_pk, "erase")
         # A summary or lesson built on forgotten evidence must not stay on file
-        # as if it were still supported. It is hidden, not deleted: the artifact
-        # can be recomputed from what remains.
+        # as if it were still supported. It is hidden rather than deleted: the row is
+        # the record of a reading that was once standing, and `explain` answers with it.
+        # The re-computed reading arrives as a *new* artifact under a new scope window;
+        # nothing revives this one, which is why the reason is a statement of fact rather
+        # than a promise about a later pass.
         for record_pk in dependents:
             if self.db.execute("SELECT deleted FROM records WHERE id=?", (record_pk,)).fetchone() is None:
                 continue
             self.db.execute(
                 "INSERT INTO record_visibility(record_id, hidden, replacement_id, reason, changed_at) "
-                "VALUES(?, 1, NULL, 'awaiting recomputation after erasure', ?) "
+                "VALUES(?, 1, NULL, 'withheld: the evidence it stood on was forgotten', ?) "
                 "ON CONFLICT(record_id) DO UPDATE SET hidden=1, replacement_id=NULL, "
                 "reason=excluded.reason, changed_at=excluded.changed_at",
                 (record_pk, now()),
@@ -188,6 +196,67 @@ class ErasureManager:
             self.db.execute("DELETE FROM record_fts WHERE id=?", (record_pk,))
             journal(self.db, record_pk, "invalidate")
         return released
+
+    def _withdraw_summaries(self, artifacts: Sequence[dict[str, Any]], *, intent_id: str,
+                            actor: str | None) -> int:
+        """Withdraw the readings that no longer stand, and book the scope as owed.
+
+        The provenance ledger already refuses to *serve* a summary whose evidence is
+        gone, so leaving it 'published' would be harmless to a reader — and harmful to
+        everybody else: a status report, an export or a future auditor walking the
+        table would find a claim on file that the archive has already disowned. The
+        withdrawal is the record of the decision; the refresh request is the promise
+        that the scope gets read again from what is left.
+        """
+        from ..knowledge.summaries import SummaryStore
+
+        habits = SummaryStore(self.store, owner_principal=self.owner_principal)
+        withdrawn = 0
+        for item in artifacts:
+            if item.get("kind") != "summary":
+                continue
+            row = self.db.execute("SELECT scope, kind, window_to, status FROM summaries "
+                                  "WHERE id=?", (item["id"],)).fetchone()
+            if row is None or row["status"] != "published":
+                continue
+            habits.withdraw(item["id"], actor=actor or self.owner_principal,
+                            reason=f"evidence forgotten by erasure intent {intent_id}",
+                            db=self.db)
+            habits.request_refresh(row["scope"], kind=row["kind"],
+                                   through_at=row["window_to"] or now(), db=self.db)
+            withdrawn += 1
+        return withdrawn
+
+    def _stale_evaluations(self, *, intent_id: str) -> int:
+        """Let no run keep licensing a lesson whose evidence has gone.
+
+        Read back from the store rather than from what this erasure intended: a lesson may
+        have lost its support to an earlier forgetting too, and a verdict should end when
+        the evidence does, not whenever somebody remembers to look. The lesson itself stays
+        on file — the owner reads it and withdraws it — but `activate_evaluation` will
+        refuse it until a fresh run is scored against what is left.
+        """
+        from ..learning.evaluation import EvaluationLedger
+        from ..ids import record_pk
+
+        ledger = EvaluationLedger.reading(self.store, owner_principal=self.owner_principal)
+        rows = self.db.execute(
+            "SELECT id, version, evidence, evaluation_id FROM lessons WHERE evaluation_id "
+            "IS NOT NULL AND evaluation_id != '' ORDER BY id, version").fetchall()
+        staled = 0
+        for row in rows:
+            try:
+                spans = json.loads(row["evidence"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                spans = []
+            if all(self.store.live_and_visible(record_pk(span)) for span in spans):
+                continue
+            outcome = ledger.invalidate(str(row["evaluation_id"]),
+                                        reason=f"evidence forgotten by erasure intent "
+                                               f"{intent_id}", db=self.db)
+            if str(outcome["verdict"]) == "stale":
+                staled += 1
+        return staled
 
     # -- obligations ---------------------------------------------------------
 
@@ -243,12 +312,33 @@ class ErasureManager:
                 "WHERE intent_id=? AND kind=? AND reference=?",
                 (now(), intent_id, kind, reference),
             )
+            if kind == "backend_document":
+                self._settle_mapping(reference)
             outcome = self._retire(intent_id)
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
         return outcome
+
+    def _settle_mapping(self, reference: str) -> None:
+        """Take a verified document out of the coverage count, in this transaction.
+
+        The obligation names the backend's own address for the document; the mapping row is
+        what ``status`` counts as coverage the archive owns. Leaving that row ``verified``
+        after the backend said the document is gone would have this installation report
+        memory it no longer has — the one thing the derived-backend stage exists to say.
+        """
+        backend, _, rest = reference.partition(":")
+        bank_id, _, document_id = rest.partition(":")
+        if not document_id:
+            return
+        rows = self.db.execute(
+            "SELECT record_id, revision FROM backend_documents WHERE backend=? AND bank_id=?"
+            " AND document_id=?", (backend, bank_id, document_id)).fetchall()
+        mapping = DocumentMap(self.store, backend=backend, bank_id=bank_id)
+        for row in rows:
+            mapping.mark_absent(str(row["record_id"]), str(row["revision"]), db=self.db)
 
     def fail(self, *, intent_id: str, kind: str, reference: str, error: str) -> dict[str, Any]:
         """Record a failed attempt without completing the erasure.
@@ -357,14 +447,12 @@ class ErasureManager:
         return rows, dependents, obligations, attachments, artifacts, fingerprint
 
     def _attachments(self, record_ids: Sequence[str]) -> dict[str, int]:
-        """How much attachment material this radius would destroy."""
-        if not record_ids:
-            return {"files": 0, "bytes": 0}
-        placeholders = ",".join("?" * len(record_ids))
-        row = self.db.execute(
-            f"SELECT count(*) AS files, COALESCE(sum(size), 0) AS bytes FROM attachments "
-            f"WHERE record_id IN ({placeholders})", list(record_ids)).fetchone()
-        return {"files": int(row["files"] or 0), "bytes": int(row["bytes"] or 0)}
+        """How much attachment material this radius would destroy.
+
+        The count belongs to the blob ledger, which owns the table; asking it rather than
+        re-writing the SQL here is what keeps a preview's number and a release's equal.
+        """
+        return self.blobs.totals_for(list(record_ids))
 
     def _transitive_dependents(self, record_ids: Sequence[str], *, cap: int = 2000) -> list[str]:
         """Everything that cites the targets, directly or through other artifacts.

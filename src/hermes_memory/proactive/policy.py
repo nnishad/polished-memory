@@ -331,13 +331,6 @@ class AttentionPolicy:
                 "shadow": shadow, "local_day": _parse(moment).astimezone(zone)
                 .date().isoformat()}
 
-    def decisions(self, *, topic: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        clause = " WHERE topic=?" if topic else ""
-        rows = self.db.execute(
-            f"SELECT * FROM proactive_decisions{clause} ORDER BY decided_at DESC, id "
-            "LIMIT ?", ([topic] if topic else []) + [_bounded(limit)]).fetchall()
-        return [dict(row) for row in rows]
-
     # -- internals -----------------------------------------------------------
 
     def _immediate_spent(self, topic: str, moment: str, zone, settings,

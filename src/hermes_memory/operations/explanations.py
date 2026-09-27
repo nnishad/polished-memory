@@ -35,7 +35,10 @@ class Explanations:
     """Read-only "why" over one store."""
 
     def __init__(self, store, *, settings: Any = None, policy: AttentionPolicy | None = None,
-                 outbox: Outbox | None = None, audit: AuditTrail | None = None):
+                 outbox: Outbox | None = None, audit: AuditTrail | None = None,
+                 blobs=None):
+        from ..storage.blobs import BlobStore
+
         self.store = store
         self.db = store.db
         self.owner = getattr(settings, "owner_principal", None)
@@ -43,6 +46,7 @@ class Explanations:
         self.outbox = outbox or Outbox(store, policy=self.policy,
                                        owner_principal=self.owner)
         self.audit = audit or AuditTrail(store)
+        self.blobs = blobs or BlobStore(store)
 
     # -- retrieval -----------------------------------------------------------
 
@@ -90,6 +94,7 @@ class Explanations:
                     "SELECT artifact_id, kind, coverage FROM derived_citations "
                     "WHERE record_id=? ORDER BY artifact_id", (row["id"],)).fetchall()],
             },
+            "held": [item.as_dict() for item in self.blobs.list_for(row["id"])],
             "history": self.audit.for_object(row["id"], limit=limit),
         }
 
@@ -154,6 +159,14 @@ class Explanations:
                  "confirmed_by": goal["confirmed_by"]}),
             "policy_now": {**self.policy.settings(artifact.topic),
                            **{"attention_today": self.policy.counts(artifact.topic)}},
+            # One decision can prepare more than one thing — a note to the owner and a
+            # draft for somebody else. "Did I get two messages about this?" is answered by
+            # naming the others, not by reasoning about what the decision probably did.
+            "from_the_same_decision": [
+                {"id": item.id, "kind": item.kind, "state": item.state,
+                 "recipient": item.recipient}
+                for item in self.outbox.for_decision(artifact.decision_id)
+                if item.id != artifact.id],
             "still_sendable": still_valid,
             "history": self.audit.for_object(artifact.id, limit=20),
         }
@@ -192,6 +205,9 @@ class Explanations:
             "policy": settings,
             "attention_today": self.policy.counts(topic, at=moment),
             "quiet_until": self.policy.next_waking(topic, moment),
+            # An empty list would otherwise read as "nothing was held back", when the
+            # likelier answer is that this topic has no policy at all.
+            "topics_under_policy": [str(item["topic"]) for item in self.policy.topics()],
             "decided_against": [{
                 "decision_id": row["id"], "action": row["action"],
                 "reason": redact_secrets(str(row["reason"]))[:MAX_DETAIL_CHARS],
@@ -200,6 +216,93 @@ class Explanations:
                 "artifact_prepared": bool(row["artifacts"]), "decided_at": row["decided_at"],
             } for row in rows],
         }
+
+    # -- what the archive learned --------------------------------------------
+
+    def lesson(self, lesson_id: str, *, include_private: bool = False) -> dict[str, Any]:
+        """Every version of a habit, what it cites, what was scored against it.
+
+        Nothing here asks the model whether the rule was a good one. The support and the
+        objections were filed by somebody who could know, the runs were scored by an
+        authorized evaluator, and the evidence either is on disk or is not.
+        """
+        from ..learning.evaluation import EvaluationLedger
+        from ..ids import record_pk
+        from ..learning.lessons import LessonStore
+        from ..learning.outcomes import OutcomeLog
+
+        wanted = _text(lesson_id, "lesson id")
+        log = OutcomeLog(self.store, owner_principal=self.owner)
+        habits = LessonStore(self.store, outcomes=log, owner_principal=self.owner)
+        if habits.get(wanted) is None:
+            raise EvidenceError(f"no lesson {wanted!r} in this store")
+        ledger = EvaluationLedger.reading(self.store, owner_principal=self.owner)
+        review = {str(item["id"]): item for item in habits.needs_review(limit=200)}
+        versions = []
+        for item in habits.versions(wanted):
+            key = f"{item.id}@{item.version}"
+            told = log.for_subject("lesson", key)
+            run = ledger.latest(item.id, item.version)
+            support = sum(1 for entry in told if entry.counts_as_support
+                          and entry.valence == "success")
+            against = sum(1 for entry in told if entry.counts_as_support
+                          and entry.valence == "failure")
+            entry = {
+                "lesson": key, "version": int(item.version), "status": item.status,
+                "proposed_by": item.created_by, "proposed_kind": item.created_kind,
+                "applicability": dict(item.applicability or {}),
+                "prerequisites": list(item.prerequisites or ()),
+                "exceptions": list(item.exceptions or ()),
+                "contrary_cases": list(item.contrary_cases or ()),
+                "evidence": [{"citation": str(span), "record": record_pk(span),
+                              "readable": self.store.live_and_visible(record_pk(span))}
+                             for span in (item.evidence or ())],
+                "support": support, "against": against,
+                "outcomes": [record.as_dict() for record in told][-20:],
+                "evaluation": None if run is None else run.as_dict(),
+                "awaiting_owner_review": key in review,
+                "review_reason": (review.get(key) or {}).get("reason"),
+            }
+            if include_private:
+                entry["text"] = redact_secrets(str(item.text))[:MAX_DETAIL_CHARS]
+            versions.append(entry)
+        return {"lesson_id": wanted, "assembled_at": now(), "versions": versions,
+                "current": habits.get(wanted).version,
+                "note": "a candidate teaches nothing; only an owner or a passed run makes "
+                        "a lesson active, and both are named above"}
+
+    def summary(self, summary_id: str, *, include_private: bool = False) -> dict[str, Any]:
+        """Why this reading is on the table, or why it is not being shown.
+
+        The citations come back with their live state, because the reason a summary is
+        withheld is always one of these rows having been forgotten, corrected or hidden —
+        and an owner reading the answer needs to see which.
+        """
+        from ..knowledge.summaries import SummaryStore
+        from ..storage.lineage import Lineage
+
+        wanted = _text(summary_id, "summary id")
+        habits = SummaryStore(self.store, owner_principal=self.owner)
+        found = habits.read(wanted)
+        if not found.get("found"):
+            raise EvidenceError(f"no summary {wanted!r} in this store")
+        found["assembled_at"] = now()
+        found["cited"] = [
+            {"record": str(row["record_id"]),
+             "state": "erased" if row["deleted"] else "hidden" if row["hidden"]
+             else "visible",
+             "coverage": str(row["coverage"])}
+            for row in Lineage(self.store).citations_of(wanted)]
+        # A withheld reading does not report its own scope, so the promise is matched
+        # against the row rather than against whatever the answer chose to show.
+        stored = habits.get(wanted)
+        found["refresh_owed"] = [
+            item for item in habits.pending_refreshes(limit=50)
+            if stored is not None and item["scope"] == stored.scope]
+        if not include_private:
+            # The body is a re-reading of private evidence; it travels only when named.
+            found.pop("body", None)
+        return found
 
     # -- prospective memory --------------------------------------------------
 

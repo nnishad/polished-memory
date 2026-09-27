@@ -23,40 +23,19 @@ from typing import Any, Iterable, Sequence
 from ..ids import digest
 from .evidence import EvidenceError
 
-__all__ = ["Lineage", "Impact", "CLOSURE_CAP"]
+__all__ = ["Lineage", "CLOSURE_CAP"]
 
 CLOSURE_CAP = 2000
 # Every place a record can be leaned on. Adding a derived product means adding it
 # here, which is the one place a new artifact type has to be announced.
-ARTIFACT_SOURCES: tuple[tuple[str, str, str], ...] = (
-    ("summary", "derived_citations", "artifact_id"),
-    ("assertion", "assertions", "id"),
+# A None kind means the table names it itself. The ledger records the artifact's own kind
+# (`summary:project`, `lesson`), and the radius report groups by family — the part before
+# the colon — because a lesson called a "summary" is a wrong answer in the one preview an
+# owner confirms against, while the families are what the cleanup paths act on.
+ARTIFACT_SOURCES: tuple[tuple[str | None, str, str, str | None], ...] = (
+    (None, "derived_citations", "artifact_id", "kind"),
+    ("assertion", "assertions", "id", None),
 )
-
-
-@dataclass
-class Impact:
-    """What would be affected, and enough detail to hash it."""
-
-    records: list[str] = field(default_factory=list)
-    artifacts: list[dict[str, Any]] = field(default_factory=list)
-    attachments: dict[str, int] = field(default_factory=lambda: {"files": 0, "bytes": 0})
-    truncated: bool = False
-
-    def digest(self) -> str:
-        """A fingerprint of the whole radius.
-
-        A preview that no longer matches this is not the thing the owner was shown,
-        which is the only defence against a confirmation racing the archive.
-        """
-        return digest([self.records,
-                       [[item["kind"], item["id"]] for item in self.artifacts],
-                       self.attachments["files"], self.attachments["bytes"]])
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"records": len(self.records), "artifacts": len(self.artifacts),
-                "attachments": dict(self.attachments), "truncated": self.truncated,
-                "digest": self.digest()}
 
 
 class Lineage:
@@ -171,11 +150,15 @@ class Lineage:
             return []
         placeholders = ",".join("?" * len(targets))
         found: list[dict[str, Any]] = []
-        for kind, table, column in ARTIFACT_SOURCES:
+        for kind, table, column, kind_column in ARTIFACT_SOURCES:
+            selected = (f"{column} AS artifact" if kind_column is None
+                        else f"{column} AS artifact, {kind_column} AS kind")
             rows = self.db.execute(
-                f"SELECT DISTINCT {column} AS artifact FROM {table} WHERE record_id IN "
+                f"SELECT DISTINCT {selected} FROM {table} WHERE record_id IN "
                 f"({placeholders})", targets).fetchall()
-            found.extend({"kind": kind, "id": str(row["artifact"])} for row in rows)
+            found.extend({"kind": kind if kind is not None else
+                          str(row[kind_column]).partition(":")[0],
+                          "id": str(row["artifact"])} for row in rows)
         return sorted(found, key=lambda item: (item["kind"], item["id"]))
 
     def citations_of(self, artifact_id: str) -> list[dict[str, Any]]:
@@ -200,23 +183,6 @@ class Lineage:
             entry["live"] = not (row["deleted"] or row["hidden"])
             out.append(entry)
         return out
-
-    def impact(self, record_ids: Iterable[str], *, cap: int = CLOSURE_CAP) -> Impact:
-        """The full radius of forgetting a set of records."""
-        seeds = [str(item) for item in record_ids if item]
-        if not seeds:
-            raise EvidenceError("an impact calculation needs at least one record")
-        records, truncated = self.closure(seeds, cap=cap)
-        if not records:
-            return Impact(truncated=truncated)
-        placeholders = ",".join("?" * len(records))
-        row = self.db.execute(
-            f"SELECT count(*) AS files, COALESCE(sum(size), 0) AS bytes FROM attachments "
-            f"WHERE record_id IN ({placeholders})", records).fetchone()
-        return Impact(records=records, artifacts=self.artifacts(records),
-                      attachments={"files": int(row["files"] or 0),
-                                   "bytes": int(row["bytes"] or 0)},
-                      truncated=truncated)
 
     # -- explanation and integrity -------------------------------------------
 

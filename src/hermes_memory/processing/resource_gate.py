@@ -55,10 +55,6 @@ class Reservation:
     priority: int
     lease_until: float
 
-    @property
-    def occupied(self) -> bool:
-        return True
-
 
 class ResourceGate:
     def __init__(self, store, *, clock: Callable[[], float] = time.time,
@@ -228,6 +224,15 @@ class ResourceGate:
     @property
     def paused(self) -> bool:
         return self.store.stage_is_paused("global", "inference")
+
+    def hold(self) -> dict[str, Any] | None:
+        """Who is holding inference, and since when. None if nobody wrote it down.
+
+        ``paused`` answers "may I run"; this answers "who decided that", which is the
+        question worth asking of a hold that stops inference for every profile sharing
+        this machine.
+        """
+        return self.store.control("global", "inference")
 
     def close(self) -> None:
         """Release the database this gate opened, if it opened one.
