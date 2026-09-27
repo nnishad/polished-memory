@@ -146,6 +146,11 @@ def test_a_build_that_carries_no_manifest_says_so_without_naming_a_path_it_never
     """
     monkeypatch.delenv("HERMES_MEMORY_RELEASE", raising=False)
     monkeypatch.setattr(compatibility, "source_checkout", lambda: None)
+    # The other half of "on its own": the module has to be imported from a library path with
+    # no tree beside it, which is what `tree_root` answers from rather than the checkout guess.
+    lonely = tmp_path / "venv/lib/python3.12/site-packages/hermes_memory"
+    lonely.mkdir(parents=True)
+    monkeypatch.setattr(compatibility, "PACKAGE_DIR", lonely)
     assert compatibility.manifest_path() is None
     checked = compatibility.verify()
     assert checked["ok"] is False and checked["absent"] is True
@@ -300,6 +305,21 @@ def an_installed_release(tmp_path, monkeypatch):
     origin.write_text("# installed copy\n")
     monkeypatch.setattr(compatibility, "source_checkout", lambda: None)
     return root, origin
+
+
+def test_an_installed_release_reads_its_own_manifest_without_being_told_where_it_lives(
+        tmp_path, monkeypatch):
+    """`hermes-memory compatibility` on the machine running a release, with no env pointer.
+
+    The door used to answer "nothing here states what it is compatible with" there, because
+    its fallback asked only the git question while the manifest was sitting beside the
+    interpreter that had just run it.
+    """
+    root, origin = an_installed_release(tmp_path, monkeypatch)
+    monkeypatch.setattr(compatibility, "PACKAGE_DIR",
+                        root / "lib" / "python3.12" / "site-packages" / "hermes_memory")
+    assert compatibility.manifest_path() == root / "deployment" / "compatibility.json"
+    assert compatibility.read_shipped()["manifest_version"] == compatibility.MANIFEST_VERSION
 
 
 def test_an_installed_build_finds_the_release_it_came_from(tmp_path, monkeypatch):

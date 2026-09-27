@@ -216,8 +216,8 @@ def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path 
         candidate = root / RELATIVE
         if candidate.is_file():
             return candidate
-    checkout = source_checkout()
-    return checkout / RELATIVE if checkout else None
+    tree = tree_root()
+    return tree / RELATIVE if tree else None
 
 
 def write(*, path: Path | None = None, settings=None,

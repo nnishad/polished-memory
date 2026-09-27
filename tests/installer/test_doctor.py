@@ -733,7 +733,7 @@ def test_a_stale_loop_with_nothing_waiting_is_not_reported_as_an_alarm(store):
 
 
 def test_a_build_with_no_manifest_warns_instead_of_condemning_a_path_it_never_had(
-        store, monkeypatch):
+        store, tmp_path, monkeypatch):
     """An installed wheel has no deployment tree beside it; that is not a broken memory.
 
     The old fallback named `<venv>/lib/python3.12/deployment/compatibility.json` and then
@@ -744,6 +744,9 @@ def test_a_build_with_no_manifest_warns_instead_of_condemning_a_path_it_never_ha
 
     monkeypatch.delenv("HERMES_MEMORY_RELEASE", raising=False)
     monkeypatch.setattr(compatibility, "source_checkout", lambda: None)
+    lonely = tmp_path / "venv/lib/python3.12/site-packages/hermes_memory"
+    lonely.mkdir(parents=True)
+    monkeypatch.setattr(compatibility, "PACKAGE_DIR", lonely)
     finding = Doctor(store).release()
     assert finding.severity == WARN, finding.detail
     assert finding.evidence["manifest"] is None

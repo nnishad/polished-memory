@@ -479,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return _doctor_command(settings, args)
     if args.command == "compatibility":
-        return _compatibility_command(args)
+        return _compatibility_command(settings, args)
     if args.command == "audit":
         return _audit_command(settings, args)
     if args.command == "measure":
@@ -1962,20 +1962,24 @@ def _doctor_command(settings, args) -> int:
     return int(report["exit_code"])
 
 
-def _compatibility_command(args) -> int:
+def _compatibility_command(settings, args) -> int:
     """The manifest door: reading it is safe anywhere, writing it belongs to packaging.
 
     ``--write`` is deliberately not a step the installer performs. A setup that regenerated
     its own compatibility claims would be a build grading its own homework; the check is only
     worth anything because the file was written by a different act than the one that reads it.
+
+    The instance settings go with the question: an installed release keeps its manifest beside
+    the ``bin/`` that was named by ``runtime/current``, and a door that did not know which
+    installation it was run from could only report that nothing was claimed.
     """
     from .install import compatibility
 
     if args.write:
-        written = compatibility.write()
+        written = compatibility.write(settings=settings)
         return _emit({"written": str(written), "facts": compatibility.facts(),
                       "note": "ship this file with the release it describes"})
-    checked = compatibility.verify(digests=args.digests)
+    checked = compatibility.verify(settings=settings, digests=args.digests)
     if not checked["ok"] and not checked.get("absent"):
         checked["next"] = ("hermes-memory compatibility --write, and ship what it prints "
                            "beside the code that produced it")
