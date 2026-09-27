@@ -22,7 +22,8 @@ from typing import Any, Callable
 from .resource_gate import GateBusy, GatePaused, ResourceGate
 from .routes import RouteTable
 
-__all__ = ["GateApp", "FORWARDED_PATHS", "UpstreamResult", "urllib_upstream"]
+__all__ = ["GateApp", "FORWARDED_PATHS", "UpstreamResult", "urllib_upstream",
+           "upstream_url"]
 
 # Only the subset memory actually needs. A general proxy would let a caller
 # reach an arbitrary endpoint through the slot we reserved.
@@ -137,7 +138,7 @@ class GateApp:
             return
 
         try:
-            result = self.upstream(f"{route.upstream.rstrip('/')}{path}",
+            result = self.upstream(upstream_url(route, path),
                                    json.dumps(payload).encode("utf-8"),
                                    _upstream_headers(route, self.upstream_credentials))
         except Exception as error:  # a defect here must not free a possibly-busy slot
@@ -163,6 +164,20 @@ class GateApp:
             # a surprising answer and a silently wrong one.
             headers.append((b"x-gate-max-tokens-capped", str(capped).encode("ascii")))
         await _respond(send, result.status, result.body, headers=headers, raw=True)
+
+
+def upstream_url(route, path: str) -> str:
+    """Where a forwarded path actually goes, without asking for ``/v1/v1/embeddings``.
+
+    An OpenAI-compatible upstream is configured by its versioned root — ``http://host/v1`` —
+    which is what every client library and this installation's own template names. The paths
+    this gate forwards carry that prefix, so joining them plainly doubled it and the model
+    server answered 404 to a request the gate had already admitted.
+    """
+    base = route.upstream.rstrip("/")
+    if base.endswith("/v1") and path.startswith("/v1/"):
+        base = base[:-3]
+    return f"{base}{path}"
 
 
 def _apply_cap(payload: dict[str, Any], limit: int) -> tuple[dict[str, Any], int | None]:

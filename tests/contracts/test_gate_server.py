@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from hermes_memory.processing.gate_server import GateApp, _apply_cap, _usage_tokens
+from hermes_memory.processing.gate_server import (GateApp, _apply_cap,
+                                                    _usage_tokens, upstream_url)
 from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import RouteTable, Route
 
@@ -117,7 +118,7 @@ def test_a_credential_cannot_name_its_own_upstream(harness):
     """The caller supplies no URL by construction; only the route table does."""
     app, _, upstream = harness
     call(app, body={"model": "x", "messages": [], "upstream": "http://198.51.100.7:9/v1"})
-    assert upstream.calls[0]["url"] == "http://127.0.0.1:8080/v1/v1/chat/completions"
+    assert upstream.calls[0]["url"] == "http://127.0.0.1:8080/v1/chat/completions"
 
 
 # -- forwarding --------------------------------------------------------------
@@ -135,7 +136,8 @@ def test_a_chat_request_is_forwarded_with_the_upstream_credential(harness):
 def test_embeddings_use_the_gpu_slot_and_a_different_upstream(harness):
     app, gate, upstream = harness
     call(app, "/v1/embeddings", token="cred-emb", body={"input": "hello", "model": "emb"})
-    assert upstream.calls[0]["url"].startswith("http://127.0.0.1:11434")
+    # The configured root already carries /v1; asking the server for it twice is a 404
+    assert upstream.calls[0]["url"] == "http://127.0.0.1:11434/v1/embeddings"
     assert gate.usage()[GPU]["tokens"] == 42
     assert gate.usage().get(REMOTE, {}).get("calls", 0) == 0, "different device, different slot"
 
@@ -293,3 +295,28 @@ def test_usage_is_counted_from_what_the_upstream_reported(harness):
 ])
 def test_token_accounting_survives_junk(body, expected):
     assert _usage_tokens(body) == expected
+
+
+# -- where a forwarded path goes ---------------------------------------------
+
+def _route(upstream, credential):
+    return Route("retain", REMOTE, "chat", upstream, credential, "freshness", 2048)
+
+
+def test_an_upstream_named_by_its_versioned_root_is_not_asked_for_that_root_twice():
+    """The engine configures `http://host/v1`; the forwarded path says `/v1/embeddings`.
+
+    Joined plainly that is `/v1/v1/embeddings`, which a model server answers with a 404 the
+    gate passes straight on — an admitted request failing for a reason nobody can see.
+    """
+    versioned = _route("http://127.0.0.1:8080/v1", "cred-a")
+    trailing = _route("http://127.0.0.1:8080/v1/", "cred-b")
+    plain = _route("http://127.0.0.1:8080", "cred-c")
+    served_under_a_path = _route("http://127.0.0.1:8080/engine/v1", "cred-d")
+    assert upstream_url(versioned, "/v1/chat/completions") == \
+        "http://127.0.0.1:8080/v1/chat/completions"
+    assert upstream_url(trailing, "/v1/embeddings") == "http://127.0.0.1:8080/v1/embeddings"
+    assert upstream_url(plain, "/v1/chat/completions") == \
+        "http://127.0.0.1:8080/v1/chat/completions"
+    assert upstream_url(served_under_a_path, "/v1/embeddings") == \
+        "http://127.0.0.1:8080/engine/v1/embeddings"

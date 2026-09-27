@@ -3,6 +3,12 @@ Description=Hermes memory runtime (canonical store, context broker and resource 
 After=network-online.target
 Wants=network-online.target
 
+# A misconfigured engine refuses its own environment at startup, and a service that is
+# restarted forever hides that in a log. Five attempts inside ten minutes, then the unit
+# stays failed where `status` and `doctor` can name it.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
 [Service]
 Type=simple
 # Which release this unit runs is named by HERMES_MEMORY_RELEASE; `hermes-memory
