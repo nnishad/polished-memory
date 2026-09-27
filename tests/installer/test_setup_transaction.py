@@ -194,6 +194,61 @@ def test_setup_refuses_a_relative_home(installation):
         plan(settings, hermes_home="homes/work", environ=environ)
 
 
+# -- what an approval is actually about ---------------------------------------
+
+def proc_table(tmp_path, name: str, *ports: int) -> Path:
+    """A machine's socket table as written by the kernel, so a test can say what is on it."""
+    root = tmp_path / name
+    (root / "net").mkdir(parents=True)
+    rows = "".join(f"   {index}: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000\n"
+                   for index, port in enumerate(ports))
+    (root / "net" / "tcp").write_text("  sl  local_address rem_address   st\n" + rows,
+                                      encoding="utf-8")
+    return root
+
+
+def test_an_approval_does_not_expire_because_a_stranger_started_listening(installation,
+                                                                          tmp_path):
+    """The socket table is a reading of the machine, not a decision anybody approved.
+
+    A plan that carried the whole port list in its digest expired the moment an unrelated
+    program opened a listener, so the owner's approval was worth as long as the quietest
+    interval on the host — which is how a re-run came to fail between showing the digest and
+    spending it.
+    """
+    settings, environ = installation
+    quiet = proc_table(tmp_path, "proc-quiet", 9999)
+    busy = proc_table(tmp_path, "proc-busy", 9999, 4242, 6379)
+    home = Path(settings.home)
+    first = plan(settings, hermes_home=home, environ=environ, proc=quiet)
+    second = plan(settings, hermes_home=home, environ=environ, proc=busy)
+    assert first["review_digest"] == second["review_digest"], (
+        [item["actions"] for item in first["steps"]][:1],
+        [item["actions"] for item in second["steps"]][:1])
+
+
+def test_a_port_this_installation_wants_being_held_is_said_and_changes_the_plan(tmp_path,
+                                                                               monkeypatch):
+    """Excluding the machine's own noise must not blind the inventory to a real collision."""
+    home = tmp_path / "instance"
+    home.mkdir()
+    release = host(home, HINDSIGHT_URL="http://127.0.0.1:8888")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    settings = load_settings()
+    environ = {"HERMES_MEMORY_RELEASE": str(release)}
+    free = plan(settings, hermes_home=home, environ=environ,
+                proc=proc_table(tmp_path, "free", 9999))
+    held = plan(settings, hermes_home=home, environ=environ,
+                proc=proc_table(tmp_path, "held", 9999, 8888))
+    assert free["review_digest"] != held["review_digest"]
+    assert any("already listening" in line for line in held["blocked"] if "hindsight" in line), \
+        held["blocked"]
+    said = " ".join(held["steps"][0]["actions"])
+    assert "1 of 2 endpoint(s)" in said and "hindsight" in said, held["steps"][0]["actions"]
+    assert "9999" not in said, "a stranger's listener is not this installation's to report"
+
+
 def test_an_installation_with_no_owner_named_has_nobody_whose_approval_counts(tmp_path,
                                                                              monkeypatch):
     home = tmp_path / "unowned"
@@ -959,6 +1014,12 @@ def stage_blockers(settings, environ) -> list[str]:
     return [line for line in proposal["blocked"] if line.startswith("stage:")]
 
 
+#: An OpenAI-compatible provider with no base URL is served by the SDK's own host, so every
+#: engine environment below has to say where its model is, exactly as the shipped template does.
+TEXT_ROUTE = "HINDSIGHT_API_LLM_BASE_URL=http://127.0.0.1:8080/v1\n"
+EMBEDDINGS_ROUTE = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL=http://127.0.0.1:11434/v1\n"
+
+
 def test_a_backend_environment_the_engine_would_refuse_is_refused_before_it_starts(
         installation):
     """`RETAIN_MAX_COMPLETION_TOKENS` has to exceed `RETAIN_CHUNK_SIZE`, or the engine quits.
@@ -968,8 +1029,8 @@ def test_a_backend_environment_the_engine_would_refuse_is_refused_before_it_star
     noticed until `systemd` had restarted the service a hundred times.
     """
     settings, environ, env = backend_env(installation)
-    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
-                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n", encoding="utf-8")
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n" + TEXT_ROUTE
+                   + "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n", encoding="utf-8")
     blockers = stage_blockers(settings, environ)
     assert any("RETAIN_CHUNK_SIZE" in line and "RETAIN_MAX_COMPLETION_TOKENS" in line
                for line in blockers), blockers
@@ -977,8 +1038,8 @@ def test_a_backend_environment_the_engine_would_refuse_is_refused_before_it_star
                    + "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
     assert stage_blockers(settings, environ) == []
     # The rule is "greater than", so the two meeting exactly is still a refusal.
-    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
-                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=1500\n"
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n" + TEXT_ROUTE
+                   + "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=1500\n"
                    "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
     assert stage_blockers(settings, environ), "an equal budget and chunk cannot answer"
 
@@ -999,8 +1060,8 @@ def test_an_engine_that_generates_nothing_is_not_checked_for_a_generation_budget
 def test_a_backend_environment_that_names_no_number_is_named_rather_than_guessed(
         installation):
     settings, environ, env = backend_env(installation)
-    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
-                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=smallish\n", encoding="utf-8")
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n" + TEXT_ROUTE
+                   + "HINDSIGHT_API_RETAIN_CHUNK_SIZE=smallish\n", encoding="utf-8")
     assert any("not a number" in line for line in stage_blockers(settings, environ))
 
 
@@ -1015,11 +1076,11 @@ def test_an_embedding_route_the_engine_must_measure_is_refused_before_it_starts(
     own backend, and the unit's restart budget then leaves it failed.
     """
     settings, environ, env = backend_env(installation)
-    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
-                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n" + TEXT_ROUTE
+                   + "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
                    "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n"
-                   "HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai\n"
-                   "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=qwen3-embedding:0.6b\n",
+                   "HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai\n" + EMBEDDINGS_ROUTE
+                   + "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=qwen3-embedding:0.6b\n",
                    encoding="utf-8")
     blockers = stage_blockers(settings, environ)
     assert any("test embedding" in line for line in blockers), blockers
@@ -1031,10 +1092,85 @@ def test_an_embedding_route_the_engine_must_measure_is_refused_before_it_starts(
 def test_an_embedding_route_that_dials_nothing_needs_no_declared_width(installation):
     """`local` loads a model in this process; it does not ask a URL what shape it is."""
     settings, environ, env = backend_env(installation)
-    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
-                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n" + TEXT_ROUTE
+                   + "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
                    "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n"
                    "HINDSIGHT_API_EMBEDDINGS_PROVIDER=local\n", encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+
+
+def test_an_engine_environment_that_names_no_text_provider_is_refused(installation):
+    """An unset provider is not "nothing configured": the engine's own default is a cloud one.
+
+    `DEFAULT_LLM_PROVIDER = "openai"` and `DEFAULT_LLM_MODEL = "gpt-4o-mini"` in the pinned
+    0.10.1 config, so a file that leaves the line out has the memory server reading the
+    owner's evidence into somebody else's API while looking, from here, like a local install.
+    """
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+    blockers = stage_blockers(settings, environ)
+    assert any("HINDSIGHT_API_LLM_PROVIDER" in line for line in blockers), blockers
+
+
+def test_a_provider_named_without_the_endpoint_it_would_use_is_the_hosted_one(installation):
+    """The route is what makes `openai` mean a server in this room rather than a vendor's."""
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+    blockers = stage_blockers(settings, environ)
+    assert any("HINDSIGHT_API_LLM_BASE_URL" in line and "api.openai.com" in line
+               for line in blockers), blockers
+    env.write_text(env.read_text(encoding="utf-8") + TEXT_ROUTE, encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+
+
+@pytest.mark.parametrize("url", ["https://api.openai.com/v1", "http://example.com:8080/v1",
+                                 "http://8.8.8.8:8080/v1", "http://localhost:8080/v1",
+                                 "http://169.254.169.254:8080/v1"])
+def test_an_engine_endpoint_off_this_machine_is_refused(installation, url):
+    """The framework's own allowlist does not bind a backend process, so its URLs are checked."""
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   f"HINDSIGHT_API_LLM_BASE_URL={url}\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+    blockers = stage_blockers(settings, environ)
+    assert any("HINDSIGHT_API_LLM_BASE_URL" in line for line in blockers), blockers
+
+
+def test_an_engine_endpoint_written_to_a_private_address_is_not_argued_with(installation):
+    """A literal RFC1918 endpoint is the approved shape, and no rule here disputes it."""
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_LLM_BASE_URL=http://192.168.68.65:8080/v1\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+
+
+def test_a_local_provider_needs_no_endpoint_and_a_disabled_engine_needs_none(installation):
+    """`llamacpp` runs a model from a path and `mock` answers in code: neither dials out."""
+    settings, environ, env = backend_env(installation)
+    for provider in ("llamacpp", "mock"):
+        env.write_text(f"HINDSIGHT_API_LLM_PROVIDER={provider}\n"
+                       "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                       "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+        assert stage_blockers(settings, environ) == [], provider
+
+
+def test_an_embedded_database_is_not_read_as_a_model_endpoint(installation):
+    """`pg0` is where the memory lives, not somewhere a request goes.
+
+    A rule about endpoints that swept every key ending in `_URL` would refuse the one key of
+    this installation's that deliberately names no host at all.
+    """
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n" + TEXT_ROUTE
+                   + "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n"
+                   "HINDSIGHT_API_DATABASE_URL=pg0\n", encoding="utf-8")
     assert stage_blockers(settings, environ) == []
 
 
@@ -1053,3 +1189,14 @@ def test_the_shipped_backend_environment_satisfies_the_checks_it_will_be_read_by
         assert int(values[ENGINE_EMBEDDINGS_DIMENSIONS]) > 0, (
             f"{template}: an OpenAI-compatible embedding route with no declared width makes "
             "the engine send a test embedding every time it starts")
+    from hermes_memory.config import endpoint_is_private
+    from hermes_memory.install.setup import ENGINE_LOCAL_PROVIDERS, ENGINE_ROUTES
+
+    assert values, template
+    for _work, provider_key, url_key in ENGINE_ROUTES:
+        provider = values.get(provider_key, "").strip().lower()
+        if provider and provider not in ENGINE_LOCAL_PROVIDERS:
+            assert url_key in values, f"{template}: {provider_key}={provider} needs {url_key}"
+    for key, value in values.items():
+        if key.endswith("_BASE_URL") and value.strip():
+            assert endpoint_is_private(value.strip()), f"{template}: {key}={value}"

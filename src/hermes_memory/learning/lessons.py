@@ -24,10 +24,23 @@ from ..storage.evidence import EvidenceError
 from ..storage.identity import citations_in_scope
 from .evaluation import PASSED
 
-# How a decision on a lesson is attributed. A promotion names the program that scored the
-# run rather than a person, because no person decided it; the bound is enforced where the
-# attribution is written, so a name has to fit before it gets here.
+# How much space a decision on a lesson may be attributed in: the column's bound, and the
+# reason a promotion signs itself with a digest rather than with a directory.
 ACTOR_LIMIT = 120
+
+
+def promotion_actor(runner: str) -> str:
+    """How a scored run signs the lesson it promoted, in the space an actor has.
+
+    Kept as one function because the bound is not decoration: an over-long attribution is
+    refused where it is written, so a deep install directory has to stop being part of the
+    name before the promotion is recorded. The run row keeps the whole path either way.
+    """
+    actor = f"evaluation:{runner}"
+    if len(actor) <= ACTOR_LIMIT:
+        return actor
+    return f"evaluation:{Path(runner).name}:{digest([runner])[:12]}"
+
 
 __all__ = ["Lesson", "LessonStore", "STATUSES", "APPLICABLE", "match"]
 
@@ -194,12 +207,7 @@ class LessonStore:
             raise EvidenceError(
                 f"{evaluation_id} is no longer a verdict about {lesson_id}@{version}: "
                 "the code, model, fixtures or the lesson itself have moved since it ran")
-        runner = str(evaluation.runner or "")
-        actor = f"evaluation:{runner}"
-        if len(actor) > ACTOR_LIMIT:
-            # The run row keeps the whole path; an activation only has to name the program
-            # unambiguously, and a deep install directory is not part of its identity.
-            actor = f"evaluation:{Path(runner).name}:{digest([runner])[:12]}"
+        actor = promotion_actor(str(evaluation.runner or ""))
         return self._set(lesson_id, int(version), "active", actor=actor,
                          reason=f"promoted by {evaluation_id}", evaluation_id=evaluation_id)
 

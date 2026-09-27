@@ -21,7 +21,7 @@ from importlib import util as _import_util
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from ..config import DEFAULT_ENV_FILENAME, env_file_values
+from ..config import DEFAULT_ENV_FILENAME, endpoint_is_private, env_file_values
 from ..ids import content_digest, digest, now
 from .inventory import conflicts, provider_selection, survey
 from .profiles import InstallationError, ProfileRegistry, STATE_FILENAME
@@ -64,6 +64,10 @@ class Context:
     ref: str | None = None
     environ: dict[str, str] | None = None
     start_services: bool = False
+    #: Where to read the machine's socket table from. The default is the real one; a test
+    #: passes a directory it wrote, because the set of ports a host happens to be listening
+    #: on is not something an approval is about and must not move underneath one.
+    proc: Path | None = Path("/proc")
 
     def profile_settings(self):
         return self.registry.profile(self.profile).scoped(self.settings)
@@ -79,11 +83,12 @@ def plan(settings, *, hermes_home: str | Path, profile: str | None = None,
          registry: ProfileRegistry | None = None, ref: str | None = None,
          environ: dict[str, str] | None = None,
          runner: Callable | None = None, actor: str | None = None,
-         start_services: bool = False) -> dict[str, Any]:
+         start_services: bool = False,
+         proc: Path | None = Path("/proc")) -> dict[str, Any]:
     """What each of the eleven steps would do, and which of them is already done."""
     ctx = _context(settings, hermes_home=hermes_home, profile=profile, registry=registry,
                    ref=ref, environ=environ, runner=runner, actor=actor,
-                   start_services=start_services)
+                   start_services=start_services, proc=proc)
     entries = []
     try:
         for step in STEPS:
@@ -113,7 +118,8 @@ def plan(settings, *, hermes_home: str | Path, profile: str | None = None,
 def run(settings, *, hermes_home: str | Path, actor: str, review: str,
         profile: str | None = None, ref: str | None = None,
         environ: dict[str, str] | None = None,
-        runner: Callable | None = None, start_services: bool = False) -> dict[str, Any]:
+        runner: Callable | None = None, start_services: bool = False,
+        proc: Path | None = Path("/proc")) -> dict[str, Any]:
     """Do the plan that was shown, from the first step that is not already finished.
 
     The digest has to match the plan computed now, so an approval cannot be spent on a
@@ -127,7 +133,7 @@ def run(settings, *, hermes_home: str | Path, actor: str, review: str,
         raise SetupError("an actor must be named: setup is the owner's decision")
     proposal = plan(settings, hermes_home=hermes_home, profile=profile, ref=ref,
                     environ=environ, runner=runner, actor=actor,
-                    start_services=start_services)
+                    start_services=start_services, proc=proc)
     if actor.strip() != settings.owner_principal:
         raise SetupError(
             f"setup may only be approved by the owner principal the configuration names "
@@ -165,18 +171,26 @@ def run(settings, *, hermes_home: str | Path, actor: str, review: str,
 
 def _inventory(ctx: Context, *, apply: bool) -> dict[str, Any]:
     """Read the machine. This step writes nothing and asks no model anything."""
-    report = survey(ctx.settings, hermes_home=ctx.hermes_home, environ=ctx.environ)
+    report = survey(ctx.settings, hermes_home=ctx.hermes_home, environ=ctx.environ,
+                    proc=ctx.proc)
     said = conflicts(report)
     blocking = [line for line in said if _collides(line)]
+    wanted = report["endpoints"]["wanted"]
+    held = sorted(name for name, point in wanted.items() if point["in_use"])
     return {
-        "actions": [f"{len(report['endpoints']['listening_ports'])} port(s) listening, "
-                    f"{len(report['capture_owners']['canonical_stores'])} canonical "
+        "actions": [f"{len(held)} of {len(wanted)} endpoint(s) this installation wants "
+                    f"{'is' if len(wanted) == 1 else 'are'} already held"
+                    + (f" ({', '.join(held)})" if held else "")
+                    + f"; {len(report['capture_owners']['canonical_stores'])} canonical "
                     f"store(s) beside the homes searched, provider reads as "
                     f"{report['host']['memory_provider']!r}"],
         "advisory": [line for line in said if line not in blocking],
         "blocking": blocking,
-        "inputs": {"ports": report["endpoints"]["listening_ports"],
-                   "wanted": report["endpoints"]["wanted"],
+        # The port this installation binds and whether something already holds it are what
+        # the approval is about. The whole socket table is not: it moves when an unrelated
+        # program starts listening, and a digest that followed it would expire an approval
+        # nobody had anything to do with — the same reason free space below is a boolean.
+        "inputs": {"wanted": wanted,
                    "stores": report["capture_owners"]["canonical_stores"],
                    "spools": report["capture_owners"]["capture_spools"],
                    "provider": report["host"]["memory_provider"],
@@ -268,6 +282,26 @@ ENGINE_RETAIN_DEFAULTS = {ENGINE_RETAIN_CAP: 64_000, ENGINE_RETAIN_CHUNK: 3_000}
 #: measures by sending a test embedding — a model request inside a process start.
 ENGINE_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENGINE_EMBEDDINGS_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"
+ENGINE_EMBEDDINGS_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
+#: The pinned engine's own text default is a hosted one: `DEFAULT_LLM_PROVIDER = "openai"`
+#: with `DEFAULT_LLM_MODEL = "gpt-4o-mini"` in 0.10.1's config, and an OpenAI-compatible
+#: provider with no base URL uses the SDK's host, api.openai.com. So an environment that
+#: leaves these names out is not "local for now" — it is a memory server reading the owner's
+#: evidence into somebody else's API, and the bill and the breach are both discovered later.
+ENGINE_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
+#: A provider name, the key that has to name it, and the key that has to say where it is.
+#: `vision` and `embeddings` are absent-by-default (no route at all), unlike the text provider,
+#: so only a named provider is asked for an endpoint.
+ENGINE_ROUTES = (("text", ENGINE_LLM_PROVIDER, "HINDSIGHT_API_LLM_BASE_URL"),
+                 ("vision", "HINDSIGHT_API_VLM_PROVIDER", "HINDSIGHT_API_VLM_BASE_URL"),
+                 ("embeddings", ENGINE_EMBEDDINGS_PROVIDER, ENGINE_EMBEDDINGS_BASE_URL))
+#: Providers the engine serves out of its own process: `none` declines to answer, `mock`
+#: answers in code, `llamacpp` runs a model the operator gave a path to, and the embeddings
+#: and reranker `local` providers load a model in process. None of them has an endpoint.
+ENGINE_LOCAL_PROVIDERS = ("none", "mock", "llamacpp", "local")
+#: Any key naming an endpoint is checked, whichever provider it belongs to: a base URL is the
+#: only thing that turns a hosted provider name into a local one.
+ENGINE_BASE_URL_SUFFIX = "_BASE_URL"
 
 
 def _engine_configuration(ctx: Context) -> list[str]:
@@ -316,6 +350,45 @@ def _engine_configuration(ctx: Context) -> list[str]:
                 "that warms a model up — and the request goes through the admission gate, so "
                 "while the owner holds inference the backend cannot boot at all and its unit "
                 "is left failed by the restart limit")
+    refused.extend(_engine_endpoints(path, values))
+    return refused
+
+
+def _engine_endpoints(path, values: dict[str, str]) -> list[str]:
+    """Refuse an environment whose model traffic could leave this machine.
+
+    Three separate inheritances are being refused here, all of them silent: an unnamed text
+    provider, the engine's own default of a hosted one; a named OpenAI-compatible provider
+    with no base URL, which the client sends to its vendor's host; and a base URL that names
+    a public machine or a resolvable name, which is the same leak written out on purpose.
+    """
+    refused: list[str] = []
+    if not str(values.get(ENGINE_LLM_PROVIDER, "")).strip():
+        refused.append(
+            f"{path.name} names no {ENGINE_LLM_PROVIDER}: the pinned engine inherits its own "
+            "default, which is the hosted OpenAI provider asking for gpt-4o-mini, so an "
+            "environment that leaves this out is not local by accident — it is the owner's "
+            "memory on somebody else's API. Name a provider, or name none")
+    for work, provider_key, url_key in ENGINE_ROUTES:
+        provider = str(values.get(provider_key, "")).strip().lower()
+        if not provider or provider in ENGINE_LOCAL_PROVIDERS:
+            continue
+        if not str(values.get(url_key, "")).strip():
+            refused.append(
+                f"{path.name} sets {provider_key}={provider} for the {work} route without "
+                f"{url_key}: an OpenAI-compatible provider with no base URL is served by the "
+                "client's own host, api.openai.com, and the route the operator meant to leave "
+                "unset is the one that is set")
+    for key in sorted(values):
+        if not key.endswith(ENGINE_BASE_URL_SUFFIX):
+            continue
+        url = str(values[key]).strip()
+        if url and not endpoint_is_private(url):
+            refused.append(
+                f"{path.name}: {key}={url} is neither loopback nor a literal private address. "
+                "This installation admits no other inference endpoint, and the allowlist that "
+                "binds the framework's own routes does not reach a backend process: the base "
+                "URL written here is where the evidence goes")
     return refused
 
 
@@ -776,7 +849,8 @@ _STEPS: dict[str, Callable] = {
 # -- the machinery around the steps ------------------------------------------
 
 def _context(settings, *, hermes_home, profile=None, registry=None, ref=None,
-             environ=None, runner=None, actor=None, start_services=False) -> Context:
+             environ=None, runner=None, actor=None, start_services=False,
+             proc: Path | None = Path("/proc")) -> Context:
     home = Path(hermes_home).expanduser()
     if not home.is_absolute():
         raise SetupError("the Hermes home must be an absolute path")
@@ -789,7 +863,7 @@ def _context(settings, *, hermes_home, profile=None, registry=None, ref=None,
                    profile=profile or profile_name(home), actor=owner,
                    registry=registry or ProfileRegistry.reading(settings),
                    runner=runner, ref=ref, environ=dict(environ or {}),
-                   start_services=start_services)
+                   start_services=start_services, proc=proc)
 
 
 def profile_name(home: Path) -> str:

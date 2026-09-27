@@ -1990,11 +1990,16 @@ class Answers:
 
     def __init__(self):
         self.retain_calls = []
+        self.cancelled: list[str] = []
         self.asked: list[str] = []
 
     def retain_async(self, items, *, submission_id):
         self.retain_calls.append({"items": items, "submission_id": submission_id})
         return {"ok": True, "operation_id": submission_id}
+
+    def cancel_operation(self, operation_id):
+        self.cancelled.append(operation_id)
+        return {"ok": True, "operation_id": operation_id, "state": "cancelled"}
 
     def operation(self, operation_id):
         self.asked.append(operation_id)
@@ -2435,14 +2440,22 @@ def test_a_job_cancel_needs_no_admission_ledger(home):
     assert not gate_path(settings).exists()
 
 
-def test_cancel_answers_only_for_the_profile_the_owner_named(forming, enrolled):
-    """A job id from one person's store is not a job in another person's."""
+def test_cancel_answers_only_for_the_profile_the_owner_named(forming, enrolled, stubbed):
+    """A job id from one person's store is not a job in another person's.
+
+    This installation has a backend route, so the cancellation does pick up the phone — over
+    the seam the fixture wires. Left to derive its client from the owned env file, the door
+    would be writing to whatever lives at the configured address, which makes the suite a
+    fact about the machine rather than about this build.
+    """
     assert not (enrolled.data_dir / "gate.db").exists()
     code, message = errors("cancel", "--job", "job-nope", "--reason", "mistake",
                            "--hermes-home", str(enrolled.home))
     assert code == 2 and "no queued job" in message
     job_id = dispatch()
-    assert run("cancel", "--job", job_id, "--reason", "mistake")[0] == 0
+    code, report = run("cancel", "--job", job_id, "--reason", "mistake")
+    assert code == 0 and report["operations"][0]["backend"] == "confirmed"
+    assert stubbed.cancelled == ["op-1"], "the stop was asked through the seam, not a socket"
     assert errors("cancel", "--job", job_id, "--reason", "mistake",
                   "--hermes-home", str(enrolled.home))[1].count("no queued job") == 1
 

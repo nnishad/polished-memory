@@ -14,8 +14,10 @@ import pytest
 from conftest import envelope
 from learning_cases import AGENT, CASES, INVOICE_RULE, RULE, Runner, propose
 from hermes_memory.learning.evaluation import EvaluationLedger
-from hermes_memory.learning.lessons import LessonStore, match
+from hermes_memory.learning.lessons import (ACTOR_LIMIT, LessonStore, match,
+                                           promotion_actor)
 from hermes_memory.learning.outcomes import OutcomeLog
+from hermes_memory.ids import digest
 from hermes_memory.proactive.outbox import Outbox
 from hermes_memory.proactive.policy import POLICY_VERSION, AttentionPolicy
 from hermes_memory.storage.evidence import EvidenceError
@@ -330,6 +332,71 @@ def test_a_passing_run_promotes_and_says_who_decided(store, lessons, ledger, evi
     lesson = lessons.get("chase-invoice")
     assert lesson.status == "active"
     assert lesson.created_by == AGENT and lesson.evaluation_id == report["id"]
+
+
+def test_a_promotion_names_the_program_that_scored_it():
+    """Where the whole path fits in the space an actor has, the attribution keeps it."""
+    runner = "/srv/hermes/bin/answer.sh"
+    assert promotion_actor(runner) == f"evaluation:{runner}"
+
+
+def a_runner_whose_attribution_is(space: int) -> str:
+    """A script path whose full attribution would be exactly *space* characters."""
+    ends = "/srv/hermes-memory/releases/" + "/answer.sh"
+    padded = space - len("evaluation:") - len(ends)
+    return "/srv/hermes-memory/releases/" + "d" * padded + "/answer.sh"
+
+
+def test_an_attribution_that_exactly_fills_the_space_keeps_the_whole_path():
+    runner = a_runner_whose_attribution_is(ACTOR_LIMIT)
+    assert len(f"evaluation:{runner}") == ACTOR_LIMIT, runner
+    assert promotion_actor(runner) == f"evaluation:{runner}"
+
+
+def test_one_character_more_than_the_space_is_a_digest_rather_than_a_refusal():
+    """The bound is paid here rather than at the write, which only refuses.
+
+    A release directory is a 40-character commit name under a runtime pointer, so the path a
+    worker was started from is routinely longer than the attribution column, and the program
+    is still identifiable without the directory that held it.
+    """
+    runner = a_runner_whose_attribution_is(ACTOR_LIMIT + 1)
+    assert promotion_actor(runner) == f"evaluation:answer.sh:{digest([runner])[:12]}"
+    assert len(promotion_actor(runner)) <= ACTOR_LIMIT
+
+
+def test_two_releases_holding_one_script_name_do_not_sign_the_same_way():
+    """The digest is the whole of the difference between one release and the next."""
+    first = ("/home/operator/data/hermes-memory/runtime/releases/"
+             "0123456789abcdef0123456789abcdef01234567/hindsight/bin/answer.sh")
+    second = first.replace("0123456789abcdef", "9876543210fedcba")
+    assert promotion_actor(first) == promotion_actor(first), "one program, one name, every time"
+    assert promotion_actor(first) != promotion_actor(second)
+
+
+def test_a_deep_run_promotes_within_the_space_an_actor_has(store, lessons, evidence):
+    """The bound is met on the way to the write, not discovered by the write refusing it.
+
+    An evaluation row may hold a 120-character runner — that is the same column's bound —
+    and the promotion's prefix does not fit inside it, so a run from a deep release directory
+    has to be signed by the program's name rather than by the path that happened to hold it.
+    """
+    runner = a_runner_whose_attribution_is(ACTOR_LIMIT + 11)
+    assert len(runner) == ACTOR_LIMIT, runner
+
+    class Deep(Runner):
+        name = runner
+
+    subject = EvaluationLedger(store, runner=Deep(), code_version="hm-0.4",
+                              model_version="remote-9b", lessons=lessons)
+    lessons.evaluations = subject
+    made = propose(lessons, evidence)
+    report = subject.run(lesson_id="chase-invoice", version=made["version"], cases=list(CASES))
+    assert report["promoted"] is True
+    row = store.db.execute("SELECT decided_by FROM lessons WHERE id='chase-invoice' "
+                           "AND status='active'").fetchone()
+    assert row["decided_by"] == f"evaluation:answer.sh:{digest([runner])[:12]}"
+    assert len(row["decided_by"]) <= ACTOR_LIMIT
 
 
 def test_a_promoter_is_not_the_proposer(store, lessons, evidence):

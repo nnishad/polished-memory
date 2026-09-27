@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from hermes_memory import config
-from hermes_memory.config import (SettingError, load_settings, scoped_secret,
-                                  scoped_settings, validate_inference_route)
+from hermes_memory.config import (SettingError, endpoint_is_private, load_settings,
+                                  scoped_secret, scoped_settings, validate_inference_route)
 
 APPROVED_LAN = "192.168.68.65"
 REPO = Path(config.__file__).resolve().parents[2]
@@ -201,6 +201,28 @@ def test_validate_inference_route_rejects_unusable_or_cloud_targets(url):
         validate_inference_route(url, frozenset({APPROVED_LAN, "127.0.0.1"}))
 
 
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8888", "http://[::1]:8080/v1",
+                                 f"http://{APPROVED_LAN}:8080/v1", "http://10.0.0.5/v1",
+                                 "https://172.16.9.9:80/v1", "http://[fd12::3]:8080/v1"])
+def test_an_endpoint_on_this_machine_or_the_private_lan_is_private(url):
+    """The question a backend's own environment is asked: can this reach the internet?"""
+    assert endpoint_is_private(url), url
+
+
+@pytest.mark.parametrize("url", ["https://api.openai.com/v1", "http://localhost:11434/v1",
+                                 "http://8.8.8.8/v1", "http://169.254.169.254/latest",
+                                 "http://100.64.0.1/v1", "http://[fe80::1]:8080/v1",
+                                 "http://internal.example:8080/v1", "ftp://127.0.0.1/x",
+                                 "127.0.0.1:8888", ""])
+def test_a_name_or_a_public_number_is_not_a_private_endpoint(url):
+    """`localhost` is a name, and a name is a record somebody else controls.
+
+    A hosted endpoint is what the whole no-cloud policy exists to keep out, and it does not
+    become acceptable because the process reaching it is the backend rather than this one.
+    """
+    assert not endpoint_is_private(url), url
+
+
 def test_validate_inference_route_accepts_loopback_and_literal_lan():
     hosts = frozenset({"127.0.0.1", APPROVED_LAN})
     assert validate_inference_route("http://127.0.0.1:8080/v1", hosts) == "127.0.0.1"
@@ -235,6 +257,74 @@ def test_a_hostname_is_refused_even_if_it_resolves_privately():
     # DNS can be redirected; only literal addresses are admissible.
     with pytest.raises(SettingError, match="neither loopback nor a literal private"):
         validate_inference_route("http://internal.example/v1", frozenset({"internal.example"}))
+
+
+def _routes(tmp_path, monkeypatch, *, backend: str, admission: str):
+    """An owned file naming a backend route and, optionally, this framework's own listener.
+
+    The process environment is cleared for both first: these are settings a running
+    installation exports, and a suite that inherited them would be testing the machine.
+    """
+    home = tmp_path / "home"
+    write_env(home, {"HERMES_MEMORY_HINDSIGHT_URL": backend,
+                     "HERMES_MEMORY_ADMISSION_URL": admission,
+                     "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS": "127.0.0.1"})
+    for key in ("HINDSIGHT_URL", "ADMISSION_URL"):
+        monkeypatch.delenv(f"HERMES_MEMORY_{key}", raising=False)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+
+
+def test_a_backend_route_that_points_at_this_frameworks_own_listener_is_refused(tmp_path,
+                                                                                monkeypatch):
+    """The admission endpoint answers by asking the backend, so that route is a call to itself.
+
+    A shipped template once documented both services on one port; the recursion it would have
+    started is a hang rather than an error, which is why the loader refuses it rather than
+    leaving it for the first retain to discover.
+    """
+    _routes(tmp_path, monkeypatch, backend="http://127.0.0.1:8123",
+            admission="http://127.0.0.1:8123")
+    with pytest.raises(SettingError, match="ADMISSION_URL"):
+        load_settings()
+
+
+@pytest.mark.parametrize("admission", ["http://127.0.0.1", "http://127.0.0.1:80/",
+                                       "HTTP://127.0.0.1:80"])
+def test_the_implicit_port_and_the_named_one_are_the_same_listener(admission, tmp_path,
+                                                                   monkeypatch):
+    _routes(tmp_path, monkeypatch, backend="http://127.0.0.1:80/v1", admission=admission)
+    with pytest.raises(SettingError, match="ADMISSION_URL"):
+        load_settings()
+
+
+def test_two_listeners_on_one_host_are_only_the_same_thing_when_they_share_a_port(tmp_path,
+                                                                                  monkeypatch):
+    """The real shape of an installation: its own gate beside the engine, one address each."""
+    _routes(tmp_path, monkeypatch, backend="http://127.0.0.1:8888",
+            admission="http://127.0.0.1:8123")
+    assert load_settings().hindsight_url == "http://127.0.0.1:8888"
+
+
+def test_a_configured_backend_with_no_admission_endpoint_is_not_argued_with(tmp_path,
+                                                                            monkeypatch):
+    """An installation whose runtime unit is not installed has nothing to collide with."""
+    _routes(tmp_path, monkeypatch, backend="http://127.0.0.1:8888", admission="")
+    assert load_settings().hindsight_url == "http://127.0.0.1:8888"
+
+
+@pytest.mark.parametrize("backend,admission", [
+    ("http://127.0.0.1:8888", "http://127.0.0.1:everywhere"),
+    ("http://127.0.0.1:nearby", "http://127.0.0.1:everywhere"),
+])
+def test_an_admission_endpoint_that_is_not_a_listener_is_not_blamed_for_the_route(
+        backend, admission, tmp_path, monkeypatch):
+    """A port that is not a number is that line's own problem, not evidence of a collision.
+
+    Reporting one as a clash would send the operator to edit the other setting, and two
+    unparsable ports are not proof that they name one place to listen.
+    """
+    _routes(tmp_path, monkeypatch, backend=backend, admission=admission)
+    assert load_settings().hindsight_url == backend
 
 
 @pytest.mark.parametrize("too_long", ["8", "8.0", "30", "0", "-1", "soon", ""])

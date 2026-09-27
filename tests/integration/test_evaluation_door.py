@@ -28,7 +28,7 @@ from hermes_memory.config import load_settings
 from hermes_memory.learning.evaluation import EvaluationLedger
 from hermes_memory.learning.evaluator import (CommandRunner, EvaluationError, evaluate,
                                               load_suite, report_on)
-from hermes_memory.learning.lessons import LessonStore
+from hermes_memory.learning.lessons import ACTOR_LIMIT, LessonStore
 from hermes_memory.learning.outcomes import OutcomeLog
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.operations.doctor import Doctor
@@ -397,8 +397,12 @@ def test_the_environment_an_evaluator_sees_comes_from_the_owners_file(tmp_path, 
         run = store.db.execute("SELECT runner FROM evaluations WHERE id=?",
                                (lesson["evaluation_id"],)).fetchone()
     assert run["runner"].endswith("answer.sh"), "the run keeps the whole path it was told"
-    assert lesson["decided_by"].startswith("evaluation:answer.sh:"), \
-        "and the promotion names the program that scored it, in the space an actor has"
+    # Which of the two spellings an activation gets depends on how deep this run's temporary
+    # root happens to be, so the door is checked against the contract that never varies: the
+    # program that scored the run is named, and the attribution fits the space one has. The
+    # unit tests pin each spelling exactly.
+    assert "answer.sh" in lesson["decided_by"] and lesson["decided_by"].startswith("evaluation:")
+    assert len(lesson["decided_by"]) <= ACTOR_LIMIT, "an actor's space is a bound, not a wish"
 
 
 def test_nothing_is_allowed_through_until_the_owner_names_it(tmp_path, monkeypatch):

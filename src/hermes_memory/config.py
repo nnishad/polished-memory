@@ -16,8 +16,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 __all__ = ["Settings", "SettingError", "load_settings", "validate_inference_route",
-           "scoped_settings", "scoped_secret", "env_file_values", "DEFAULT_PROFILE",
-           "DEFAULT_BANK"]
+           "endpoint_is_private", "scoped_settings", "scoped_secret", "env_file_values",
+           "DEFAULT_PROFILE", "DEFAULT_BANK"]
 
 
 class SettingError(RuntimeError):
@@ -244,6 +244,35 @@ class Settings:
         )
 
 
+def endpoint_is_private(url: str) -> bool:
+    """Whether a URL names loopback or a literal private address, without asking DNS.
+
+    This is the question the backend's own environment is asked, rather than the route
+    allowlist question: the allowlist decides which routes *this process* may use, while a
+    memory server configured with somebody else's endpoint is a policy breach in a process
+    that never consults the allowlist at all.
+    """
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    return _host_is_local_or_lan(parsed.hostname.lower())
+
+
+def _same_endpoint(first: str, second: str) -> bool:
+    """Whether two URLs name one listener: same host, same port, defaults resolved."""
+    def key(value: str):
+        parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        host = (parsed.hostname or "").lower()
+        return (host, port if port is not None else 443 if parsed.scheme == "https" else 80)
+
+    left, right = key(first), key(second)
+    return left is not None and left == right
+
+
 def validate_inference_route(url: str, allowed: frozenset[str]) -> str:
     """Return the host of *url*, or raise if the route is not explicitly approved."""
     parsed = urlparse(url)
@@ -294,6 +323,13 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
             "inference is enabled with a configured route but no "
             "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS allowlist"
         )
+
+    admission = (get("ADMISSION_URL") or "").strip()
+    if url and admission and _same_endpoint(url, admission):
+        raise SettingError(
+            f"HERMES_MEMORY_HINDSIGHT_URL and HERMES_MEMORY_ADMISSION_URL both name "
+            f"{admission}: the admission endpoint is this framework's own listener, so the "
+            "route is a request to answer oneself rather than to ask the backend")
 
     foreground = _deadline(get("FOREGROUND_DEADLINE_S", str(DEFAULT_FOREGROUND_DEADLINE_S)))
     queue = _gate_queue(get("GATE_QUEUE_S", str(DEFAULT_GATE_QUEUE_S)))
