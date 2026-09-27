@@ -170,7 +170,7 @@ def run(settings, *, hermes_home: str | Path, actor: str, review: str,
 # -- the steps ---------------------------------------------------------------
 
 def _inventory(ctx: Context, *, apply: bool) -> dict[str, Any]:
-    """Read the machine. This step writes nothing and asks no model anything."""
+    """Read the machine. This step writes nothing, runs no host command, opens no socket."""
     report = survey(ctx.settings, hermes_home=ctx.hermes_home, environ=ctx.environ,
                     proc=ctx.proc)
     said = conflicts(report)

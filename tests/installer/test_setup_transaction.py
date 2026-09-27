@@ -9,6 +9,7 @@ proves erasure, not merely that tables exist.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sqlite3
 from pathlib import Path
@@ -196,14 +197,30 @@ def test_setup_refuses_a_relative_home(installation):
 
 # -- what an approval is actually about ---------------------------------------
 
-def proc_table(tmp_path, name: str, *ports: int) -> Path:
-    """A machine's socket table as written by the kernel, so a test can say what is on it."""
+def proc_table(tmp_path, name: str, *ports: int, owned_by: Path | None = None,
+               pid: str = "4242", program: str = "hindsight", inode: str = "9001") -> Path:
+    """A machine's socket table as written by the kernel, so a test can say what is on it.
+
+    `owned_by` puts this installation's own process behind the last port, the way /proc does:
+    the table names an inode, the process has that socket open, and its command line carries
+    this installation's home. Every other port keeps no inode, so it is somebody unreadable's.
+    """
     root = tmp_path / name
     (root / "net").mkdir(parents=True)
-    rows = "".join(f"   {index}: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000\n"
-                   for index, port in enumerate(ports))
-    (root / "net" / "tcp").write_text("  sl  local_address rem_address   st\n" + rows,
-                                      encoding="utf-8")
+    rows = []
+    for index, port in enumerate(ports):
+        ours = owned_by is not None and port == ports[-1]
+        rows.append(f"   {index}: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000"
+                    + (f" 00:00000000 00000000  1000        0 {inode}\n" if ours else "\n"))
+    (root / "net" / "tcp").write_text("  sl  local_address rem_address   st\n"
+                                      + "".join(rows), encoding="utf-8")
+    if owned_by is not None:
+        descriptors = root / pid / "fd"
+        descriptors.mkdir(parents=True)
+        os.symlink(f"socket:[{inode}]", descriptors / "7")
+        (root / pid / "cmdline").write_bytes(
+            b"\0".join([f"/usr/bin/{program}".encode(), b"--config",
+                        str(Path(owned_by) / "hermes-memory.env").encode()]) + b"\0")
     return root
 
 
@@ -247,6 +264,66 @@ def test_a_port_this_installation_wants_being_held_is_said_and_changes_the_plan(
     said = " ".join(held["steps"][0]["actions"])
     assert "1 of 2 endpoint(s)" in said and "hindsight" in said, held["steps"][0]["actions"]
     assert "9999" not in said, "a stranger's listener is not this installation's to report"
+
+
+def test_a_running_installation_is_replaced_rather_than_refused(tmp_path, monkeypatch):
+    """`stop, setup, start` was the only way through, for no collision at all.
+
+    The port this installation wants is held by a process whose own command line names this
+    installation's home, read out of /proc. A plan that called that a collision would be
+    refusing to restart itself, and asking the service manager instead would have made a
+    read-only step run host commands.
+    """
+    home = tmp_path / "instance"
+    home.mkdir()
+    release = host(home, HINDSIGHT_URL="http://127.0.0.1:8888")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    settings = load_settings()
+    environ = {"HERMES_MEMORY_RELEASE": str(release)}
+    proc = proc_table(tmp_path, "held", 9999, 8888)
+
+    running = plan(settings, hermes_home=home, environ=environ,
+                   proc=proc_table(tmp_path, "owned", 9999, 8888, owned_by=home))
+    assert not any("already listening" in line for line in running["blocked"]), \
+        running["blocked"]
+    said = " ".join(running["steps"][0]["advisory"])
+    assert "4242" in said and "replaces" in said, running["steps"][0]["advisory"]
+
+    stranger = plan(settings, hermes_home=home, environ=environ, proc=proc)
+    assert any("already listening" in line for line in stranger["blocked"]), stranger["blocked"]
+    # Attribution changes the verdict on the port and nothing else: the steps, and so the
+    # work an owner is being asked to approve, are identical either way.
+    assert ({item["step"]: item["actions"] for item in stranger["steps"]}
+            == {item["step"]: item["actions"] for item in running["steps"]}), (
+        [item["actions"] for item in running["steps"]][:1],
+        [item["actions"] for item in stranger["steps"]][:1])
+    assert [item["state"] for item in running["steps"]][0] == "pending"
+    assert [item["state"] for item in stranger["steps"]][0] == "blocked"
+
+
+def test_an_approval_survives_its_own_service_being_restarted(tmp_path, monkeypatch):
+    """Which process happened to hold the port is a reading of the machine, not a decision.
+
+    A restart changes the PID and nothing else, so a plan that carried the holder's name or
+    number into what was approved would expire an owner's approval every time a unit was
+    bounced — including by the setup run the approval was for.
+    """
+    home = tmp_path / "instance"
+    home.mkdir()
+    release = host(home, HINDSIGHT_URL="http://127.0.0.1:8888")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    settings = load_settings()
+    environ = {"HERMES_MEMORY_RELEASE": str(release)}
+
+    before = plan(settings, hermes_home=home, environ=environ,
+                  proc=proc_table(tmp_path, "first", 8888, owned_by=home, pid="4242"))
+    after = plan(settings, hermes_home=home, environ=environ,
+                 proc=proc_table(tmp_path, "second", 8888, owned_by=home, pid="7777"))
+    assert [item["advisory"] for item in before["steps"]][0] != \
+           [item["advisory"] for item in after["steps"]][0], "the two machines do differ"
+    assert before["review_digest"] == after["review_digest"]
 
 
 def test_an_installation_with_no_owner_named_has_nobody_whose_approval_counts(tmp_path,

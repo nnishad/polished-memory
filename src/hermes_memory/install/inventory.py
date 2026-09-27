@@ -28,6 +28,9 @@ __all__ = ["survey", "listening_ports", "provider_selection", "conflicts"]
 ENV_PREFIX = "HERMES_MEMORY_"
 _HEX_PORT = re.compile(r"^[0-9A-Fa-f]{4}$")
 LISTEN = "0A"
+# Where `backup` writes its copies, relative to a profile's data directory. Named here because
+# the search for a second capture owner has to look straight through it.
+SNAPSHOT_DIR = "snapshots"
 # A scalar the host would have written starts with none of these.
 _NOT_SCALAR = frozenset("[{&*|>-?")
 # The answers an inventory gives when the fact is simply not there to be read. They
@@ -52,6 +55,10 @@ def survey(settings, *, hermes_home: str | Path | None = None,
         unknowns.append("no installed Hermes distribution to read a version from")
     if not endpoints["proc_readable"]:
         unknowns.append("the listening-port table, so no port collision has been ruled out")
+    if endpoints["unattributed"]:
+        unknowns.append("which process holds the "
+                        f"{', '.join(endpoints['unattributed'])} port(s), so a stranger's "
+                        "listener cannot be told apart from this installation's own")
     if disk["free_bytes"] is None:
         unknowns.append("free disk space beside " + disk["measured_against"])
     return {"installation": installation, "release": _release(settings, environment),
@@ -203,15 +210,39 @@ def provider_selection(config_path: Path) -> str:
 
 
 def _endpoints(settings, *, proc: Path | None) -> dict[str, Any]:
-    """Configured bind points against what is already listening. Local reads only."""
-    listening = listening_ports(proc)
+    """Configured bind points against what is already listening. Local reads only.
+
+    `held_by_ours` names the wanted ports whose every listener is a process of this
+    installation itself — the difference between restarting this installation and arguing with a
+    stranger over one port, and the fact that lets a re-run against a running machine be a
+    restart rather than a refusal. It lives outside `wanted`, whose shape the approval digest is
+    taken over: which process happened to be up when the plan was read is not a change to what
+    was approved.
+    """
+    sockets = _socket_table(proc)
     wanted = _configured_ports(settings)
+    ours: dict[str, Any] = {}
+    unnamed: list[str] = []
+    for name, port in wanted.items():
+        if not port or port not in sockets:
+            continue
+        holders = [_listener(proc, inode, home=str(settings.home))
+                   for inode in sockets[port]]
+        # Every socket on the port has to be ours to call it ours: a service listening on
+        # v4 does not speak for whatever is on v6, and a plan that asked only "who is on
+        # this port" would restart into a bind failure it had just approved.
+        if all(holder is not None and holder["ours"] for holder in holders):
+            ours[name] = {"pid": holders[0]["pid"], "program": holders[0]["program"]}
+        elif any(holder is None for holder in holders):
+            unnamed.append(name)
     return {
-        "listening_ports": sorted(listening),
-        "proc_readable": bool(listening),
+        "listening_ports": sorted(sockets),
+        "proc_readable": bool(sockets),
         "wanted": {str(name): {"port": port,
-                               "in_use": port in listening if port else None}
+                               "in_use": port in sockets if port else None}
                    for name, port in wanted.items()},
+        "held_by_ours": ours,
+        "unattributed": sorted(unnamed),
         "routes": [{"work": name, "base_url": route.base_url, "resource": route.resource,
                     "model": route.model or "engine default"}
                    for name, route in (("text", settings.text_route),
@@ -251,12 +282,19 @@ def _port_of(url: str | None) -> int | None:
 
 
 def listening_ports(proc: Path | None) -> set[int]:
-    """Ports this machine is listening on, read from /proc without opening a socket.
+    """Ports this machine is listening on, read from /proc without opening a socket."""
+    return set(_socket_table(proc))
 
-    Parsing hex is dull and deliberate: binding a probe port to check for a collision
-    is exactly how an installer takes a port away from something that was using it.
+
+def _socket_table(proc: Path | None) -> dict[int, list[str]]:
+    """Every listening socket, as port to the inodes that name their owners. A /proc read.
+
+    Parsing hex is dull and deliberate: binding a probe port to check for a collision is
+    exactly how an installer takes a port away from something that was using it. The inodes
+    are kept because a port says only that something is there, while they say what — and one
+    port can have more than one something, one per address family.
     """
-    found: set[int] = set()
+    found: dict[int, list[str]] = {}
     if proc is None:
         return found
     for table in ("net/tcp", "net/tcp6"):
@@ -271,8 +309,66 @@ def listening_ports(proc: Path | None) -> set[int]:
                 continue
             _, separator, port = columns[1].rpartition(":")
             if _HEX_PORT.fullmatch(port):
-                found.add(int(port, 16))
+                found.setdefault(int(port, 16), []).append(
+                    columns[9] if len(columns) > 9 else "")
     return found
+
+
+def _listener(proc: Path | None, inode: str, *, home: str) -> dict[str, Any] | None:
+    """The process holding a listening socket, and whether it is this installation's own.
+
+    A process's `cmdline` is readable for every process on the machine and carries no secret, so
+    the owner is found by a file read rather than by asking the service manager to run anything —
+    the inventory runs no commands. An installation's own units carry their home in their command
+    line, and that is the comparison that matters: a stranger on the same port is not a listener
+    this run may replace. When nothing can be named, the port is still somebody's.
+    """
+    if proc is None or not inode:
+        return None
+    wanted = f"socket:[{inode}]"
+    try:
+        pids = sorted((path for path in Path(proc).iterdir() if path.name.isdigit()),
+                      key=lambda path: int(path.name))
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            descriptors = list((pid / "fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                held = os.readlink(descriptor)
+            except OSError:
+                continue
+            if held != wanted:
+                continue
+            argv = _arguments(pid)
+            command = " ".join(argv)
+            return {"pid": pid.name, "program": _program(argv),
+                    "ours": bool(command) and home in command}
+    return None
+
+
+def _arguments(pid: Path) -> list[str]:
+    try:
+        raw = (pid / "cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+# A shebang makes the kernel report the interpreter first, and naming it answers nothing about
+# who owns a port: the unit says which program it was written to run, one argument further along.
+_INTERPRETERS = frozenset({"python", "python3", "pythonw", "pypy3", "sh", "bash", "zsh", "dash"})
+
+
+def _program(argv: list[str]) -> str:
+    for argument in argv:
+        name = argument.rsplit("/", 1)[-1]
+        if argument.startswith("/") and name not in _INTERPRETERS:
+            return name
+    return argv[0].rsplit("/", 1)[-1] if argv else "unknown"
 
 
 def _capture_owners(settings, *, home: Path | None) -> dict[str, Any]:
@@ -294,7 +390,14 @@ def _capture_owners(settings, *, home: Path | None) -> dict[str, Any]:
         if not root.is_dir():
             continue
         for name in seen:
-            seen[name].extend(str(path) for path in sorted(root.rglob(name)))
+            for path in sorted(root.rglob(name)):
+                # A snapshot is a copy this installation took of a store it already counted, and
+                # the pre-restore guard is a copy of one of those. Counting them as owners made
+                # `backup` look like a second capture owner, and made the next backup expire the
+                # approval of a plan whose steps had not moved.
+                if SNAPSHOT_DIR in path.relative_to(root).parts[:-1]:
+                    continue
+                seen[name].append(str(path))
     return {"searched": [str(root) for root in searched],
             "canonical_stores": sorted(set(seen["canonical.db"])),
             "capture_spools": sorted(set(seen["capture-spool.db"]))}
@@ -327,10 +430,17 @@ def conflicts(report: dict[str, Any]) -> list[str]:
     a missing owner principal only blocks forgetting.
     """
     say: list[str] = []
+    ours = report["endpoints"].get("held_by_ours") or {}
     for name, entry in sorted(report["endpoints"]["wanted"].items()):
         if entry["port"] and entry["in_use"]:
-            say.append(f"the {name} endpoint wants port {entry['port']}, which something "
-                       "is already listening on")
+            if name in ours:
+                hold = ours[name]
+                say.append(f"the {name} endpoint's port {entry['port']} is held by this "
+                           f"installation's own {hold['program']} (PID {hold['pid']}); a setup "
+                           "run here replaces that listener rather than colliding with it")
+            else:
+                say.append(f"the {name} endpoint wants port {entry['port']}, which something "
+                           "is already listening on")
     stores = [path for path in report["capture_owners"]["canonical_stores"]]
     if len(stores) > 1:
         say.append(f"{len(stores)} canonical stores are visible under the searched homes "

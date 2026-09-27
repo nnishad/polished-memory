@@ -132,6 +132,19 @@ provider selection through the host's narrow dotted-key writer, after approval, 
 `model.*` alone. The whole list of host commands is printed with the plan, so a reviewer sees
 every external action before any of them runs.
 
+Re-running setup against a machine that is already serving is the ordinary case rather than a
+collision, and `stop` first is not required. The `inventory` step reads the kernel's socket
+table and, for a port it wants, names the process holding it by socket inode and by the command
+line that process carries. When the holder is one of this installation's own processes the held
+port is said as an advisory — *a setup run here replaces that listener* — and the plan is not
+blocked; the sentence names the program and PID, read from `/proc`, and no host command is run
+to find out. A listener that cannot be attributed to this installation's home keeps blocking the
+run, and the report names that as the missing fact instead of guessing at it. Which of its own
+processes happened to be up is outside what the digest covers, so bouncing a service does not
+expire an approval that was about something else. A backup copy of a store, taken under the
+profile's own `snapshots/` directory, is read as one copy of one owner rather than as a second
+capture owner.
+
 `--start` and `hermes-memory start` are the only ways anything gets started, and starting
 is a separate decision from installing the units. Autostart is a third decision:
 

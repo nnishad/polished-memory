@@ -6,6 +6,7 @@ that cannot be read is reported as unreadable rather than invented.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 from pathlib import Path
@@ -150,6 +151,49 @@ def test_a_store_on_disk_is_reported_as_present(installation):
     assert report["capture_owners"]["canonical_stores"] == [str(settings.db_path)]
 
 
+def test_a_backup_of_the_store_is_not_a_second_capture_owner(installation):
+    """`backup` copies the store into the tree beside it, which is one owner and one copy.
+
+    Counting the copy made a routine backup block the next setup run — "one profile has one
+    capture owner" was said about a profile with exactly one live store — and put the snapshot
+    list inside the inputs of a plan whose steps had not moved, so every backup taken expired
+    an approval nobody had reconsidered.
+    """
+    home, settings = installation
+    settings.data_dir.mkdir(parents=True, mode=0o700)
+    with EvidenceStore(settings.db_path):
+        pass
+    taken = settings.data_dir / "snapshots" / "20260927T172823Z-snap_fc9076"
+    (taken / "pre-restore").mkdir(parents=True)
+    (taken / "canonical.db").write_bytes(b"")
+    (taken / "pre-restore" / "canonical.db").write_bytes(b"")
+
+    report = probe(installation, home)
+    assert report["capture_owners"]["canonical_stores"] == [str(settings.db_path)]
+    assert not any("capture owner" in line for line in conflicts(report)), conflicts(report)
+
+
+def test_a_store_under_a_directory_named_snapshots_is_still_a_live_owner(installation,
+                                                                        tmp_path):
+    """The exclusion is this tree's backups, not the word appearing somewhere in a path.
+
+    A profile whose data directory happens to sit beneath a directory called `snapshots` is a
+    capture owner like any other, and an inventory blind to it would let a second one be
+    enrolled over a profile that was already serving turns.
+    """
+    from dataclasses import replace
+
+    home, settings = installation
+    living = tmp_path / "snapshots" / "work"
+    living.mkdir(parents=True)
+    (living / "canonical.db").write_text("", encoding="utf-8")
+    settings = replace(settings, data_dir=living, db_path=living / "canonical.db",
+                       blob_dir=living / "blobs")
+
+    report = survey(settings, hermes_home=home, environ={}, proc=None)
+    assert report["capture_owners"]["canonical_stores"] == [str(living / "canonical.db")]
+
+
 def test_delivery_needs_a_destination_and_says_which_kind_it_has(installation, tmp_path):
     home, settings = installation
     (home / "hermes-memory.env").write_text(
@@ -287,6 +331,185 @@ def test_a_free_port_is_not_reported_as_a_problem(installation, tmp_path):
     report = survey(load_settings(), hermes_home=tmp_path, environ={}, proc=proc)
     assert report["endpoints"]["wanted"]["hindsight"]["in_use"] is False
     assert conflicts(report) == []
+
+
+def a_holder(proc, pid, *, inode, owner, program="hindsight", interpreter=None):
+    """A process that holds one listening socket and names one installation home."""
+    descriptors = proc / pid / "fd"
+    descriptors.mkdir(parents=True)
+    os.symlink(f"socket:[{inode}]", descriptors / "3")
+    argv = ([f"/usr/bin/{interpreter}"] if interpreter else []) + [
+        f"/usr/bin/{program}", "--home", str(owner)]
+    (proc / pid / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
+
+
+def a_port_8080_in_use(tmp_path, *, owner=None, pid="4242", program="hindsight",
+                      interpreter=None, inode="9001", mentioner=None, unreadable=None,
+                      other_stack=None):
+    """A /proc with one listener on the backend's port, written by hand.
+
+    A real /proc cannot be used: the holder has to be exactly the process the test is about,
+    and never whatever else happened to be listening while the test ran. The inode is the
+    whole mechanism — a port says something is there, and the inode says which process.
+
+    `owner` is the installation home the holder's command line names, so `None` leaves the
+    port held by an unnamed process; `mentioner` adds a lower-numbered process that names a
+    home in its command line without holding the socket, `unreadable` one with no descriptor
+    table to walk at all, and `other_stack` a `(inode, owner)` pair listening on v6 as well.
+    All three are what a real /proc is mostly made of.
+    """
+    proc = tmp_path / "proc"
+    (proc / "net").mkdir(parents=True)
+    (proc / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st\n"
+        f"   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 "
+        f"00000000  1000        0 {inode}\n", encoding="utf-8")
+    if other_stack is not None:
+        family_inode, family_owner = other_stack
+        (proc / "net" / "tcp6").write_text(
+            "  sl  local_address rem_address   st\n"
+            "   0: 00000000000000000000000000000000:1F90 "
+            "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 "
+            f"00000000  1000        0 {family_inode}\n", encoding="utf-8")
+        if family_owner is not None:
+            a_holder(proc, "5555", inode=family_inode, owner=family_owner)
+    if mentioner is not None:
+        (proc / "1111" / "fd").mkdir(parents=True)
+        os.symlink("/dev/null", proc / "1111" / "fd" / "0")
+        (proc / "1111" / "cmdline").write_bytes(
+            b"\0".join([b"/usr/bin/cat", f"--read {mentioner}/hermes-memory.env".encode()])
+            + b"\0")
+    if unreadable is not None:
+        # Somebody else's process: no directory to walk at all.
+        (proc / unreadable).mkdir(parents=True)
+    if owner is not None:
+        a_holder(proc, pid, inode=inode, owner=owner, program=program,
+                 interpreter=interpreter)
+    return proc
+
+
+def backend_on_8080(home):
+    """The installation's own config, pointed at a port the caller has put a listener on."""
+    (home / "hermes-memory.env").write_text(
+        config(home, OWNER_PRINCIPAL=OWNER, HINDSIGHT_URL="http://127.0.0.1:8080"),
+        encoding="utf-8")
+    from hermes_memory.config import load_settings
+
+    return load_settings()
+
+
+def test_a_port_held_by_this_installation_s_own_process_is_not_a_collision(installation,
+                                                                           tmp_path):
+    """Re-running setup against a running installation is a restart, not a fight over a port.
+
+    The port is wanted, something is listening, and the listener's own command line names this
+    installation's home. Stopping that run from proceeding would make `stop, then setup` the only
+    way through, for no collision at all.
+    """
+    home, _ = installation
+    settings = backend_on_8080(home)
+    proc = a_port_8080_in_use(tmp_path, owner=home, mentioner=home)
+
+    report = survey(settings, hermes_home=tmp_path, environ={}, proc=proc)
+    assert report["endpoints"]["held_by_ours"] == {
+        "hindsight": {"pid": "4242", "program": "hindsight"}}
+    said = conflicts(report)
+    assert any("4242" in line and "replaces" in line for line in said), said
+    assert not any("already listening" in line for line in said), \
+        "this installation's own listener must not carry the blocking sentence"
+
+
+def test_a_process_whose_descriptors_cannot_be_read_does_not_end_the_search(installation,
+                                                                            tmp_path):
+    """Almost every process on a machine belongs to somebody else, and has no table to walk.
+
+    One unreadable directory has to be stepped over: stopping there would report this
+    installation's own listener as an unknown, which is a collision the operator would be
+    told to go and clear by hand.
+    """
+    home, _ = installation
+    settings = backend_on_8080(home)
+    proc = a_port_8080_in_use(tmp_path, owner=home, unreadable="999")
+
+    report = survey(settings, hermes_home=tmp_path, environ={}, proc=proc)
+    assert report["endpoints"]["held_by_ours"] == {
+        "hindsight": {"pid": "4242", "program": "hindsight"}}
+    assert report["endpoints"]["unattributed"] == []
+
+
+def test_a_port_held_by_a_stranger_on_another_stack_is_still_a_collision(installation,
+                                                                        tmp_path):
+    """This installation's own v4 listener does not speak for whoever holds the v6 socket.
+
+    A port has one answer per address family, and a plan that read only the first would call
+    the port ours, restart into a bind failure, and have the owner's approval on the strength
+    of a half-read machine.
+    """
+    home, _ = installation
+    settings = backend_on_8080(home)
+
+    shared = survey(settings, hermes_home=tmp_path, environ={}, proc=a_port_8080_in_use(
+        tmp_path, owner=home, other_stack=("7777", tmp_path / "other-installation")))
+    assert shared["endpoints"]["held_by_ours"] == {}
+    assert any("already listening" in line for line in conflicts(shared)), conflicts(shared)
+
+    both = survey(settings, hermes_home=tmp_path, environ={}, proc=a_port_8080_in_use(
+        tmp_path / "ours", owner=home, other_stack=("7777", home)))
+    assert both["endpoints"]["held_by_ours"] == {
+        "hindsight": {"pid": "4242", "program": "hindsight"}}
+
+
+def test_a_port_held_by_another_installation_is_still_a_collision(installation, tmp_path):
+    """A listener whose command line names some other home is a stranger on our port.
+
+    Same program, same port, different installation: only the owner of the listener may be
+    replaced by a run here, and a second installation on one port is the failure the whole
+    inventory exists to catch.
+    """
+    home, _ = installation
+    settings = backend_on_8080(home)
+    proc = a_port_8080_in_use(tmp_path, owner=tmp_path / "other-installation")
+
+    report = survey(settings, hermes_home=tmp_path, environ={}, proc=proc)
+    assert report["endpoints"]["held_by_ours"] == {}
+    assert report["endpoints"]["unattributed"] == []
+    assert any("already listening" in line for line in conflicts(report))
+
+
+def test_a_port_held_by_a_process_that_cannot_be_named_says_what_is_unknown(installation,
+                                                                           tmp_path):
+    """Not finding the owner is not the same as finding a stranger, and neither is a licence.
+
+    The port keeps blocking either way; what the report owes the operator is which fact was
+    missing, because that is the difference between a machine to re-check and a machine to
+    clear by hand.
+    """
+    home, _ = installation
+    settings = backend_on_8080(home)
+    proc = a_port_8080_in_use(tmp_path)
+
+    report = survey(settings, hermes_home=tmp_path, environ={}, proc=proc)
+    assert report["endpoints"]["held_by_ours"] == {}
+    assert report["endpoints"]["unattributed"] == ["hindsight"]
+    assert any("already listening" in line for line in conflicts(report))
+    assert any("cannot be told apart" in line for line in report["unknowns"]), report["unknowns"]
+
+
+def test_a_listener_is_named_by_its_program_rather_than_by_what_ran_it(installation, tmp_path):
+    """A shebang makes the kernel report `python /…/bin/hindsight-api --home …`.
+
+    "Held by this installation's own python" answers nothing an operator asked: which unit is
+    sitting on the port is in the second word, and the units are written with that interpreter
+    first.
+    """
+    home, _ = installation
+    settings = backend_on_8080(home)
+    proc = a_port_8080_in_use(tmp_path, owner=home,
+                              interpreter="python", program="hindsight-api")
+
+    report = survey(settings, hermes_home=tmp_path, environ={}, proc=proc)
+    assert report["endpoints"]["held_by_ours"]["hindsight"]["program"] == "hindsight-api"
+    assert "python" not in " ".join(conflicts(report)), conflicts(report)
 
 
 # -- two capture owners --------------------------------------------------------
