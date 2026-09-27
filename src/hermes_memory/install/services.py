@@ -253,6 +253,38 @@ def _write_record(values: dict[str, Any], *, unit_dir: Path) -> None:
     path.chmod(0o600)
 
 
+#: Directives whose value must be a directory that exists before the manager can spawn
+#: the process. `ProtectSystem=strict` turns a missing `ReadWritePaths` entry into a mount
+#: namespace failure at exec time — exit 226, with the unit never reaching its own code — so
+#: a unit naming a directory nobody made fails as a mystery months later unless the plan that
+#: wrote the unit says so now.
+PATH_DIRECTIVES = ("WorkingDirectory", "RootDirectory", "BindPaths", "BindReadOnlyPaths")
+LIST_DIRECTIVES = ("ReadWritePaths", "ReadOnlyPaths", "ExecutableSearchPaths")
+
+
+def unit_paths(rendered: Mapping[str, str]) -> list[Path]:
+    """The absolute directories these units will require at spawn time.
+
+    Read out of the rendered text rather than restated beside it, in the same spirit as
+    `executables()`: editing a template cannot leave this check behind.
+    """
+    found: list[Path] = []
+    for text in rendered.values():
+        for line in text.splitlines():
+            stripped = line.strip()
+            for directive in (*PATH_DIRECTIVES, *LIST_DIRECTIVES):
+                prefix = f"{directive}="
+                if not stripped.startswith(prefix):
+                    continue
+                for token in stripped[len(prefix):].split():
+                    if token.startswith("-") or not token.startswith("/"):
+                        continue          # an optional marker, or a relative directory name
+                    path = Path(token)
+                    if path not in found:
+                        found.append(path)
+    return found
+
+
 def plan(settings, *, environ: dict[str, str] | None = None,
          unit_dir: str | Path | None = None,
          templates: str | Path | None = None) -> dict[str, Any]:
@@ -291,8 +323,9 @@ def plan(settings, *, environ: dict[str, str] | None = None,
     proposal = {"unit_dir": str(target),
                 "changes": sorted(f"{entry['unit']}:{entry['state']}" for entry in entries
                                   if entry["unit"] in changing)}
+    missing = [str(path) for path in unit_paths(rendered) if not path.is_dir()]
     return {"unit_dir": str(target), "units": entries, "would_change": changing,
-            "reload_needed": bool(changing),
+            "reload_needed": bool(changing), "missing_paths": missing,
             "blocked": [entry["unit"] for entry in entries if entry["state"] == "collision"],
             "start_order": list(wanted_units(settings)),
             "review_digest": digest([PLAN_VERSION,
@@ -308,6 +341,11 @@ def apply(settings, *, actor: str, review: str, environ: dict[str, str] | None =
     worse than none, since the units name each other.
     """
     proposal = plan(settings, environ=environ, unit_dir=unit_dir)
+    if proposal["missing_paths"]:
+        raise InstallationError(
+            "these units name directories that do not exist, so the manager would fail to "
+            "spawn them: " + ", ".join(proposal["missing_paths"])
+            + ". `setup`'s initialize step creates this installation's directories")
     if proposal["blocked"]:
         raise InstallationError(
             "these units already exist and were not written by this installation, so they "

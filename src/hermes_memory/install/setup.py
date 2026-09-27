@@ -376,10 +376,22 @@ def _initialize(ctx: Context, *, apply: bool) -> dict[str, Any]:
         return {"actions": ["no profile is enrolled yet, so there is no store to create"],
                 "blocking": ["the configure step must enroll this profile first"],
                 "inputs": {"store": "no profile enrolled"}}
-    if path.exists():
+    if path.exists() and not apply:
         return {"actions": [f"{path} already exists and is left exactly as it is"],
                 "inputs": {"store": str(path)}}
+    if path.exists():
+        actions = [f"{path} already exists and is left exactly as it is"]
     actions = [f"would create and migrate {path}"]
+    # The directories the backend unit binds have to exist before the manager can spawn it:
+    # under `ProtectSystem=strict` a missing `ReadWritePaths` entry is a mount-namespace
+    # failure at exec time, which is a very late way to report a missing mkdir. Created here
+    # rather than by the unit because this installation owns the layout, and created on every
+    # pass rather than only on the first because a resumed transaction may have stopped
+    # between the store and the services.
+    for directory in _backend_directories(ctx):
+        actions.append(f"would create {directory}")
+        if apply:
+            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     if apply:
         from ..storage.evidence import EvidenceStore
 
@@ -391,6 +403,17 @@ def _initialize(ctx: Context, *, apply: bool) -> dict[str, Any]:
         with EvidenceStore(path):
             pass
     return {"actions": actions, "inputs": {"store": str(path)}}
+
+
+def _backend_directories(ctx: Context) -> list[Path]:
+    """Where the engine keeps its own state: its data directory, its pg0 cluster, its cache."""
+    from .services import layout
+
+    if not ctx.settings.hindsight_url:
+        return []
+    placed = layout(ctx.settings, environ=ctx.environ)
+    return [placed.hindsight_dir, placed.pg0_dir,
+            Path(placed.instance_home) / "cache" / "huggingface"]
 
 
 def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:

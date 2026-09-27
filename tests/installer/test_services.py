@@ -45,6 +45,12 @@ def instance(tmp_path, monkeypatch):
     """An installation with a Hindsight backend configured, and a unit directory of its own."""
     home = tmp_path / "instance"
     home.mkdir()
+    # The directories the backend unit binds. `initialize` makes these on a real machine, and
+    # `services` now refuses a unit that names one which is absent — under
+    # `ProtectSystem=strict` that is a mount-namespace failure at exec time, not a warning.
+    for directory in (home / "hindsight", home / "pg0", home / "cache" / "huggingface",
+                      home / "data"):
+        directory.mkdir(parents=True)
     (home / "hermes-memory.env").write_text(
         f"HERMES_MEMORY_DATA_DIR={home / 'data'}\n"
         "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
@@ -583,3 +589,28 @@ def test_a_unit_block_without_a_separating_blank_line_still_stays_separate(insta
     assert units[BACKEND_UNIT]["ActiveState"] == "failed"
     assert units[WORKER_UNIT]["ActiveState"] == "inactive"
     assert all(units[name].get("Id") == name for name in UNITS)
+
+
+def test_a_unit_naming_a_directory_that_was_never_made_is_refused_before_it_is_written(
+        tmp_path, monkeypatch):
+    """The failure this prevents was real: exit 226/NAMESPACE, with the unit never starting.
+
+    An installation whose backend directories were not created used to have its units written
+    and approved, and then discover on the first `start` that the manager could not spawn the
+    process at all.
+    """
+    home = tmp_path / "never-initialised"
+    home.mkdir()
+    (home / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={home / 'data'}\n"
+        "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+        "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n"
+        f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    settings = load_settings()
+    proposal = plan(settings, environ=environment())
+    assert str(home / "pg0") in proposal["missing_paths"], proposal["missing_paths"]
+    with pytest.raises(InstallationError, match="would fail to spawn"):
+        apply(settings, actor=OWNER, review=proposal["review_digest"],
+              environ=environment())
