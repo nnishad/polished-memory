@@ -301,17 +301,13 @@ class JobQueue:
         is invented: the answer says the work landed, not what it cost, and a budget charged
         from a guess would make the day's spend a number nobody can defend.
         """
-        wanted = [str(item) for item in identities if str(item or "").strip()]
-        closed: list[str] = []
+        wanted = _clean(identities)
         if not wanted:
             return 0
-        marks = ",".join("?" for _ in wanted)
+        closed: list[str] = []
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            rows = self.db.execute(
-                f"SELECT id FROM processing_jobs WHERE submission_id IN ({marks}) AND "
-                f"state IN (?,?)", (*wanted, UNCERTAIN, SUBMITTING)).fetchall()
-            closed = [row["id"] for row in rows]
+            closed = self._carrying(wanted)
             for job_id in closed:
                 self.db.execute(
                     "UPDATE processing_jobs SET state=?, last_error=NULL, lease=NULL, "
@@ -324,6 +320,64 @@ class JobQueue:
             self.store._audit("job_settled_by_reconciliation", closed[0],
                               {"actor": actor, "jobs": len(closed), "settled": closed[:20]})
         return len(closed)
+
+    def settle_refused(self, identities: list[str], *, actor: str, reason: str) -> int:
+        """Put back through the attempt budget the work a negative answer has freed.
+
+        Uncertainty is not an ending: the row is ``uncertain`` because the outcome is unknown,
+        and the rule that it is never retried by itself exists to stop a machine from resending
+        private text on a guess. Once the engine names the outcome — *that operation never
+        happened* — the ordinary failed-attempt edge applies instead, and it is the honest one:
+        the attempt is counted, the backoff holds it, and when the budget runs out the row is
+        quarantined rather than looping. Nothing is dispatched here and nothing is charged; the
+        next claim is a worker's decision, made under the gate and the day's ceiling.
+        """
+        moved = []
+        for job_id in self._carrying(identities):
+            self.retry(self.get(job_id), error=reason)
+            moved.append(job_id)
+        if moved:
+            self.store._audit("job_refused_by_reconciliation", moved[0],
+                              {"actor": actor, "jobs": len(moved), "retried": moved[:20]})
+        return len(moved)
+
+    def settle_ended(self, identities: list[str], *, actor: str, reason: str) -> int:
+        """End in-flight work that must not be tried again, and say why on the row.
+
+        Two answers mean that, and they are the two places a machine could otherwise quietly
+        overrule a person: a record the owner forgot (re-forming it would put deleted text back
+        into the engine, and the projection ledger writes ``absent`` for that and for a lost
+        submission alike — only the tombstone tells them apart), and an operation somebody
+        stopped (where the ending is the point of it). The queue's own cancel edge is what runs
+        here, so a row that already succeeded is refused rather than rewritten.
+        """
+        ended = []
+        for job_id in self._carrying(identities):
+            self.cancel(job_id, actor=actor, reason=reason)
+            ended.append(job_id)
+        if ended:
+            self.store._audit("job_ended_by_reconciliation", ended[0],
+                              {"actor": actor, "jobs": len(ended), "ended": ended[:20]})
+        return len(ended)
+
+    def _carrying(self, identities: list[str]) -> list[str]:
+        """The in-flight rows whose submission is one of these backend identities.
+
+        ``UNCERTAIN`` and ``SUBMITTING`` are the only states asked about: a ``RUNNING`` row has
+        a worker watching it, and an answer arriving for a terminal row is a decision somebody
+        else already made. An empty question returns without reaching SQL — SQLite parses
+        `IN ()` happily, so the reason is the lock rather than the answer: asking for no
+        submissions still asks the store for one, and reconciling happens while a pass may be
+        writing.
+        """
+        wanted = _clean(identities)
+        if not wanted:
+            return []
+        marks = ",".join("?" for _ in wanted)
+        rows = self.db.execute(
+            f"SELECT id FROM processing_jobs WHERE submission_id IN ({marks}) AND "
+            f"state IN (?,?)", (*wanted, UNCERTAIN, SUBMITTING)).fetchall()
+        return [row["id"] for row in rows]
 
     def cancel(self, job_id: str, *, actor: str, reason: str) -> str:
         self.db.execute("BEGIN IMMEDIATE")
@@ -515,6 +569,11 @@ class JobQueue:
         if row is None:
             raise EvidenceError(f"unknown job {job_id!r}")
         return row["inputs"]
+
+
+def _clean(identities: list[str]) -> list[str]:
+    """The identities worth asking about: a blank one names no submission at all."""
+    return [str(item) for item in identities if str(item or "").strip()]
 
 
 def _job(row) -> Job:

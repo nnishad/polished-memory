@@ -158,7 +158,7 @@ class DocumentMap:
         Guessing either way produces a store that disagrees with itself.
         """
         settled = verified = still_pending = unknown = absent = 0
-        confirmed: list[str] = []
+        stopped: list[str] = []
         for row in self.outstanding(limit=limit):
             submission = row["operation_id"]
             if not submission:
@@ -172,9 +172,6 @@ class DocumentMap:
                     if state == "present":
                         self.confirm(row["record_id"], row["revision"])
                         verified += 1
-                        # The document id is the identity a synchronous retain leaves on the
-                        # job row, so this is what settles that work as well as the claim.
-                        confirmed.append(str(row["document_id"]))
                     else:
                         self.mark_absent(row["record_id"], row["revision"])
                         absent += 1
@@ -197,7 +194,6 @@ class DocumentMap:
             if state in OPERATION_DONE:
                 self.confirm(row["record_id"], row["revision"])
                 verified += 1
-                confirmed.append(str(submission))
             elif state in OPERATION_ABANDONED | OPERATION_STOPPED:
                 # `not_found` belongs here: an operation the backend has no record of is a
                 # question that can never be answered, and leaving the row open would ask it
@@ -208,6 +204,12 @@ class DocumentMap:
                 self.fail(row["record_id"], row["revision"],
                           error=f"backend operation {state}"
                           + (f": {reason[:300]}" if reason else ""))
+                if state in OPERATION_STOPPED:
+                    # Named here and nowhere else: a stop and a failure leave the same row
+                    # behind, and the projection ledger cannot afterwards tell them apart. The
+                    # difference matters to the queue, where one is owed again and the other was
+                    # ended by a person.
+                    stopped.append(str(submission))
             elif state in OPERATION_RUNNING:
                 still_pending += 1
             else:
@@ -216,10 +218,52 @@ class DocumentMap:
                                 "is neither finished nor one of the states it documents")
         return {"settled": settled, "verified": verified, "pending": still_pending,
                 "absent": absent, "unreachable": unknown,
-                # The identities the backend has now answered *yes* to, so the caller can
-                # settle the queue rows that carried them: an operation id for an async
-                # retain, a document id for a synchronous one.
-                "confirmed_identities": confirmed}
+                # The identities somebody stopped. Every other verdict this pass collected is
+                # already in the projection ledger and is read from there, so the queue sees
+                # the older answers as plainly as the fresh ones.
+                "stopped_operations": stopped}
+
+    def answers(self, *, limit: int = 200) -> dict[str, list[str]]:
+        """Every answer the backend has given about a submission, whenever it gave it.
+
+        ``reconcile`` reports what it asked about today, and a queue row has no interest in
+        when its answer arrived. A job left ``uncertain`` by an older run of this door carries
+        a submission whose projection row is already settled, and ``outstanding`` no longer
+        asks about those — so reporting only today's collection would leave the remedy the
+        doctor names unable to reach the backlog it names.
+        """
+        established: list[str] = []
+        did_not_land: list[str] = []
+        forgotten: list[str] = []
+        rows = self.db.execute(
+            "SELECT record_id, document_id, operation_id, state FROM backend_documents "
+            "WHERE backend=? AND bank_id=? AND state IN (?,?,?) ORDER BY rowid LIMIT ?",
+            (self.backend, self.bank_id, VERIFIED, FAILED, ABSENT, limit)).fetchall()
+        for row in rows:
+            # The identity the queue carries: the operation id the backend named for an async
+            # retain, or the document id a synchronous one agreed in advance and never got.
+            identity = str(row["operation_id"] or row["document_id"] or "")
+            if not identity:
+                continue
+            if row["state"] == VERIFIED:
+                established.append(identity)
+            elif self._tombstoned(str(row["record_id"])):
+                forgotten.append(identity)
+            else:
+                did_not_land.append(identity)
+        return {"established": established, "did_not_land": did_not_land,
+                "forgotten": forgotten}
+
+    def _tombstoned(self, record_id: str) -> bool:
+        """Whether the owner forgot this record — the only fact that tells the two absences apart.
+
+        A projection can be missing because a submission never arrived, or because the erasure
+        path removed it on purpose in the same transaction as the tombstone. The first wants to
+        be tried again; the second must never be re-driven, because that would put text the
+        owner deleted back into the engine.
+        """
+        return bool(self.db.execute("SELECT 1 FROM tombstones WHERE record_id=?",
+                                    (record_id,)).fetchone())
 
     def _probe(self, client, document_id: str) -> dict[str, Any]:
         """What the backend says about one document, with the reason when it cannot say.

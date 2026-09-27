@@ -1,6 +1,7 @@
 """C12 job state machine: leases, epoch fencing, budgets and honest coverage."""
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -187,7 +188,8 @@ def test_an_empty_answer_takes_no_write_lock_off_a_busy_store(jobs, store):
 
     SQLite tolerates `IN ()`, so the guard cannot be caught by a wrong answer; it is caught by
     the transaction. Reconciling happens while a pass may still be writing, and a door that
-    answers nothing has no business queueing a writer behind it.
+    answers nothing has no business queueing a writer behind it. Every settlement form has the
+    same shape, so all three are asked here.
     """
     store.db.execute("PRAGMA busy_timeout=0")
     blocker = sqlite3.connect(store.path)
@@ -195,9 +197,112 @@ def test_an_empty_answer_takes_no_write_lock_off_a_busy_store(jobs, store):
     blocker.execute("BEGIN EXCLUSIVE")
     try:
         assert jobs.settle_established([]) == 0
+        assert jobs.settle_refused([], actor="operator", reason="nothing was answered") == 0
+        assert jobs.settle_ended([], actor="operator", reason="nothing was answered") == 0
     finally:
         blocker.execute("ROLLBACK")
         blocker.close()
+
+
+def test_an_empty_answer_asks_the_store_for_nothing_at_all(jobs, store):
+    """The guard is about the lock, not the answer, and only a non-WAL store can show it.
+
+    In WAL a reader is insulated from a writer, so an empty question that still reaches SQL
+    returns nothing and looks harmless. Rollback-journal mode is the store's other shape — the
+    one a restored snapshot or an older file is in — and there a read during somebody else's
+    exclusive transaction is refused. A door with nothing to say should not be in the queue for
+    the store at all, in either mode.
+    """
+    store.db.execute("PRAGMA journal_mode=delete")
+    store.db.execute("PRAGMA busy_timeout=0")
+    blocker = sqlite3.connect(store.path)
+    blocker.isolation_level = None
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        assert jobs.settle_established([]) == 0
+        assert jobs.settle_refused([], actor="operator", reason="nothing was answered") == 0
+        assert jobs.settle_ended([], actor="operator", reason="nothing was answered") == 0
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+
+def refused(jobs, *, submission="sub-refused", inputs=("rec_denied",), **kwargs):
+    """A job whose submission the backend has now disowned."""
+    enqueued(jobs, inputs=list(inputs), **kwargs)
+    job = jobs.claim(worker="w1")
+    jobs.begin_submission(job, submission_id=submission)
+    jobs.uncertain(jobs.get(job.id), reason="the bounded wait ran out")
+    return job.id
+
+
+def test_a_denied_answer_counts_the_attempt_and_keeps_the_backoff(jobs):
+    """§8.2: a negative answer takes the failed-attempt edge, budget and all.
+
+    The row was never waiting to be forgiven, it was waiting to be known. Putting it back
+    through ``retry`` is the only path that counts the attempt, holds the backoff and can still
+    quarantine it, and it dispatches nothing by itself — the next claim is a worker's decision
+    made under the gate and the day's ceiling.
+    """
+    job_id = refused(jobs)
+    assert jobs.settle_refused(["sub-refused"], actor="operator",
+                               reason="the backend answered that this submission did not reach "
+                                      "it") == 1
+    fresh = jobs.get(job_id)
+    assert fresh.state == RETRY_WAIT
+    assert fresh.attempts == 1, "the attempt the uncertainty swallowed is counted"
+    assert "did not reach it" in fresh.last_error
+    assert fresh.submission_id == "sub-refused", "the identity is what the answer was about"
+
+
+def test_a_denied_answer_on_the_last_attempt_is_quarantined_not_looped(jobs):
+    """Reconciliation cannot exhaust a budget it does not count against."""
+    job_id = refused(jobs, max_attempts=1)
+    assert jobs.settle_refused(["sub-refused"], actor="operator",
+                               reason="the backend refused it") == 1
+    assert jobs.get(job_id).state == QUARANTINED
+
+
+def test_a_row_a_worker_is_watching_is_not_rewritten_by_an_answer(jobs):
+    """A RUNNING row has somebody who knows what it is doing; the door does not contradict them."""
+    enqueued(jobs, inputs=["rec_live"])
+    job = jobs.claim(worker="w1")
+    jobs.begin_submission(job, submission_id="sub-live")
+    jobs.mark_running(jobs.get(job.id), operation_id="op-live")
+    assert jobs.settle_refused(["sub-live"], actor="operator", reason="denied") == 0
+    assert jobs.settle_established(["sub-live"]) == 0
+    assert jobs.get(job.id).state == RUNNING
+
+
+def test_a_forgotten_record_ends_its_work_rather_than_re_forming_it(jobs):
+    """C4 applied to the queue: re-driving a forgotten record would resurrect deleted text."""
+    login = "owner-login"
+    job_id = refused(jobs, submission="sub-gone")
+    assert jobs.settle_ended(["sub-gone"], actor=login,
+                             reason="the record was forgotten") == 1
+    fresh = jobs.get(job_id)
+    assert fresh.state == CANCELLED
+    assert "forgotten" in fresh.last_error
+    assert jobs.settle_refused(["sub-gone"], actor=login, reason="denied") == 0, \
+        "and an ended row is not owed again by the next pass"
+    entry = jobs.store.db.execute("SELECT object_id, metadata FROM audit WHERE action="
+                                  "'job_ended_by_reconciliation'").fetchone()
+    assert entry["object_id"] == job_id
+    assert json.loads(entry["metadata"])["actor"] == login, \
+        "an ending is somebody's decision, and the ledger says whose"
+
+
+def test_work_that_already_finished_is_never_moved_by_an_answer(jobs):
+    """Both settlement forms refuse a terminal row: a late answer is not a retraction."""
+    enqueued(jobs, inputs=["rec_done"])
+    job = jobs.claim(worker="w1")
+    jobs.begin_submission(job, submission_id="sub-done")
+    jobs.mark_running(jobs.get(job.id), operation_id="sub-done")
+    jobs.complete(jobs.get(job.id), covered=["rec_done"], tokens=11)
+    assert jobs.settle_established(["sub-done"]) == 0
+    assert jobs.settle_ended(["sub-done"], actor="operator", reason="the record was forgotten") == 0
+    fresh = jobs.get(job.id)
+    assert fresh.state == SUCCEEDED and fresh.tokens_used == 11
 
 
 def test_an_overdue_job_is_not_dispatched(jobs):

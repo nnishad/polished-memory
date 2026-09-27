@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 import pytest
 
 from conftest import envelope
-from hermes_memory.backend.document_map import VERIFIED, DocumentMap
+from hermes_memory.backend.document_map import FAILED, VERIFIED, DocumentMap
 from hermes_memory.backend.hindsight_client import HindsightUnavailable
 from hermes_memory.config import load_settings
 from hermes_memory.ids import backend_document_id
@@ -31,7 +31,8 @@ from hermes_memory.processing.formation import (DEFAULT_BATCH, KIND, MAX_BATCH, 
                                                 processor_fingerprint, retain_route,
                                                 unprojected)
 from hermes_memory.processing.instance_gate import gate_path, instance_gate
-from hermes_memory.processing.jobs import CANCELLED, SUCCEEDED, UNCERTAIN, JobQueue
+from hermes_memory.processing.jobs import (CANCELLED, RETRY_WAIT, SUCCEEDED, UNCERTAIN,
+                                           JobQueue)
 from hermes_memory.storage.evidence import EvidenceStore
 
 OWNER = "jugaadu"
@@ -716,7 +717,7 @@ def test_reconcile_closes_the_job_the_backend_answered_for(installation):
     record, submission, job_id = a_stranded_submission(installation)
     report = formation_reconcile(installation, client=Answers())
     assert report["settled"] == 1 and report["jobs_settled"] == 1
-    assert report["confirmed_identities"] == [submission]
+    assert report["answers"]["established"] == [submission]
     with EvidenceStore(installation.db_path) as store:
         job = JobQueue(store).get(job_id)
         assert job.state == SUCCEEDED, "the engine said it finished"
@@ -737,7 +738,7 @@ def test_reconcile_leaves_a_job_the_backend_has_not_answered_for_alone(installat
     backend.operation = lambda operation_id: {"status": "processing"}
     report = formation_reconcile(installation, client=backend)
     assert report["jobs_settled"] == 0 and report["pending"] == 1
-    assert report["confirmed_identities"] == []
+    assert report["answers"]["established"] == []
     with EvidenceStore(installation.db_path) as store:
         assert JobQueue(store).get(job_id).state == UNCERTAIN
 
@@ -807,9 +808,182 @@ def test_reconcile_settles_a_synchronous_submission_by_the_document_it_landed_in
     report = formation_reconcile(installation, client=backend)
     assert report["verified"] == 1 and report["settled"] == 1
     assert report["jobs_settled"] == 1
-    assert report["confirmed_identities"] == [begun["document_id"]]
+    assert report["answers"]["established"] == [begun["document_id"]]
     with EvidenceStore(installation.db_path) as store:
         assert JobQueue(store).get(job_id).state == SUCCEEDED
+
+
+def a_forgotten_projection(installation, *, text="a retain whose record was erased"):
+    """A job whose submission left no projection, plus the tombstone that says why.
+
+    Both rows are written rather than one: a tombstone without the intent that made it is a
+    foreign key away from existing, and the intent is the fact that makes this an owner's
+    decision instead of a lost submission.
+    """
+    record, submission, job_id = a_stranded_submission(installation, text=text)
+    with EvidenceStore(installation.db_path) as store:
+        DocumentMap(store, bank_id=BANK).mark_absent(record, "1")
+        store.db.execute(
+            "INSERT INTO erasure_ledger(id, source, requested_at, requested_by, "
+            "requester_kind, reason, preview, preview_digest, state, epoch) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("erase_reconciled", record, "2026-09-27T00:00:00+00:00", OWNER, "owner",
+             "the owner asked", "{}", "0" * 64, "erased", store.epoch()))
+        store.db.execute("INSERT INTO tombstones(record_id, intent_id, fingerprint, "
+                         "deleted_at) VALUES(?,?,?,?)",
+                         (record, "erase_reconciled", "0" * 64, "2026-09-27T00:00:00+00:00"))
+    return record, submission, job_id
+
+
+def test_reconcile_closes_a_row_whose_answer_arrived_in_an_earlier_pass(installation):
+    """The live shape: the projection was answered before the queue could be told.
+
+    Four jobs sat uncertain beside four settled submissions on a real installation. The door
+    asked only about rows still `outstanding`, and a projection stops being outstanding the
+    moment it is verified — so the backlog it named as its own remedy was unreachable by it. A
+    queue row has no view on when its answer arrived.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    with EvidenceStore(installation.db_path) as store:
+        DocumentMap(store, bank_id=BANK).confirm(record, "1")
+
+    report = formation_reconcile(installation, client=Answers())
+    assert report["asked"] == [], "nothing to ask: the projection already has its answer"
+    assert report["settled"] == 0 and report["verified"] == 0
+    assert report["jobs_settled"] == 1, "and the row is closed anyway"
+    assert report["answers"]["established"] == [submission]
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).state == SUCCEEDED
+
+
+def test_reconcile_sends_a_denied_submission_back_through_the_attempt_budget(installation):
+    """§8.2: an answer that says "that never happened" is not a reason to ask forever.
+
+    The row is uncertain because the outcome was unknown, and the rule that uncertain work is
+    never retried by itself exists to stop a machine resending private text on a guess. Once the
+    engine names the outcome, the ordinary failed-attempt edge is the honest one: the attempt is
+    counted, the backoff holds it, and the budget can still quarantine it. Nothing is dispatched
+    here and nothing is charged — the next claim is a worker's, under the gate.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "failed", "error": "no such model"}
+    report = formation_reconcile(installation, client=backend)
+    assert report["jobs_retried"] == 1 and report["jobs_settled"] == 0
+    assert report["answers"]["refused"] == [submission]
+    with EvidenceStore(installation.db_path) as store:
+        job = JobQueue(store).get(job_id)
+        assert job.state == RETRY_WAIT, "the work is owed again, not forgiven"
+        assert job.attempts == 1, "and the attempt the uncertainty swallowed is counted"
+        assert "did not reach it" in job.last_error
+        assert DocumentMap(store, bank_id=BANK).state(record, "1") == FAILED
+        assert store.db.execute("SELECT count(*) FROM audit WHERE action="
+                                "'job_refused_by_reconciliation'").fetchone()[0] == 1
+
+
+def test_a_denied_submission_is_not_counted_twice_by_two_passes(installation):
+    """A row waiting for its backoff is not in flight, so the next pass leaves it alone."""
+    record, submission, job_id = a_stranded_submission(installation)
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "failed"}
+    assert formation_reconcile(installation, client=backend)["jobs_retried"] == 1
+    second = formation_reconcile(installation, client=backend)
+    assert second["jobs_retried"] == 0, "the projection is asked again; the job is not"
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).attempts == 1
+
+
+def test_reconcile_ends_work_whose_record_was_forgotten_rather_than_re_forming_it(
+        installation):
+    """C4's whole point, applied to the queue: a missing projection has two causes.
+
+    `absent` is written both when a submission never arrived and when the owner erased the
+    record and the erasure path settled the mapping beside its tombstone. Only the second is a
+    decision a machine may not undo: re-forming it would put text the owner deleted back into
+    the engine. So the tombstone is asked, and a forgotten record's work is ended instead of
+    tried again.
+    """
+    record, submission, job_id = a_forgotten_projection(installation)
+    report = formation_reconcile(installation, client=Answers())
+    assert report["answers"]["ended"] == [submission]
+    assert report["answers"]["refused"] == []
+    assert report["jobs_ended"] == 1 and report["jobs_retried"] == 0
+    with EvidenceStore(installation.db_path) as store:
+        job = JobQueue(store).get(job_id)
+        assert job.state == CANCELLED
+        assert "forgotten" in job.last_error
+
+
+def test_an_absent_projection_the_owner_never_erased_is_tried_again(installation):
+    """The other cause of the same stored state, and the opposite answer.
+
+    Without the tombstone the absence is a lost submission: the record is still here, its
+    coverage is not, and the work is owed. Refusing to move it because the column cannot tell
+    the two apart would leave a plain failure looking like an owner's decision.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    with EvidenceStore(installation.db_path) as store:
+        DocumentMap(store, bank_id=BANK).mark_absent(record, "1")
+    report = formation_reconcile(installation, client=Answers())
+    assert report["answers"]["refused"] == [submission]
+    assert report["jobs_retried"] == 1 and report["jobs_ended"] == 0
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).state == RETRY_WAIT
+
+
+def test_an_operation_somebody_stopped_is_ended_not_resubmitted(installation):
+    """`cancelled` at the backend is a person's decision, and a retry would overrule it.
+
+    The projection ledger records a stop and a failure in the same column, so the distinction
+    only exists in the answer this pass heard. That is why the fresh verdict outranks the
+    ledger's reading of the same identity: the row is ended the first time the stop is seen, and
+    a later pass has no in-flight row left to misclassify.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "cancelled"}
+    report = formation_reconcile(installation, client=backend)
+    assert report["stopped_operations"] == [submission]
+    assert report["answers"]["ended"] == [submission]
+    assert report["answers"]["refused"] == [], "the same identity is not also owed again"
+    assert report["jobs_ended"] == 1 and report["jobs_retried"] == 0
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).state == CANCELLED
+
+
+def test_a_stopped_job_is_not_restarted_by_a_denied_answer(installation):
+    """A cancellation a person made is not undone by the backend's answer about the attempt."""
+    record, submission, job_id = a_stranded_submission(installation)
+    with EvidenceStore(installation.db_path) as store:
+        JobQueue(store).cancel(job_id, actor=OWNER, reason="superseded by hand")
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "failed"}
+    report = formation_reconcile(installation, client=backend)
+    assert report["jobs_retried"] == 0 and report["jobs_ended"] == 0
+    with EvidenceStore(installation.db_path) as store:
+        job = JobQueue(store).get(job_id)
+        assert job.state == CANCELLED and job.attempts == 0, "no attempt was counted against a stop"
+
+
+def test_the_reconcile_report_says_what_is_still_unanswered(installation):
+    """A note that always promised more work was a report that could not be finished with.
+
+    The door used to close every run with "a row still in `pending` was asked and is not
+    finished; run this again", including the runs where nothing was pending. An operator who
+    obeyed got the same sentence back, so the sentence carried no information about whether the
+    backlog was any smaller.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "processing"}
+    running = formation_reconcile(installation, client=backend)
+    assert "1 submission(s) still have no answer" in running["note"]
+    assert running["jobs_settled"] == 0 and running["jobs_retried"] == 0
+    with EvidenceStore(installation.db_path) as store:
+        DocumentMap(store, bank_id=BANK).mark_absent(record, "1")
+    settled = formation_reconcile(installation, client=backend)
+    assert "run this again" not in settled["note"], "nothing is left unanswered"
+    assert settled["jobs_retried"] == 1
 
 
 def test_reconcile_spends_nothing_on_the_shared_device(installation):

@@ -209,13 +209,28 @@ submissions this machine cannot account for, and writes down the answer it was g
 cannot settle stays outstanding and is asked again next time.
 
 The answer settles the *queue* too, not only the coverage claim. A job left `uncertain` is
-never retried by itself, and the doctor's remedy for one is "reconcile or cancel them" — so an
-operation the engine reports `completed` closes the job that carried it, under the same
-identity that verified its projection: the operation id for an async retain, the document id
-for a synchronous one whose call never named an operation. Three things are refused rather than
-convenient: a job somebody cancelled is not resurrected by a late answer, a row is not closed
-for an answer that belongs to a different submission, and no token count is written for work
-nobody watched the end of — the answer says the work landed, not what it cost.
+never retried by itself, and the doctor's remedy for one is "reconcile or cancel them" — so the
+door has to reach the rows it names, including the ones an older run of itself answered. It
+reads the projection ledger rather than only its own collection, and the verdict decides what
+happens to the job that carried the identity (the operation id for an async retain, the document
+id for a synchronous one whose call never named an operation):
+
+- an operation the engine finished closes the row, with no token count written for work nobody
+  watched the end of — the answer says the work landed, not what it cost;
+- an operation the engine says never landed is put back through the attempt budget, so the
+  attempt is counted, the backoff holds it and a spent budget quarantines it rather than looping.
+  Nothing is dispatched by the settlement itself: the next claim is a worker's decision, made
+  under the gate and the day's ceiling;
+- work whose record the owner has since forgotten is ended. A projection can be missing because
+  a submission never arrived or because the erasure path removed it beside its tombstone, and the
+  ledger stores both as `absent`. Re-forming the second would put text the owner deleted back
+  into the engine, so the tombstone is asked and decides;
+- an operation somebody *stopped* is ended for the same kind of reason: the ending is the point
+  of it, and a retry would overrule the person who asked. This is the one verdict the projection
+  ledger cannot remember afterwards, so the pass that heard it carries it.
+
+A job somebody cancelled is never moved by any of these, and a row is never settled for an
+answer that belongs to a different submission.
 
 The approval is a digest of the list, not of a flag: selected record ids, the route facts,
 the processor fingerprint, the token ceiling and `blocking` are all inside it. A hold set

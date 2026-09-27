@@ -294,17 +294,39 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
         raise FormationError(f"no canonical store at {settings.db_path}; run "
                              "`hermes-memory init` first")
     empty = {"settled": 0, "verified": 0, "pending": 0, "absent": 0, "unreachable": 0,
-             "confirmed_identities": []}
+             "stopped_operations": []}
     with EvidenceStore(settings.db_path) as store:
         docs = DocumentMap(store, bank_id=settings.bank_id)
         asked = docs.outstanding(limit=limit)
-        outcome = empty if not asked else docs.reconcile(
-            client=client or backend_client(settings), limit=limit)
-        # The same answer that verifies a projection closes the queue row that carried it.
-        # Reconciliation was already the door the doctor named for an uncertain job; this is
-        # the half that makes the naming true.
-        settled_jobs = JobQueue(store).settle_established(
-            outcome["confirmed_identities"], actor=settings.owner_principal or "operator")
+        outcome = docs.reconcile(client=client or backend_client(settings), limit=limit) \
+            if asked else empty
+        # The answers are read from the projection ledger rather than from what this pass
+        # collected. A job left uncertain by an older run of this door carries a submission
+        # whose projection has long since been answered, and `outstanding` stops asking about a
+        # row once it has an answer — so a door that reported only its own collection left the
+        # backlog it names untouched. A queue row has no view on when its answer arrived.
+        held = docs.answers(limit=max(int(limit), 1) * 10)
+        # A stop is the one verdict the ledger cannot remember: it leaves the same `failed` row
+        # as a failure does, and re-driving somebody's stop would overrule them. So the fresh
+        # answer carries it, and it outranks the ledger's blunter reading of that row.
+        stopped = list(outcome["stopped_operations"])
+        stopped_set = set(stopped)
+        established = held["established"]
+        refused = [item for item in held["did_not_land"] if item not in stopped_set]
+        ended = stopped + held["forgotten"]
+        actor = settings.owner_principal or "operator"
+        queue = JobQueue(store)
+        settled_jobs = queue.settle_established(established, actor=actor)
+        retried_jobs = queue.settle_refused(refused, actor=actor,
+                                            reason="reconciled: the backend answered that this "
+                                                   "submission did not reach it, so the work is "
+                                                   "owed again")
+        ended_jobs = queue.settle_ended(
+            ended, actor=actor,
+            reason="reconciled: the answer is that this work ends — the operation was stopped "
+                   "at the backend, or the record was forgotten and its projection must not be "
+                   "formed again")
+        still_open = outcome["pending"] + outcome["unreachable"]
         return {
             "ok": True,
             "performed_at": now(),
@@ -314,22 +336,32 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
             "asked": [{"record_id": row["record_id"], "state": row["state"],
                        "operation_id": row["operation_id"]} for row in asked],
             "jobs_settled": settled_jobs,
-            **{key: value for key, value in outcome.items()
-               if key != "confirmed_identities"},
-            "confirmed_identities": outcome["confirmed_identities"],
+            "jobs_retried": retried_jobs,
+            "jobs_ended": ended_jobs,
+            **{key: value for key, value in outcome.items() if key != "stopped_operations"},
+            "stopped_operations": stopped,
+            "answers": {"established": established, "refused": refused, "ended": ended},
             "projections": docs.as_dict(),
             "performed": [
                 f"the backend was asked about {len(asked)} submission(s)",
                 "a projection it confirmed is written down as verified coverage",
-                f"{settled_jobs} queue job(s) it answered for are closed rather than "
-                "left uncertain",
+                f"{settled_jobs} queue job(s) it answered for are closed rather than left "
+                "uncertain",
+                f"{retried_jobs} job(s) whose submission the backend denies are counted as one "
+                "failed attempt and wait for the next claim, under the attempt budget",
+                f"{ended_jobs} job(s) are ended rather than re-driven: their operation was "
+                "stopped, or their record was forgotten",
             ],
             "not_performed": [
                 "no model request was sent, so nothing new was formed",
                 "no document the backend did not name was written as present",
                 "no gate slot was claimed and no budget was charged",
+                "nothing whose record carries a tombstone was queued again",
             ],
-            "note": "a row still in `pending` was asked and is not finished; run this again",
+            "note": (f"{still_open} submission(s) still have no answer from the backend; run "
+                     "this again" if still_open else
+                     "every submission this machine could account for now has the backend's "
+                     "answer, and the queue rows that carried them have moved"),
         }
 
 
