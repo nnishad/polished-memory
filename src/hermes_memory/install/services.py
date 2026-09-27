@@ -25,8 +25,8 @@ from typing import Any, Callable, Mapping, Sequence
 from ..ids import content_digest, digest, now
 from .profiles import InstallationError
 
-__all__ = ["UNITS", "RUNTIME_UNIT", "BACKEND_UNIT", "WORKER_UNIT", "Layout", "layout",
-           "render", "executables", "plan", "apply", "Services",
+__all__ = ["UNITS", "RUNTIME_UNIT", "BACKEND_UNIT", "WORKER_UNIT", "HELD_BEHIND_INFERENCE",
+           "Layout", "layout", "render", "executables", "plan", "apply", "Services",
            "unit_directory", "wanted_units"]
 
 # Kebab-case, the host convention, and the only names these functions will ever pass to
@@ -35,6 +35,11 @@ RUNTIME_UNIT = "hermes-memory.service"
 BACKEND_UNIT = "hermes-memory-hindsight.service"
 WORKER_UNIT = "hermes-memory-worker.service"
 UNITS: tuple[str, ...] = (RUNTIME_UNIT, BACKEND_UNIT, WORKER_UNIT)
+
+# The units that cannot come up while the owner holds inference, because starting them
+# dispatches a model request that the admission gate denies for as long as the hold stands.
+# The admission unit is deliberately absent: it is the one that answers the hold.
+HELD_BEHIND_INFERENCE: frozenset[str] = frozenset({BACKEND_UNIT, WORKER_UNIT})
 
 RECORD_FILENAME = "services.json"
 PLAN_VERSION = "service-plan-v1"
@@ -428,16 +433,27 @@ class Services:
         self._run(["daemon-reload"])
         return True
 
-    def start(self) -> list[str]:
+    def start(self, *, inference_held: bool = False) -> list[str]:
         """Runtime first, then the backend, then the worker. Never resumes a pause.
 
         A paused fence is the owner's decision and outlives a restart on purpose; a
         start that unpaused anything would turn "put this on hold" into "the machine
         rebooted, so we changed our mind".
+
+        With inference held, only the admission unit is asked for. The backend probes an
+        embedding as it starts up and that dispatch goes through the gate, which denies it
+        for as long as the owner's hold stands — so asking for the backend would produce a
+        restart cycle that ends with the unit `failed` and the worker taken down with it. A
+        machine that looks broken because its owner asked it to wait is the wrong answer;
+        the hold is lifted by the door that set it.
         """
+        started = []
         for unit in self.order:
+            if inference_held and unit in HELD_BEHIND_INFERENCE:
+                continue
             self._run(["start", unit])
-        return list(self.order)
+            started.append(unit)
+        return started
 
     def stop(self, *, pause: Callable[[], Any] | None = None) -> list[str]:
         """Persist the pause before the last process goes away.

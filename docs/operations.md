@@ -142,6 +142,16 @@ configured and no `--actor`, a pause is refused rather than recorded against nob
 `--source` on the two installation-wide scopes is refused rather than ignored, and naming a
 connector no memory registers is refused too: a typo must not look like a hold.
 
+A held installation starts differently. `hermes-memory start` under an inference hold brings
+up the admission unit and asks for nothing else, reporting `not_started` and the door that
+lifts the hold: the backend dispatches an embedding probe as it comes up, that probe goes
+through the admission gate, and the gate denies a new dispatch for as long as the owner's
+hold stands — so asking for the backend would put it into a restart cycle that ends with the
+unit `failed` and its bound worker taken down beside it. A machine that looks broken because
+it was told to wait is not a machine that is waiting. The worker's own launcher reads the
+same row and waits where it can: it prints `{"worker": "waiting"}` with the actor and the
+moment, polls, and composes the engine only once nothing is held.
+
 ## Settling an admission that never came back
 
 ```sh
@@ -243,6 +253,16 @@ have eaten every reminder on a new installation before anyone had agreed to be i
 `status` reports the pass as `background_pass` (the last one recorded, its age, what is
 waiting) and `doctor` checks it as `background`, because a dead scheduler is indistinguishable
 from a machine with nothing to do unless the pass writes down that it ran.
+
+The heartbeat carries a failure too. The sections run in order, so a raise halfway through
+would leave nothing recorded and the loop would report exactly like one that stopped — which
+is what happened on a live machine whose queue section reaped expired leases against a
+read-only admission ledger: the timer kept its period, the heartbeat stopped, and `status`
+said "the runtime unit's scheduler is not running" for hours. A pass that raised now records
+`failed_section` and `error` in its own heartbeat, `status` says *the scheduler is running but
+the pass is not finishing*, and `doctor` raises it as `FAIL` with the command that reproduces
+the raise in your own terminal. Reaping is a write, so the pass opens the admission ledger
+writable — and, like every reading, invents no ledger where none exists.
 
 ## Promises and their conditions
 

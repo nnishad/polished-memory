@@ -789,6 +789,7 @@ _HOST_RUNNER: Callable[[Sequence[str]], tuple[int, str]] = subprocess_runner
 
 def _start_command(settings) -> int:
     from .install.profiles import InstallationError
+    from .install.services import HELD_BEHIND_INFERENCE
 
     stale = _service_plan(settings)
     if stale is None:
@@ -797,14 +798,30 @@ def _start_command(settings) -> int:
         print("refused: these units exist but were not written by this installation, so "
               f"they are not ours to start: {', '.join(stale['blocked'])}", file=sys.stderr)
         return 2
+    hold = _inference_hold(settings)
+    inference_held = hold is not None
+    controller = _controller(settings)
     try:
-        started = _controller(settings).start()
+        started = controller.start(inference_held=inference_held)
     except InstallationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
+    # In the order the units would have been started, so the list reads as the sequence an
+    # operator is being asked to complete later rather than as an arbitrary set.
+    withheld = [unit for unit in controller.order
+                if unit in HELD_BEHIND_INFERENCE and unit not in started]
     return _emit({"ok": True, "started": started,
-                  "note": "a pause the owner set is still in force; starting does not "
-                          "resume formation or delivery",
+                  "note": ("a pause the owner set is still in force; starting does not "
+                           "resume formation or delivery" if not inference_held else
+                           "inference is held by the owner, so the backend and its worker "
+                           "were not asked to start: the backend dispatches an embedding "
+                           "probe as it comes up, and the gate denies it while the hold "
+                           "stands. The admission unit is up and answers queries about this "
+                           "installation either way."),
+                  "not_started": withheld,
+                  "inference_hold": hold,
+                  "resumes_with": ("hermes-memory pause --scope inference --resume"
+                                   if inference_held else None),
                   "units_not_as_described": stale["would_change"]})
 
 
@@ -976,6 +993,26 @@ def _hold_capture(settings, *, source: str, state: str, actor: str,
             method(source, actor=actor, reason=reason, policy_version="operator-pause")
         held.append(scoped.profile)
     return held
+
+
+def _inference_hold(settings) -> dict[str, Any] | None:
+    """The owner's hold on this machine's models, read without bringing a ledger into being.
+
+    The same row :meth:`ResourceGate.pause` wrote, and the same one `status` reports: the
+    hold that stops a backend from starting has to be the hold an operator can see, or a
+    machine that is waiting and a machine that is broken are the same report. A missing
+    ledger is "not held" — nothing has been queued from here — and `start` has no business
+    creating the file a reading promised not to create.
+    """
+    from .processing.instance_gate import status_gate
+
+    ledger = status_gate(settings)
+    if ledger is None:
+        return None
+    try:
+        return ledger.hold() if ledger.paused else None
+    finally:
+        ledger.close()
 
 
 def _holds(settings) -> dict[str, Any]:
