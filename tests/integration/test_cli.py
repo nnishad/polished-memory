@@ -686,6 +686,70 @@ def test_start_goes_gate_then_backend_then_worker(service_home, runner):
     assert report["units_not_as_described"] == report["started"]
 
 
+def test_start_under_an_inference_hold_raises_only_the_admission_unit(service_home, runner):
+    """§10.5: the hold outlives a restart, and the backend's own startup dispatch is denied.
+
+    This is the live failure the door used to cause: `stop` held inference, `start` asked for
+    the backend, its embedding probe got a 503 from the admission gate, the unit restarted
+    into its start limit and came up `failed` with the worker taken down beside it. A machine
+    that looks broken because its owner asked it to wait is not a machine that is waiting.
+    """
+    from hermes_memory.config import load_settings
+    from hermes_memory.processing.instance_gate import instance_gate
+
+    (service_home / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={service_home.parent / 'data'}\n"
+        "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
+        "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+        "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n"
+        f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}\n", encoding="utf-8")
+    with instance_gate(load_settings()) as gate:
+        gate.pause(actor=OWNER, reason="the owner is holding the models")
+
+    code, report = run("start")
+    assert code == 0
+    assert report["started"] == ["hermes-memory.service"]
+    assert report["not_started"] == ["hermes-memory-hindsight.service",
+                                     "hermes-memory-worker.service"]
+    assert [call[2:] for call in runner] == [["start", "hermes-memory.service"]], \
+        "a held backend is not even asked for, let alone restarted into its limit"
+    assert report["inference_hold"]["actor"] == OWNER
+    assert report["resumes_with"] == "hermes-memory pause --scope inference --resume"
+    assert "embedding probe" in report["note"], "the reason has to be in the answer"
+
+    # The round trip: a hold that has been lifted is not a hold, and an installation that
+    # only ever saw the paused row must not keep refusing its backend.
+    runner.clear()
+    with instance_gate(load_settings()) as gate:
+        gate.resume(actor=OWNER, reason="the owner is back")
+    code, report = run("start")
+    assert code == 0 and len(report["started"]) == 3
+    assert report["not_started"] == [] and report["inference_hold"] is None
+    assert report["resumes_with"] is None
+    assert [call[2:] for call in runner] == [["start", name] for name in report["started"]]
+
+
+def test_a_start_with_no_ledger_at_all_invents_none(service_home, runner):
+    """`start` reads the hold, and a reading that writes a ledger is not a reading.
+
+    Without this rule every fresh installation would gain an admission database from the
+    first `start`, and the honest answer "nothing has been queued from here yet" would stop
+    being available to anything that asked afterwards.
+    """
+    from hermes_memory.config import load_settings
+    from hermes_memory.processing.instance_gate import gate_path
+
+    (service_home / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={service_home.parent / 'data'}\n"
+        "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
+        "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+        "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n"
+        f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}\n", encoding="utf-8")
+    code, report = run("start")
+    assert code == 0 and len(report["started"]) == 3
+    assert not gate_path(load_settings()).exists()
+
+
 def test_stopping_holds_the_fence_first_and_the_hold_outlives_the_process(
         service_home, runner):
     run("init")

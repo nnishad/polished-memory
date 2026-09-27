@@ -446,6 +446,19 @@ def test_starting_follows_the_top_order_and_reloads_nothing(instance):
     assert runner.calls == [["systemctl", "--user", "start", name] for name in UNITS]
 
 
+def test_a_hold_starts_the_admission_unit_and_nothing_that_dispatches(instance):
+    """The backend probes a model as it comes up, and a hold denies that dispatch.
+
+    Asking for it anyway is not patience: it fails its own start limit, ends `failed`, and
+    takes the bound worker down beside it. The hold is the owner's decision, so the door
+    that lifts it is the answer a start gives rather than a stack of restarts.
+    """
+    _, settings = instance
+    runner = Runner()
+    assert Services(settings, runner=runner).start(inference_held=True) == [RUNTIME_UNIT]
+    assert runner.calls == [["systemctl", "--user", "start", RUNTIME_UNIT]]
+
+
 def test_a_capture_only_installation_starts_only_the_runtime(instance, monkeypatch):
     home, settings = instance
     (home / "hermes-memory.env").write_text(
