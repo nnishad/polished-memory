@@ -67,13 +67,27 @@ class GateApp:
     def __init__(self, *, routes: RouteTable, gate: ResourceGate, upstream_credentials,
                  upstream: Callable | None = None,
                  token_estimate: Callable[[dict], int] | None = None,
-                 store: Any = None):
+                 queue_s: float = 0.0, store: Any = None):
         self.routes = routes
         self.gate = gate
         self.store = store
+        self.queue_s = queue_s
         self.upstream_credentials = dict(upstream_credentials)
         self.upstream = upstream or urllib_upstream()
         self.token_estimate = token_estimate or _estimate_tokens
+
+    def wait_for(self, route) -> float:
+        """How long this caller may stand in the queue for its device.
+
+        An interactive request is the one the host is already late for: waiting behind a
+        consolidation run would trade a visible refusal for an invisible overrun, so it keeps
+        the immediate answer and the caller degrades. Everything else is work with no human on
+        the other end of it, and a device held by one caller is a reason to be next, not a
+        reason to fail — the engine presents several sub-calls of one operation at once, each
+        inside its own concurrency limit, so refusing on contact stops the installation
+        forming anything at all.
+        """
+        return 0.0 if route.priority == "interactive" else self.queue_s
 
     def close(self) -> None:
         """Release what this application was built from.
@@ -122,18 +136,24 @@ class GateApp:
 
         payload, capped = _apply_cap(payload, route.max_output_tokens)
         reservation = None
+        waited = self.wait_for(route)
         try:
-            reservation = self.gate.try_acquire(
+            reservation = self.gate.acquire(
                 route=route.name, holder=f"gate:{route.name}", resource=route.resource,
-                priority=route.priority_rank(), ttl=max(60.0, self.gate.default_ttl))
+                priority=route.priority_rank(), ttl=max(60.0, self.gate.default_ttl),
+                timeout=waited)
         except GatePaused as error:
             await _respond(send, 503, {"error": {"message": str(error)[:300], "type": "paused"}})
             return
         if reservation is None:
             # 429 with Retry-After: the caller must back off, not assume failure
-            # and resend into an occupied device.
-            await _respond(send, 429, {"error": {"message": f"{route.resource} is busy",
-                                                 "type": "rate_limit"}},
+            # and resend into an occupied device. For a queued route this is said
+            # only after its wait ran out, so the number is in the message.
+            await _respond(send, 429, {"error": {
+                "message": f"{route.resource} is busy" + (
+                    f": waited {waited:g}s for the slot" if waited else
+                    ", and this route never waits for one"),
+                "type": "rate_limit"}},
                            headers=[(b"retry-after", b"2")])
             return
 

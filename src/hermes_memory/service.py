@@ -96,6 +96,7 @@ def build_app(settings, *, store, upstream: Callable | None = None,
               build_routes(settings, credentials=settings.route_credentials))
     return GateApp(routes=routes, gate=gate or instance_gate(settings),
                    upstream_credentials=settings.route_credentials,
+                   queue_s=settings.gate_queue_s,
                    upstream=upstream, store=store)
 
 

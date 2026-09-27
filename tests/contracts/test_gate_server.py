@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 
@@ -10,6 +12,7 @@ from hermes_memory.processing.gate_server import (GateApp, _apply_cap,
                                                     _usage_tokens, upstream_url)
 from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import RouteTable, Route
+from hermes_memory.storage.evidence import EvidenceStore
 
 REMOTE = "remote-9b"
 GPU = "local-gpu"
@@ -320,3 +323,94 @@ def test_an_upstream_named_by_its_versioned_root_is_not_asked_for_that_root_twic
         "http://127.0.0.1:8080/v1/chat/completions"
     assert upstream_url(served_under_a_path, "/v1/embeddings") == \
         "http://127.0.0.1:8080/engine/v1/embeddings"
+
+
+# -- waiting for a busy device ------------------------------------------------
+
+def queued_harness(store, *, queue_s=5.0):
+    """The same gate, with the wait an installation is configured to give it."""
+    gate = ResourceGate(store)
+    upstream = Upstream()
+    app = GateApp(routes=TABLE, gate=gate, upstream_credentials=CREDENTIALS,
+                  upstream=upstream, queue_s=queue_s)
+    return app, gate, upstream
+
+
+def hold(gate, *, resource, route="someone-else's-job", ttl=300.0):
+    return gate.acquire(route=route, holder="test:holder", resource=resource,
+                        priority=1, ttl=ttl, timeout=0)
+
+
+def hand_back(store, reservation, *, after=0.3):
+    """Give the device back from another thread, the way another process would.
+
+    Leaving the lease to expire is not the same situation: an expired lease becomes
+    uncertain and keeps the resource blocked, and the point here is a slot that frees.
+    """
+    def release():
+        time.sleep(after)
+        with EvidenceStore(store.path) as other:
+            ResourceGate(other).release(reservation, outcome="succeeded", tokens=1)
+
+    threading.Thread(target=release, daemon=True).start()
+
+
+def test_a_background_caller_waits_for_a_busy_device_and_is_then_served(store):
+    """One slot per device serialises that device; it does not turn its callers away.
+
+    The engine presents several sub-calls of one operation at a time, so a gate that
+    refused on contact answered the second of them with a 429 the client does not
+    re-drive — and the installation could never form anything at all.
+    """
+    app, gate, upstream = queued_harness(store)
+    hand_back(store, hold(gate, resource=GPU))
+    started = time.monotonic()
+    response = call(app, "/v1/embeddings", token="cred-emb",
+                    body={"input": "hello", "model": "emb"})
+    assert response["status"] == 200, response["body"]
+    assert len(upstream.calls) == 1
+    assert time.monotonic() - started >= 0.2, "the caller was served without waiting"
+
+
+def test_a_wait_that_runs_out_says_what_it_waited_for(store):
+    app, gate, upstream = queued_harness(store, queue_s=0.2)
+    hold(gate, resource=GPU)
+    response = call(app, "/v1/embeddings", token="cred-emb",
+                    body={"input": "hello", "model": "emb"})
+    assert response["status"] == 429
+    assert "waited 0.2s" in response["body"]["error"]["message"]
+    assert upstream.calls == []
+    # The caller's own queue entry goes with its refusal, or every abandoned request
+    # would hold the line behind it.
+    assert gate.occupancy().get(GPU, {}).get("waiting", 0) == 0
+
+
+def test_the_call_a_human_is_waiting_for_is_never_queued_behind_background_work(store):
+    """Refusing the interactive route at once is what makes the host's degradation real."""
+    app, gate, upstream = queued_harness(store, queue_s=30.0)
+    hold(gate, resource=REMOTE)
+    started = time.monotonic()
+    response = call(app, token="cred-chat")
+    assert response["status"] == 429
+    assert "never waits" in response["body"]["error"]["message"]
+    assert time.monotonic() - started < 1.0, "an interactive caller was made to queue"
+    assert upstream.calls == []
+
+
+def test_a_busy_device_is_reaped_before_the_wait_it_starts(store):
+    """A lease that expired while this request was arriving is still not a free device.
+
+    Waiting must not become a way around the rule that an unestablished completion keeps
+    the slot: the waiter gets the same refusal a caller that never waited would get.
+    """
+    app, gate, upstream = queued_harness(store, queue_s=0.2)
+    held = hold(gate, resource=GPU, ttl=60.0)
+    # Another connection's clock is the only honest way to age a lease here: this gate
+    # marks it uncertain itself, on its next attempt, from its own row.
+    with EvidenceStore(store.path) as other:
+        ResourceGate(other).mark_uncertain(held, reason="test: lease expired")
+    response = call(app, "/v1/embeddings", token="cred-emb",
+                    body={"input": "hello", "model": "emb"})
+    assert response["status"] == 429
+    assert gate.occupancy()[GPU]["uncertain"] == 1
+    assert upstream.calls == []

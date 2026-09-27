@@ -543,3 +543,19 @@ def test_a_process_that_is_leaving_takes_its_scheduler_with_it(settings):
     assert serve(settings, upstream=boom, host="127.0.0.1", port=0, report=stopping,
                  maintenance=ticker) == 0
     assert ticker.state()["running"] is False
+
+
+def test_the_queue_the_owner_configures_is_the_queue_requests_get(tmp_path, monkeypatch):
+    """A setting nobody passes on is a knob that does nothing.
+
+    The refused-on-contact gate is what made this installation unable to form anything, so
+    the patience the owner writes down has to reach the app standing on the socket, not
+    stop in the file it was read from.
+    """
+    from hermes_memory.service import build_app
+
+    settings = installed(tmp_path / "patient", monkeypatch, GATE_QUEUE_S="37")
+    with EvidenceStore(settings.db_path) as store:
+        app = build_app(settings, store=store, gate=ResourceGate(store),
+                        upstream=lambda *args: None)
+    assert app.queue_s == 37.0

@@ -43,6 +43,30 @@ DEFAULT_FOREGROUND_DEADLINE_S = 4.0
 DEFAULT_EVALUATOR_TIMEOUT_S = 120.0
 DEFAULT_MAINTENANCE_INTERVAL_S = 900
 MAX_MAINTENANCE_INTERVAL_S = 86_400
+# How long a background request may wait for a physical model that one other caller holds.
+# One slot per device means the device is serialised, not that its callers are turned away:
+# the engine presents several sub-calls of one operation at a time, each within its own
+# concurrency limit, so a gate that refuses on contact cannot form anything at all. Zero is
+# the owner asking for the old immediate refusal.
+DEFAULT_GATE_QUEUE_S = 120.0
+MAX_GATE_QUEUE_S = 900.0
+
+
+def _gate_queue(value: str | None) -> float:
+    """The wait a non-interactive caller is given for a busy device, in seconds."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise SettingError(
+            f"HERMES_MEMORY_GATE_QUEUE_S must be a number of seconds, got {value!r}"
+        ) from None
+    if not 0 <= seconds <= MAX_GATE_QUEUE_S:
+        raise SettingError(
+            f"HERMES_MEMORY_GATE_QUEUE_S={value} is outside the admissible range "
+            f"(0 to {MAX_GATE_QUEUE_S}); 0 refuses a busy device immediately, which no "
+            "single-slot installation survives"
+        )
+    return seconds
 
 
 def _maintenance_interval(value: str | None) -> int:
@@ -179,6 +203,7 @@ class Settings:
     inference_enabled: bool = False
     background_budget_tokens: int = 0
     foreground_deadline_s: float = DEFAULT_FOREGROUND_DEADLINE_S
+    gate_queue_s: float = DEFAULT_GATE_QUEUE_S
     owner_principal: str | None = None
     text_route: ModelRoute | None = None
     vision_route: ModelRoute | None = None
@@ -271,6 +296,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         )
 
     foreground = _deadline(get("FOREGROUND_DEADLINE_S", str(DEFAULT_FOREGROUND_DEADLINE_S)))
+    queue = _gate_queue(get("GATE_QUEUE_S", str(DEFAULT_GATE_QUEUE_S)))
     interval = _maintenance_interval(get("MAINTENANCE_INTERVAL_S",
                                          str(DEFAULT_MAINTENANCE_INTERVAL_S)))
     delivery_target = (get("DELIVERY_TARGET") or "").strip() or None
@@ -293,6 +319,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         inference_enabled=inference_enabled,
         background_budget_tokens=int(get("BACKGROUND_BUDGET_TOKENS", "0") or 0),
         foreground_deadline_s=foreground,
+        gate_queue_s=queue,
         # Unnamed by default: with no owner principal, forgetting can be
         # requested and previewed but never confirmed, which fails closed
         # instead of accepting any caller that claims to be the owner.

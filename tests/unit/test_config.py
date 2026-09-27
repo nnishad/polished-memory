@@ -257,6 +257,41 @@ def test_the_default_foreground_deadline_leaves_room_inside_the_host_stop(tmp_pa
     assert 0 < settings.foreground_deadline_s < 8.0
 
 
+@pytest.mark.parametrize("nonsense", ["soon", "", "1,2"])
+def test_a_queue_that_is_not_a_number_of_seconds_is_refused(nonsense, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    write_env(home, {"HERMES_MEMORY_GATE_QUEUE_S": nonsense})
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    with pytest.raises(SettingError, match="GATE_QUEUE_S must be a number"):
+        load_settings()
+
+
+@pytest.mark.parametrize("outside", ["-1", "901", "3600"])
+def test_a_queue_outside_the_admissible_range_is_refused(outside, tmp_path, monkeypatch):
+    """A wait measured in hours is a formation queue that never drains, not patience."""
+    home = tmp_path / "home"
+    write_env(home, {"HERMES_MEMORY_GATE_QUEUE_S": outside})
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    with pytest.raises(SettingError, match="GATE_QUEUE_S"):
+        load_settings()
+
+
+def test_zero_queue_is_the_owner_asking_for_the_old_immediate_refusal(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    write_env(home, {"HERMES_MEMORY_GATE_QUEUE_S": "0"})
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    assert load_settings().gate_queue_s == 0.0
+
+
+def test_the_default_queue_outlives_the_operation_it_is_waiting_behind(tmp_path, monkeypatch):
+    """The engine's retain call holds a device for tens of seconds; a shorter patience
+    would put the installation back where the refusal did."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(home))
+    assert load_settings().gate_queue_s > 60.0
+
+
 # -- per-profile configuration -------------------------------------------------
 
 def instance(tmp_path, monkeypatch, extra=None):

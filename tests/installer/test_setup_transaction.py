@@ -9,6 +9,7 @@ proves erasure, not merely that tables exist.
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 from pathlib import Path
 
@@ -25,6 +26,25 @@ from hermes_memory.storage.evidence import EvidenceStore
 
 OWNER = "jugaadu"
 REF = "a" * 40
+
+
+def a_free_port() -> int:
+    """A port this machine is not holding, asked of the kernel rather than guessed.
+
+    The transaction's first step refuses to plan over a port somebody else listens on, so
+    naming the real backend's port here made these tests answer a question about whatever
+    the developer was running: on a machine where the memory stack is up, a plan about a
+    temporary instance was blocked by the installation beside it.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+# Decided once for the module: every test that wants a backend endpoint wants one that is
+# free, and the plan's review digest has to stay reproducible across a resumed run.
+BACKEND_PORT = a_free_port()
+BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 
 
 def host(home, **extra):
@@ -521,7 +541,7 @@ def test_a_unit_is_written_only_for_an_executable_that_was_staged(tmp_path, monk
     """
     home = tmp_path / "instance"
     home.mkdir()
-    release = host(home, HINDSIGHT_URL="http://127.0.0.1:8123",
+    release = host(home, HINDSIGHT_URL=BACKEND_URL,
                    ALLOWED_INFERENCE_HOSTS="127.0.0.1")
     (release / "hindsight" / "bin").mkdir(parents=True)
     (release / "hindsight" / "bin" / "hindsight-api").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -608,7 +628,7 @@ def test_a_credential_written_into_the_configuration_stops_the_configure_step(
     settings, environ = installation
     home = activity(tmp_path)
     (home / "hermes-memory.env").write_text(
-        "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+        f"HERMES_MEMORY_HINDSIGHT_URL={BACKEND_URL}\n"
         "HERMES_MEMORY_HINDSIGHT_API_KEY=sk-never-in-a-config-file\n", encoding="utf-8")
     proposal = plan(settings, hermes_home=home, environ=environ, ref=REF)
     entry = {item["step"]: item for item in proposal["steps"]}["configure"]
@@ -664,7 +684,7 @@ def test_a_profile_configuration_the_owner_wrote_is_left_word_for_word(installat
                                                                        tmp_path):
     settings, environ = installation
     home = activity(tmp_path)
-    written = ("HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+    written = (f"HERMES_MEMORY_HINDSIGHT_URL={BACKEND_URL}\n"
                "HERMES_MEMORY_OWNER_PRINCIPAL=jugaadu\n"
                "# a line the owner added, and a reason not to rewrite this file\n")
     (home / "hermes-memory.env").write_text(written, encoding="utf-8")
@@ -770,7 +790,7 @@ def staged_backend(installation, *, imports, exit_code=0, interpreter=True):
     (release / "hindsight" / "bin" / "hindsight-api").write_text("#!/bin/sh\n", encoding="utf-8")
     env_file = home / "hermes-memory.env"
     env_file.write_text(env_file.read_text(encoding="utf-8")
-                        + "\nHERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+                        + f"\nHERMES_MEMORY_HINDSIGHT_URL={BACKEND_URL}\n"
                           "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n",
                         encoding="utf-8")
     if interpreter:
