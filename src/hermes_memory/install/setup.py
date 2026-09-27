@@ -264,10 +264,14 @@ def _stage(ctx: Context, *, apply: bool) -> dict[str, Any]:
 ENGINE_RETAIN_CAP = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
 ENGINE_RETAIN_CHUNK = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
 ENGINE_RETAIN_DEFAULTS = {ENGINE_RETAIN_CAP: 64_000, ENGINE_RETAIN_CHUNK: 3_000}
+#: An OpenAI-compatible embedding route with no declared width is a route the engine
+#: measures by sending a test embedding — a model request inside a process start.
+ENGINE_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
+ENGINE_EMBEDDINGS_DIMENSIONS = "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS"
 
 
 def _engine_configuration(ctx: Context) -> list[str]:
-    """What the engine would refuse about the environment file it is started with."""
+    """What the engine would refuse about — or ask a model because of — its environment."""
     from .services import layout
 
     path = layout(ctx.settings, environ=ctx.environ).hindsight_env
@@ -276,6 +280,7 @@ def _engine_configuration(ctx: Context) -> list[str]:
     values = env_file_values(path)
     if values.get("HINDSIGHT_API_LLM_PROVIDER", "").strip().lower() == "none":
         return []
+    refused: list[str] = []
 
     def number(key: str) -> int | None:
         raw = values.get(key)
@@ -289,15 +294,29 @@ def _engine_configuration(ctx: Context) -> list[str]:
     cap, chunk = number(ENGINE_RETAIN_CAP), number(ENGINE_RETAIN_CHUNK)
     if cap is None or chunk is None:
         broken = ENGINE_RETAIN_CAP if cap is None else ENGINE_RETAIN_CHUNK
-        return [f"{path} sets {broken} to something that is not a number; the engine reads "
-                "an integer there and will refuse to start"]
-    if cap <= chunk:
-        return [f"{path.name}: {ENGINE_RETAIN_CAP}={cap} is not greater than "
-                f"{ENGINE_RETAIN_CHUNK}={chunk}, which is the arithmetic the pinned engine "
-                "validates before it serves. Lower the chunk or raise the cap; the gate's "
-                "own output cap is what actually limits a completion, so raising this one "
-                "above it would only move the truncation"]
-    return []
+        refused.append(f"{path} sets {broken} to something that is not a number; the engine "
+                       "reads an integer there and will refuse to start")
+    elif cap <= chunk:
+        refused.append(f"{path.name}: {ENGINE_RETAIN_CAP}={cap} is not greater than "
+                       f"{ENGINE_RETAIN_CHUNK}={chunk}, which is the arithmetic the pinned "
+                       "engine validates before it serves. Lower the chunk or raise the cap; "
+                       "the gate's own output cap is what actually limits a completion, so "
+                       "raising this one above it would only move the truncation")
+    dimensions = None
+    if values.get(ENGINE_EMBEDDINGS_PROVIDER, "").strip().lower() == "openai":
+        try:
+            dimensions = int(str(values.get(ENGINE_EMBEDDINGS_DIMENSIONS, "")).strip())
+        except ValueError:
+            dimensions = None
+        if dimensions is None or dimensions < 1:
+            refused.append(
+                f"{path.name} names an OpenAI-compatible embedding route without "
+                f"{ENGINE_EMBEDDINGS_DIMENSIONS}, so the engine discovers the vector width by "
+                "sending a test embedding every time it starts. §10.4 forbids a liveness path "
+                "that warms a model up — and the request goes through the admission gate, so "
+                "while the owner holds inference the backend cannot boot at all and its unit "
+                "is left failed by the restart limit")
+    return refused
 
 
 def _engine_probe(release: Path) -> dict[str, Any]:

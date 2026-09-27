@@ -1004,12 +1004,52 @@ def test_a_backend_environment_that_names_no_number_is_named_rather_than_guessed
     assert any("not a number" in line for line in stage_blockers(settings, environ))
 
 
+def test_an_embedding_route_the_engine_must_measure_is_refused_before_it_starts(
+        installation):
+    """A declared width is a number in a file; an undeclared one is a model request.
+
+    The engine discovers an unknown OpenAI-compatible model's vector width by sending a test
+    embedding at startup. That is a model call inside a process start — which §10.4 rules out
+    for a liveness path, and which costs more than the tokens: the request goes through the
+    admission gate, so an installation whose inference the owner is holding cannot start its
+    own backend, and the unit's restart budget then leaves it failed.
+    """
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n"
+                   "HINDSIGHT_API_EMBEDDINGS_PROVIDER=openai\n"
+                   "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=qwen3-embedding:0.6b\n",
+                   encoding="utf-8")
+    blockers = stage_blockers(settings, environ)
+    assert any("test embedding" in line for line in blockers), blockers
+    env.write_text(env.read_text(encoding="utf-8")
+                   + "HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS=1024\n", encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+
+
+def test_an_embedding_route_that_dials_nothing_needs_no_declared_width(installation):
+    """`local` loads a model in this process; it does not ask a URL what shape it is."""
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n"
+                   "HINDSIGHT_API_EMBEDDINGS_PROVIDER=local\n", encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+
+
 def test_the_shipped_backend_environment_satisfies_the_checks_it_will_be_read_by():
     """The template is what an operator copies; a template the engine refuses is a trap."""
     from hermes_memory.config import env_file_values
-    from hermes_memory.install.setup import ENGINE_RETAIN_CAP, ENGINE_RETAIN_CHUNK
+    from hermes_memory.install.setup import (ENGINE_EMBEDDINGS_DIMENSIONS,
+                                             ENGINE_EMBEDDINGS_PROVIDER, ENGINE_RETAIN_CAP,
+                                             ENGINE_RETAIN_CHUNK)
 
     template = (Path(__file__).resolve().parents[2] / "deployment" / "env"
                 / "hindsight.env.example")
     values = env_file_values(template)
     assert int(values[ENGINE_RETAIN_CAP]) > int(values[ENGINE_RETAIN_CHUNK]), template
+    if values.get(ENGINE_EMBEDDINGS_PROVIDER) == "openai":
+        assert int(values[ENGINE_EMBEDDINGS_DIMENSIONS]) > 0, (
+            f"{template}: an OpenAI-compatible embedding route with no declared width makes "
+            "the engine send a test embedding every time it starts")
