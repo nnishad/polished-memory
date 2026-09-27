@@ -158,6 +158,7 @@ class DocumentMap:
         Guessing either way produces a store that disagrees with itself.
         """
         settled = verified = still_pending = unknown = absent = 0
+        confirmed: list[str] = []
         for row in self.outstanding(limit=limit):
             submission = row["operation_id"]
             if not submission:
@@ -171,6 +172,9 @@ class DocumentMap:
                     if state == "present":
                         self.confirm(row["record_id"], row["revision"])
                         verified += 1
+                        # The document id is the identity a synchronous retain leaves on the
+                        # job row, so this is what settles that work as well as the claim.
+                        confirmed.append(str(row["document_id"]))
                     else:
                         self.mark_absent(row["record_id"], row["revision"])
                         absent += 1
@@ -193,6 +197,7 @@ class DocumentMap:
             if state in OPERATION_DONE:
                 self.confirm(row["record_id"], row["revision"])
                 verified += 1
+                confirmed.append(str(submission))
             elif state in OPERATION_ABANDONED | OPERATION_STOPPED:
                 # `not_found` belongs here: an operation the backend has no record of is a
                 # question that can never be answered, and leaving the row open would ask it
@@ -210,7 +215,11 @@ class DocumentMap:
                 self._note(row, f"the backend answered {state!r} about the operation, which "
                                 "is neither finished nor one of the states it documents")
         return {"settled": settled, "verified": verified, "pending": still_pending,
-                "absent": absent, "unreachable": unknown}
+                "absent": absent, "unreachable": unknown,
+                # The identities the backend has now answered *yes* to, so the caller can
+                # settle the queue rows that carried them: an operation id for an async
+                # retain, a document id for a synchronous one.
+                "confirmed_identities": confirmed}
 
     def _probe(self, client, document_id: str) -> dict[str, Any]:
         """What the backend says about one document, with the reason when it cannot say.

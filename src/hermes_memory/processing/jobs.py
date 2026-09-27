@@ -288,6 +288,43 @@ class JobQueue:
         """We do not know whether the backend did it. The slot stays claimed."""
         self._transition(job.id, UNCERTAIN, error=reason, release_lease=True)
 
+    def settle_established(self, identities: list[str], *, actor: str = "operator") -> int:
+        """Close the in-flight work a backend answer has now accounted for.
+
+        Uncertainty is a question — *did this reach the engine* — and reconciliation is the
+        door that asks it. Leaving the row open after the engine said the operation finished
+        would keep asking a question whose answer is already written in the projection ledger,
+        and would make the doctor's own remedy ("reconcile or cancel them") point an operator
+        at a door that demonstrably does nothing to the queue.
+
+        Only an in-flight row whose submission is one of ``identities`` moves. No token count
+        is invented: the answer says the work landed, not what it cost, and a budget charged
+        from a guess would make the day's spend a number nobody can defend.
+        """
+        wanted = [str(item) for item in identities if str(item or "").strip()]
+        closed: list[str] = []
+        if not wanted:
+            return 0
+        marks = ",".join("?" for _ in wanted)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.db.execute(
+                f"SELECT id FROM processing_jobs WHERE submission_id IN ({marks}) AND "
+                f"state IN (?,?)", (*wanted, UNCERTAIN, SUBMITTING)).fetchall()
+            closed = [row["id"] for row in rows]
+            for job_id in closed:
+                self.db.execute(
+                    "UPDATE processing_jobs SET state=?, last_error=NULL, lease=NULL, "
+                    "lease_until=NULL, updated_at=? WHERE id=?", (SUCCEEDED, now(), job_id))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        if closed:
+            self.store._audit("job_settled_by_reconciliation", closed[0],
+                              {"actor": actor, "jobs": len(closed), "settled": closed[:20]})
+        return len(closed)
+
     def cancel(self, job_id: str, *, actor: str, reason: str) -> str:
         self.db.execute("BEGIN IMMEDIATE")
         try:

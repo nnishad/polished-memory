@@ -208,6 +208,15 @@ needs no approval digest; it asks the backend, one bounded list at a time, what 
 submissions this machine cannot account for, and writes down the answer it was given. A row it
 cannot settle stays outstanding and is asked again next time.
 
+The answer settles the *queue* too, not only the coverage claim. A job left `uncertain` is
+never retried by itself, and the doctor's remedy for one is "reconcile or cancel them" — so an
+operation the engine reports `completed` closes the job that carried it, under the same
+identity that verified its projection: the operation id for an async retain, the document id
+for a synchronous one whose call never named an operation. Three things are refused rather than
+convenient: a job somebody cancelled is not resurrected by a late answer, a row is not closed
+for an answer that belongs to a different submission, and no token count is written for work
+nobody watched the end of — the answer says the work landed, not what it cost.
+
 The approval is a digest of the list, not of a flag: selected record ids, the route facts,
 the processor fingerprint, the token ceiling and `blocking` are all inside it. A hold set
 after the list was shown therefore invalidates the approval rather than being run through.

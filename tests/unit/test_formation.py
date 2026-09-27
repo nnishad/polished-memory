@@ -31,7 +31,7 @@ from hermes_memory.processing.formation import (DEFAULT_BATCH, KIND, MAX_BATCH, 
                                                 processor_fingerprint, retain_route,
                                                 unprojected)
 from hermes_memory.processing.instance_gate import gate_path, instance_gate
-from hermes_memory.processing.jobs import SUCCEEDED, UNCERTAIN, JobQueue
+from hermes_memory.processing.jobs import CANCELLED, SUCCEEDED, UNCERTAIN, JobQueue
 from hermes_memory.storage.evidence import EvidenceStore
 
 OWNER = "jugaadu"
@@ -685,6 +685,131 @@ def test_reconcile_claims_no_coverage_the_backend_did_not_give(installation):
         assert docs.state(record, "1") == "submitted"
         assert count_unprojected(store, bank_id=BANK) == 4, \
             "unresolved work is still unprojected, not coverage"
+
+
+def a_stranded_submission(settings, *, text="a note nobody saw the end of"):
+    """A projection the backend holds an answer to, and the queue row that carried it.
+
+    This is the residue a killed pass leaves: the operation identity is written on both rows,
+    the outcome exists only in the engine, and the doctor names reconciliation as the remedy.
+    """
+    record, submission = strand(settings, text=text)
+    with EvidenceStore(settings.db_path) as store:
+        jobs = JobQueue(store)
+        job_id = jobs.enqueue(kind=KIND, inputs=[record], input_revision="1",
+                              route=retain_route(settings),
+                              processor_fingerprint="the-processor-that-died",
+                              priority="freshness")["job_id"]
+        jobs.begin_submission(jobs.get(job_id), submission_id=submission)
+        jobs.uncertain(jobs.get(job_id), reason="the bounded wait ran out")
+    return record, submission, job_id
+
+
+def test_reconcile_closes_the_job_the_backend_answered_for(installation):
+    """An uncertain row is a question, and this door is the answer to it.
+
+    Reconciling already wrote verified coverage from the same answer, so leaving the queue row
+    uncertain made the remedy the doctor names do nothing to the thing it names: a machine with
+    four settled submissions went on reporting four jobs that will not be retried by
+    themselves, forever, with an operator told to run the door that had already run.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    report = formation_reconcile(installation, client=Answers())
+    assert report["settled"] == 1 and report["jobs_settled"] == 1
+    assert report["confirmed_identities"] == [submission]
+    with EvidenceStore(installation.db_path) as store:
+        job = JobQueue(store).get(job_id)
+        assert job.state == SUCCEEDED, "the engine said it finished"
+        assert job.tokens_used == 0, "the answer says the work landed, not what it cost"
+        assert DocumentMap(store, bank_id=BANK).state(record, "1") == VERIFIED
+        assert store.db.execute("SELECT count(*) FROM audit WHERE action="
+                                "'job_settled_by_reconciliation'").fetchone()[0] == 1
+
+
+def test_reconcile_leaves_a_job_the_backend_has_not_answered_for_alone(installation):
+    """`processing` is not `completed`: the question stays, and so does the row.
+
+    Closing an uncertain job on a running operation would claim coverage the engine has not
+    given, which is the one failure this whole path exists to avoid.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "processing"}
+    report = formation_reconcile(installation, client=backend)
+    assert report["jobs_settled"] == 0 and report["pending"] == 1
+    assert report["confirmed_identities"] == []
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).state == UNCERTAIN
+
+
+def test_reconcile_settles_only_the_row_that_carried_the_answer(installation):
+    """One confirmed submission settles one job, not the backlog it sits beside."""
+    answered = a_stranded_submission(installation, text="answered")
+    still_open = a_stranded_submission(installation, text="still open")
+    backend = Answers()
+    identity = answered[1]
+
+    def operation(operation_id):
+        return ({"status": "completed"} if operation_id == identity
+                else {"status": "processing"})
+
+    backend.operation = operation
+    report = formation_reconcile(installation, client=backend)
+    assert report["jobs_settled"] == 1 and report["pending"] == 1
+    with EvidenceStore(installation.db_path) as store:
+        jobs = JobQueue(store)
+        assert jobs.get(answered[2]).state == SUCCEEDED
+        assert jobs.get(still_open[2]).state == UNCERTAIN
+
+
+def test_reconcile_does_not_resurrect_work_the_operator_stopped(installation):
+    """A cancelled job stays cancelled even when the engine says the operation finished.
+
+    The stop was somebody's decision and a late answer is not a second approval. The queue's
+    own transition guard refuses to move a cancelled row; this door writes SQL of its own, so
+    the same rule has to hold here explicitly.
+    """
+    record, submission, job_id = a_stranded_submission(installation)
+    with EvidenceStore(installation.db_path) as store:
+        JobQueue(store).cancel(job_id, actor=OWNER, reason="superseded by hand")
+
+    report = formation_reconcile(installation, client=Answers())
+    assert report["settled"] == 1, "the projection is still answered for"
+    assert report["jobs_settled"] == 0, "and the stopped job is not moved by that answer"
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).state == CANCELLED
+
+
+def test_reconcile_settles_a_synchronous_submission_by_the_document_it_landed_in(
+        installation):
+    """A retain that named no operation is still answerable: the document is the identity.
+
+    A synchronous submission records no operation id, so the job row carries the document id
+    and the probe is the only answer it can ever get. The identity that settles the coverage
+    has to be the same one that settles the work, or a pass interrupted before an operation id
+    existed would stay uncertain whatever the backend then said.
+    """
+    with EvidenceStore(installation.db_path) as store:
+        record = store.commit(envelope(source_id="msg-sync",
+                                      text="a synchronous retain"))["id"]
+        begun = DocumentMap(store, bank_id=BANK).begin(record, "1")
+        assert begun["submission_id"] is None, "a synchronous call mints no operation id"
+        jobs = JobQueue(store)
+        job_id = jobs.enqueue(kind=KIND, inputs=[record], input_revision="1",
+                              route=retain_route(installation),
+                              processor_fingerprint="the-processor-that-died",
+                              priority="freshness")["job_id"]
+        jobs.begin_submission(jobs.get(job_id), submission_id=begun["document_id"])
+        jobs.uncertain(jobs.get(job_id), reason="the wait ran out")
+
+    backend = Answers()
+    backend.document_state = lambda document: {"state": "present"}
+    report = formation_reconcile(installation, client=backend)
+    assert report["verified"] == 1 and report["settled"] == 1
+    assert report["jobs_settled"] == 1
+    assert report["confirmed_identities"] == [begun["document_id"]]
+    with EvidenceStore(installation.db_path) as store:
+        assert JobQueue(store).get(job_id).state == SUCCEEDED
 
 
 def test_reconcile_spends_nothing_on_the_shared_device(installation):

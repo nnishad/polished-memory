@@ -293,12 +293,18 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
     if not settings.db_path.is_file():
         raise FormationError(f"no canonical store at {settings.db_path}; run "
                              "`hermes-memory init` first")
-    empty = {"settled": 0, "verified": 0, "pending": 0, "absent": 0, "unreachable": 0}
+    empty = {"settled": 0, "verified": 0, "pending": 0, "absent": 0, "unreachable": 0,
+             "confirmed_identities": []}
     with EvidenceStore(settings.db_path) as store:
         docs = DocumentMap(store, bank_id=settings.bank_id)
         asked = docs.outstanding(limit=limit)
         outcome = empty if not asked else docs.reconcile(
             client=client or backend_client(settings), limit=limit)
+        # The same answer that verifies a projection closes the queue row that carried it.
+        # Reconciliation was already the door the doctor named for an uncertain job; this is
+        # the half that makes the naming true.
+        settled_jobs = JobQueue(store).settle_established(
+            outcome["confirmed_identities"], actor=settings.owner_principal or "operator")
         return {
             "ok": True,
             "performed_at": now(),
@@ -307,11 +313,16 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
             "limit": int(limit),
             "asked": [{"record_id": row["record_id"], "state": row["state"],
                        "operation_id": row["operation_id"]} for row in asked],
-            **outcome,
+            "jobs_settled": settled_jobs,
+            **{key: value for key, value in outcome.items()
+               if key != "confirmed_identities"},
+            "confirmed_identities": outcome["confirmed_identities"],
             "projections": docs.as_dict(),
             "performed": [
                 f"the backend was asked about {len(asked)} submission(s)",
                 "a projection it confirmed is written down as verified coverage",
+                f"{settled_jobs} queue job(s) it answered for are closed rather than "
+                "left uncertain",
             ],
             "not_performed": [
                 "no model request was sent, so nothing new was formed",

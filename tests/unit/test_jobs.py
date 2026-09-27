@@ -1,6 +1,8 @@
 """C12 job state machine: leases, epoch fencing, budgets and honest coverage."""
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from types import SimpleNamespace
 
@@ -120,6 +122,82 @@ def test_the_submission_identity_is_recorded_before_the_request(jobs):
     assert fresh.state == SUBMITTING and fresh.submission_id == "sub-123"
     jobs.mark_running(job, operation_id="op-9")
     assert jobs.get(job.id).backend_operation_id == "op-9"
+
+
+def stranded(jobs, *, submission="sub-answered", inputs=("rec_settled",)):
+    """One job whose submission this machine can no longer answer for."""
+    enqueued(jobs, inputs=list(inputs))
+    job = jobs.claim(worker="w1")
+    jobs.begin_submission(job, submission_id=submission)
+    jobs.uncertain(jobs.get(job.id), reason="the bounded wait ran out")
+    return job.id
+
+
+def test_an_answered_submission_closes_the_job_that_carried_it(jobs, store):
+    """§12.4: an uncertain row is a question, and the backend's answer is allowed to close it.
+
+    Reconciliation is the door the doctor names for exactly this backlog, so the answer it gets
+    has to reach the queue as well as the projection ledger. Writing only the coverage claim
+    left the remedy unable to change the state it reports — four jobs "will not be retried by
+    themselves", forever, next to four completed operations.
+    """
+    job_id = stranded(jobs)
+    assert jobs.settle_established(["sub-answered"]) == 1
+    fresh = jobs.get(job_id)
+    assert fresh.state == SUCCEEDED
+    assert fresh.tokens_used == 0, "the answer says the work landed, not what it cost"
+    assert fresh.last_error is None, "settled work does not keep the old complaint"
+    assert store.db.execute("SELECT count(*) FROM audit WHERE action="
+                            "'job_settled_by_reconciliation'").fetchone()[0] == 1
+
+
+def test_a_late_answer_does_not_resurrect_work_the_operator_stopped(jobs):
+    """A cancelled job stays cancelled: the stop was somebody's decision.
+
+    The queue's own transition guard refuses this, and settlement writes its own SQL, so the
+    rule has to be held here too rather than assumed from the method it did not use.
+    """
+    job_id = stranded(jobs)
+    jobs.cancel(job_id, actor="operator", reason="superseded by hand")
+    assert jobs.settle_established(["sub-answered"]) == 0
+    assert jobs.get(job_id).state == CANCELLED
+
+
+def test_only_the_row_that_carried_the_answer_is_closed(jobs):
+    answered = stranded(jobs, submission="sub-answered", inputs=("rec_a",))
+    still_open = stranded(jobs, submission="sub-still-open", inputs=("rec_b",))
+    assert jobs.settle_established(["sub-answered"]) == 1
+    assert jobs.get(answered).state == SUCCEEDED
+    assert jobs.get(still_open).state == UNCERTAIN, \
+        "one submission's answer is not the backlog's answer"
+
+
+def test_a_row_that_is_not_waiting_on_an_answer_is_left_alone(jobs):
+    """Settling is for in-flight work; a job backing off is waiting to be tried again."""
+    enqueued(jobs)
+    job = jobs.claim(worker="w1")
+    jobs.begin_submission(job, submission_id="sub-retry")
+    jobs.retry(jobs.get(job.id), error="the backend refused", backoff=30.0)
+    assert jobs.settle_established(["sub-retry"]) == 0
+    assert jobs.get(job.id).state in {RETRY_WAIT, QUARANTINED}
+
+
+def test_an_empty_answer_takes_no_write_lock_off_a_busy_store(jobs, store):
+    """No identities means no question — and a question with no subjects is still a lock.
+
+    SQLite tolerates `IN ()`, so the guard cannot be caught by a wrong answer; it is caught by
+    the transaction. Reconciling happens while a pass may still be writing, and a door that
+    answers nothing has no business queueing a writer behind it.
+    """
+    store.db.execute("PRAGMA busy_timeout=0")
+    blocker = sqlite3.connect(store.path)
+    blocker.isolation_level = None
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        assert jobs.settle_established([]) == 0
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
 
 
 def test_an_overdue_job_is_not_dispatched(jobs):
