@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -181,10 +182,15 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
     target = Path(staged["into"])
     root = Path(staged["source"])
     target.mkdir(parents=True)
+    # The wheel is compiled outside the tree it is staging a release of: `uv venv` refuses a
+    # directory that already has contents, so a build placed inside the half-made tree would
+    # make the very first command fail. It is copied in afterwards, which is what lets the
+    # record name an artefact that only this release holds.
+    scratch = Path(tempfile.mkdtemp(prefix="hermes-memory-wheel-"))
     try:
         distribution = Path(staged["wheel"])
         if not distribution.is_file():
-            distribution = _build_wheel(root, into=target, run=run)
+            distribution = _build_wheel(root, into=scratch, run=run)
         _run(run, ["uv", "venv", str(target), "--quiet"], stage="runtime venv")
         environments = [target]
         if backend:
@@ -196,6 +202,11 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
         for environment in environments:
             _run(run, ["uv", "pip", "install", "--python", str(_python(environment)),
                        "--quiet", str(distribution)], stage="hermes-memory")
+        if distribution.parent != target / "wheel":
+            kept = target / "wheel" / distribution.name
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(distribution, kept)
+            distribution = kept
         carry(source=root, into=target, names=tuple(staged["carried"]))
         manifest = {**{key: staged[key] for key in
                        ("into", "source", "source_commit", "source_dirty", "backend",
@@ -217,6 +228,8 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
         # taking it away again is not destroying anyone's work.
         shutil.rmtree(target, ignore_errors=True)
         raise
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     report = {**staged, "performed": True, "staged": str(target),
               "wheel": str(distribution), **verify(settings=settings, into=target,
                                                    environ=environ)}
@@ -314,19 +327,17 @@ def _revision(root: Path) -> tuple[str | None, bool]:
 
 
 def _build_wheel(root: Path, *, into: Path, run: Callable) -> Path:
-    """Compile the distribution *inside* the release being staged.
+    """Compile the distribution into a directory of its own, and insist on one answer.
 
     A checkout's ``dist/`` holds every build that machine has ever run, so choosing the
-    newest wheel there can install something this call never compiled. One directory per
-    release, holding exactly the artefact that went into both of its environments, is the
-    difference between a record and a guess.
+    newest wheel there can install something this call never compiled. The scratch directory
+    this builds into belongs to the one staging that asked for it.
     """
-    target = into / "wheel"
-    target.mkdir(parents=True, exist_ok=True)
-    _run(run, ["uv", "build", "--quiet", "--out-dir", str(target), str(root)], stage="wheel")
-    built = sorted(target.glob("hermes_memory-*.whl"))
+    into.mkdir(parents=True, exist_ok=True)
+    _run(run, ["uv", "build", "--quiet", "--out-dir", str(into), str(root)], stage="wheel")
+    built = sorted(into.glob("hermes_memory-*.whl"))
     if len(built) != 1:
-        raise ReleaseError(f"the build left {len(built)} wheels under {target}; a release "
+        raise ReleaseError(f"the build left {len(built)} wheels under {into}; a release "
                            "installs exactly one")
     return built[0]
 

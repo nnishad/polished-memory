@@ -41,8 +41,14 @@ class Fake:
             if marker in " ".join(argv):
                 return subprocess.CompletedProcess(argv, 1, "", f"{marker} refused")
         if argv[:2] == ["uv", "venv"]:
-            (Path(argv[2]) / "bin").mkdir(parents=True, exist_ok=True)
-            (Path(argv[2]) / "bin" / "python").write_text("#!/bin/sh\n")
+            # As strict as the real command: a half-filled directory is refused, which is
+            # what makes the order of the staging steps observable here at all.
+            venv = Path(argv[2])
+            if venv.exists() and any(venv.iterdir()):
+                return subprocess.CompletedProcess(argv, 1, "",
+                                                   "A directory already exists")
+            (venv / "bin").mkdir(parents=True, exist_ok=True)
+            (venv / "bin" / "python").write_text("#!/bin/sh\n")
         elif argv[1:3] == ["pip", "install"]:
             environment = Path(argv[argv.index("--python") + 1]).parent.parent
             name = "hermes-memory" if any(part.endswith(".whl") for part in argv) \
@@ -350,6 +356,15 @@ def test_the_record_says_which_commit_and_exactly_which_wheel_it_is(instance, so
     assert Path(record["wheel"]).parent == Path(report["staged"]) / "wheel", \
         "the artefact lives with the release that installed it"
     assert record["wheel_digest"] == content_digest(Path(record["wheel"]).read_bytes())
+
+
+def test_a_wheel_named_by_hand_is_still_kept_with_the_release(instance, source, tmp_path):
+    wheel = a_wheel(tmp_path)
+    report = staged(instance, source, tmp_path, wheel=wheel, runner=Fake())
+    record = json.loads((Path(report["staged"]) / MANIFEST).read_text(encoding="utf-8"))
+    assert Path(record["wheel"]).parent == Path(report["staged"]) / "wheel"
+    assert Path(record["wheel"]).read_bytes() == wheel.read_bytes(), \
+        "the record names the bytes the two environments actually installed"
 
 
 def test_a_dirty_checkout_is_not_staged_under_a_clean_commit_name(instance, source, tmp_path):
