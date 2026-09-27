@@ -142,6 +142,30 @@ configured and no `--actor`, a pause is refused rather than recorded against nob
 `--source` on the two installation-wide scopes is refused rather than ignored, and naming a
 connector no memory registers is refused too: a typo must not look like a hold.
 
+## Settling an admission that never came back
+
+```sh
+hermes-memory gate
+hermes-memory gate --resolve res_1a2b… --outcome cancelled --reason "cancel --operation "
+                   "op-117 was acknowledged by the backend"
+```
+
+`gate` reads the instance's admission ledger: which device is held, by whom and for how
+long, what is waiting behind it, and what is *unresolved*. The last of those is the reason
+the door exists. A request whose connection was lost leaves a reservation that keeps its
+device blocked on purpose — nothing this process knows proves the model server stopped, and
+handing the slot out again could put a second request on a GPU that is still busy. The
+doctor reports that state as degraded and it does not repair itself: `reap_expired` turns an
+expired lease into an uncertain reservation, never into a free device.
+
+So `--resolve` is how an operator establishes the answer from outside — a cancellation the
+backend acknowledged, a record the reconciler found projected, a model server checked by
+hand. It refuses without both `--outcome` and `--reason`, because "impatient" is not a
+settlement, and it refuses a reservation its holder already released. Nothing is charged to
+the daily budget: the token count of a request nobody saw the end of is not a number worth
+adding to a total. The ledger keeps both records — the holder that could not answer, and
+the operator who answered for it, with the name given.
+
 ## Working the archive
 
 ```sh

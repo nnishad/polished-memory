@@ -187,6 +187,51 @@ class ResourceGate:
             self.db.execute("ROLLBACK")
             raise
 
+    def resolve(self, reservation_id: str, *, outcome: str, actor: str,
+                reason: str) -> dict[str, Any]:
+        """Establish what happened to a slot this process could not prove, and free it.
+
+        The holder cannot call this: a request whose connection was lost is exactly the
+        case where the caller has no right to claim the upstream finished. So the answer
+        comes from outside — a cancellation the backend acknowledged, a reconciled record,
+        an operator who looked — and this writes down who gave it and when.
+
+        Nothing is charged to the budget. The token count of a request nobody saw the end
+        of is not a number that can be honestly added to a total, and a ledger that
+        invented one would make the day's spend a guess.
+        """
+        if outcome not in {"succeeded", "failed", "cancelled"}:
+            raise EvidenceError(
+                f"unknown outcome {outcome!r}; an unresolved reservation stays unresolved "
+                "until somebody establishes that it finished, failed or was stopped")
+        for name, value in (("actor", actor), ("reason", reason)):
+            if not isinstance(value, str) or not value.strip():
+                raise EvidenceError(f"{name} must be nonempty text: a settled slot without a "
+                                    "name on it is indistinguishable from a lost one")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._row_or_raise(reservation_id)
+            if row["state"] == RELEASED:
+                raise GateClosed(f"reservation {reservation_id} was already released by its "
+                                 "holder; there is nothing here for an operator to settle")
+            if row["state"] != UNCERTAIN:
+                raise GateClosed(
+                    f"reservation {reservation_id} is still a live lease held by "
+                    f"{row['holder']!r}; an operator settles a device nobody can answer for, "
+                    "and a live lease becomes that when it expires")
+            self.db.execute(
+                "UPDATE gate_reservations SET state=?, released_at=?, outcome=? WHERE id=?",
+                (RELEASED, self.clock(), outcome[:500], reservation_id))
+            self._log(reservation_id, row["resource"], row["route"], row["holder"], "resolved",
+                      {"outcome": outcome, "actor": actor[:200], "reason": reason[:400]})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return {"reservation": reservation_id, "resource": row["resource"],
+                "route": row["route"], "holder": row["holder"], "state": RELEASED,
+                "outcome": outcome, "settled_by": actor}
+
     def reap_expired(self) -> list[str]:
         """Expired leases become uncertain; they never become free."""
         self.db.execute("BEGIN IMMEDIATE")
@@ -275,6 +320,19 @@ class ResourceGate:
         rows = self.db.execute(
             "SELECT resource, route, holder, priority, acquired_at, lease_until "
             "FROM gate_reservations WHERE state=? ORDER BY resource", (HELD,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def unresolved(self) -> list[dict[str, Any]]:
+        """Reservations that keep a device blocked with nobody left to answer for them.
+
+        ``held`` is the live queue; this is the residue — a request whose connection went
+        away and whose end nobody has established. Each row here is a device nothing may
+        use, which is why the doctor calls it degraded and why settling one is a written
+        decision rather than a delete.
+        """
+        rows = self.db.execute(
+            "SELECT id, resource, route, holder, job_id, acquired_at, outcome "
+            "FROM gate_reservations WHERE state=? ORDER BY acquired_at", (UNCERTAIN,)).fetchall()
         return [dict(row) for row in rows]
 
     def ever_used(self) -> bool:

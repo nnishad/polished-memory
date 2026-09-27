@@ -337,8 +337,9 @@ class Doctor:
         # One severity path for every stage: the reading decides, and the remedy
         # follows it. A second FAIL branch here would mean two places that have to
         # agree about how bad "uncertain" is, and only one of them would be tested.
-        remedy = ("the resource stays blocked until an operator settles them; the "
-                  "ledger names the holder" if report.state == DEGRADED else None)
+        remedy = ("the resource stays blocked until an operator settles them; `hermes-memory "
+                  "gate` names the reservation and `gate --resolve` settles it with a stated "
+                  "outcome and reason" if report.state == DEGRADED else None)
         if operations.get("unattributed"):
             # An operation nobody could charge is the launcher saying it could not place the
             # task on a route, which is a version-contract question, not a stuck device.

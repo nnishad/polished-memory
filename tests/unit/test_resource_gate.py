@@ -156,6 +156,110 @@ def test_release_is_idempotent_and_an_unknown_id_is_refused(gate):
         gate.release(type(reservation)("nope", REMOTE, "retain", "h", 3, 0.0), outcome="failed")
 
 
+# -- an operator settling an unresolved request --------------------------------
+
+def stranded(gate, resource=REMOTE):
+    """A request whose answer never came back, which is the state nothing else frees."""
+    reservation = take(gate, resource=resource)
+    gate.mark_uncertain(reservation, reason="connection lost mid-request")
+    return reservation
+
+
+def test_an_operator_who_learnt_the_answer_can_free_the_device(gate, clock):
+    """The plan's rule is that a lost request blocks its device until proven otherwise.
+
+    "Until proven otherwise" has to be sayable, or one dropped connection retires a GPU for
+    the rest of the installation's life: the reconciler that finds the record projected, and
+    the cancellation the backend acknowledged, are both an answer about somebody else's
+    reservation, and until now there was nowhere to give it.
+    """
+    reservation = stranded(gate)
+    assert gate.unresolved()[0]["id"] == reservation.id
+    settled = gate.resolve(reservation.id, outcome="cancelled", actor="jugaadu",
+                           reason="the backend acknowledged the stop")
+    assert settled["state"] == "released" and settled["settled_by"] == "jugaadu"
+    assert gate.unresolved() == []
+
+
+def test_a_settled_device_is_admissible_again(gate):
+    reservation = take(gate)
+    gate.mark_uncertain(reservation, reason="connection lost mid-request")
+    assert gate.try_acquire(route="retain", holder="worker-2", resource=REMOTE,
+                            priority=2, ttl=60) is None
+    gate.resolve(reservation.id, outcome="cancelled", actor="owner",
+                 reason="the backend acknowledged the cancellation")
+    next_up = take(gate, holder="worker-2")
+    assert next_up is not None
+    gate.release(next_up, outcome="succeeded", tokens=1)
+    assert gate.blocked_resources() == []
+
+
+def test_settling_needs_an_outcome_a_name_and_a_reason(gate):
+    reservation = stranded(gate)
+    for kwargs in ({"outcome": "cancelled", "actor": "", "reason": "asked"},
+                   {"outcome": "cancelled", "actor": "owner", "reason": "  "},
+                   {"outcome": "unknown", "actor": "owner", "reason": "asked"}):
+        with pytest.raises(EvidenceError):
+            gate.resolve(reservation.id, **kwargs)
+    assert gate.blocked_resources() == [REMOTE], "a refused settlement changes nothing"
+
+
+def test_an_uncertain_answer_is_not_an_answer(gate):
+    """The whole point is that somebody established what happened.
+
+    "Still don't know" is the row's current state, and recording it as settled would let the
+    next caller onto a device nobody has proved idle — the guess this gate exists to prevent.
+    """
+    reservation = stranded(gate)
+    with pytest.raises(EvidenceError, match="stays unresolved"):
+        gate.resolve(reservation.id, outcome="uncertain", actor="owner", reason="gave up")
+
+
+def test_a_live_lease_is_not_the_operators_to_take(gate):
+    """A worker that is still running its request must not be handed out from under."""
+    reservation = take(gate)
+    with pytest.raises(GateClosed, match="live lease"):
+        gate.resolve(reservation.id, outcome="cancelled", actor="owner", reason="impatience")
+    assert gate.blocked_resources() == [REMOTE]
+
+
+def test_a_reservation_its_holder_already_released_is_not_resettled(gate):
+    reservation = take(gate)
+    gate.release(reservation, outcome="succeeded", tokens=10)
+    with pytest.raises(GateClosed, match="already released by its holder"):
+        gate.resolve(reservation.id, outcome="cancelled", actor="owner", reason="too late")
+    assert gate.usage()[REMOTE]["tokens"] == 10, "the holder's own charge stands"
+
+
+def test_settling_charges_nothing_because_nobody_saw_the_usage(gate):
+    """An invented token count would make the day's spend a guess wearing a total."""
+    reservation = stranded(gate)
+    gate.resolve(reservation.id, outcome="failed", actor="owner", reason="checked the server")
+    assert gate.usage() == {}
+
+
+def test_the_ledger_keeps_who_answered_for_a_lost_request(gate):
+    reservation = stranded(gate)
+    gate.resolve(reservation.id, outcome="succeeded", actor="jugaadu",
+                 reason="the reconciler found the record projected")
+    events = [dict(row) for row in gate.db.execute(
+        "SELECT event, detail FROM gate_ledger WHERE reservation_id=? ORDER BY rowid",
+        (reservation.id,)).fetchall()]
+    settled = events[-1]
+    assert settled["event"] == "resolved"
+    assert "jugaadu" in settled["detail"] and "projected" in settled["detail"]
+    assert "upstream disconnected" not in settled["detail"]
+
+
+def test_unresolved_lists_the_rows_that_block_a_device_with_nobody_left_to_answer(gate):
+    reservation = stranded(gate)
+    take(gate, resource=LOCAL)
+    rows = gate.unresolved()
+    assert [row["id"] for row in rows] == [reservation.id]
+    assert rows[0]["resource"] == REMOTE and rows[0]["route"] == "retain"
+    assert rows[0]["holder"] == "worker"
+
+
 # -- operator pause ----------------------------------------------------------
 
 def test_an_operator_pause_denies_new_dispatch_immediately(gate):

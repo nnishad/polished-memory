@@ -219,6 +219,20 @@ def main(argv: list[str] | None = None) -> int:
     pause.add_argument("--actor")
     pause.add_argument("--reason")
 
+    gate = sub.add_parser(
+        "gate", help="the admission ledger: which device is held by whom, and the settlement "
+                     "of a reservation whose answer never came")
+    gate.add_argument("--resolve", metavar="ID",
+                      help="free the device a reservation is still blocking, once somebody "
+                           "outside it has established what happened")
+    gate.add_argument("--outcome", choices=("succeeded", "failed", "cancelled"),
+                     help="with --resolve: the answer that was established; nothing is "
+                          "settled as still-unknown")
+    gate.add_argument("--reason",
+                      help="with --resolve: what established it; an unattributed settlement "
+                           "is refused")
+    gate.add_argument("--actor", help="who decided; defaults to the owner principal")
+
     backup = sub.add_parser("backup",
                             help="copy each profile's store to a snapshot that can be "
                                  "identified and verified")
@@ -504,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
         return _stop_command(settings, args)
     if args.command == "pause":
         return _pause_command(settings, args)
+    if args.command == "gate":
+        return _gate_command(settings, args)
     if args.command == "backup":
         return _backup_command(settings, args)
     if args.command == "restore":
@@ -887,6 +903,49 @@ def _pause_command(settings, args) -> int:
     return _emit({"ok": True, "scope": args.scope, "state": state, "actor": actor,
                   "source": args.source, "reason": reason, "held": _holds(settings),
                   "written_to": written_to, "survives_a_restart": True})
+
+
+def _gate_command(settings, args) -> int:
+    """Read the admission ledger, or settle a reservation its holder can no longer answer for.
+
+    A lost connection leaves a device blocked on purpose: nothing this process knows proves
+    the model server stopped, and handing the slot out again could put a second request on a
+    GPU that is still busy. So the release is never automatic, and the door that performs it
+    has to say who established the answer — the same rule the inference hold follows, read
+    from the other side.
+    """
+    from .processing.instance_gate import gate_path, instance_gate
+
+    if (args.outcome or args.reason) and not args.resolve:
+        print("refused: --outcome and --reason belong to --resolve; the reading of the "
+              "ledger asks for nothing", file=sys.stderr)
+        return 2
+    if args.resolve:
+        if not args.outcome:
+            print("refused: a device is freed by an answer, not by impatience — say what was "
+                  "established with --outcome succeeded, failed or cancelled", file=sys.stderr)
+            return 2
+        if not args.reason:
+            print("refused: settling somebody else's reservation needs a stated reason, such "
+                  "as the cancellation the backend acknowledged or the record it was run for",
+                  file=sys.stderr)
+            return 2
+    actor = args.actor or settings.owner_principal
+    if args.resolve and not actor:
+        print("refused: nothing names who settled this, and no owner principal is configured",
+              file=sys.stderr)
+        return 2
+    with instance_gate(settings) as gate:
+        settled = (gate.resolve(args.resolve, outcome=args.outcome, actor=actor,
+                                reason=args.reason) if args.resolve else None)
+        reading = {"ok": True, "ledger": str(gate_path(settings)),
+                   "paused": gate.paused, "hold": gate.hold(),
+                   "held": gate.held(), "unresolved": gate.unresolved(),
+                   "occupancy": gate.occupancy(), "usage": gate.usage(),
+                   "blocked": gate.blocked_resources()}
+    if settled:
+        reading["settled"] = settled
+    return _emit(reading)
 
 
 def _hold_capture(settings, *, source: str, state: str, actor: str,

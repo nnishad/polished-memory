@@ -787,6 +787,72 @@ def test_a_pause_needs_somebody_to_be_answerable_for(service_home, tmp_path, mon
     assert code == 2 and "owner" in message
 
 
+# -- the admission ledger, and the request nobody can answer for ---------------
+
+def stranded_at_the_gate(*, resource="remote-9b"):
+    """One instance reservation whose upstream answer never came back."""
+    with instance_gate(load_settings()) as gate:
+        reservation = gate.try_acquire(route="retain", holder="worker-1", resource=resource,
+                                       priority=2, ttl=60)
+        gate.mark_uncertain(reservation, reason="connection lost mid-request")
+        return reservation.id
+
+
+def test_the_gate_door_says_who_holds_each_device_and_which_answer_is_missing(home):
+    """`doctor` says a device is blocked; this is the reading that names the row."""
+    reservation = stranded_at_the_gate()
+    code, reading = run("gate")
+    assert code == 0
+    assert [row["id"] for row in reading["unresolved"]] == [reservation]
+    assert reading["held"] == [], "an uncertain reservation is not a live holder"
+    assert reading["blocked"] == ["remote-9b"]
+    assert reading["paused"] is False and reading["hold"] is None
+
+
+def test_settling_a_lost_request_through_the_door_gives_the_device_back(home):
+    """The reconciler that found the record projected is an answer about the slot too.
+
+    Without this the honest report and the working installation were incompatible: the
+    gate kept the device blocked exactly as designed, and nothing in the framework could
+    say what had become of the request, so one dropped connection retired a GPU.
+    """
+    reservation = stranded_at_the_gate()
+    code, report = run("gate", "--resolve", reservation, "--outcome", "cancelled",
+                       "--reason", "the backend acknowledged the cancellation")
+    assert code == 0
+    assert report["settled"]["settled_by"] == OWNER
+    assert report["unresolved"] == [] and report["blocked"] == []
+    assert report["usage"] == {}, "nobody saw the token count, so nothing is charged"
+
+
+def test_the_gate_door_refuses_to_free_a_device_on_an_unstated_outcome(home):
+    reservation = stranded_at_the_gate()
+    code, message = errors("gate", "--resolve", reservation, "--reason", "looked at it")
+    assert code == 2 and "freed by an answer" in message
+    with instance_gate(load_settings()) as gate:
+        assert [row["id"] for row in gate.unresolved()] == [reservation], \
+            "a refusal must not free the device it refuses to speak for"
+
+
+def test_the_gate_door_refuses_an_unattributed_settlement(home, tmp_path, monkeypatch):
+    unowned = tmp_path / "no-owner"
+    unowned.mkdir()
+    (unowned / "hermes-memory.env").write_text(
+        f"HERMES_MEMORY_DATA_DIR={unowned / 'data'}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(unowned))
+    reservation = stranded_at_the_gate()
+    code, message = errors("gate", "--resolve", reservation, "--outcome", "failed")
+    assert code == 2 and "reason" in message
+    code, message = errors("gate", "--resolve", reservation, "--outcome", "failed",
+                           "--reason", "checked the model server by hand")
+    assert code == 2 and "who settled" in message
+
+
+def test_the_gate_door_refuses_flags_that_belong_to_a_settlement(home):
+    code, message = errors("gate", "--outcome", "cancelled")
+    assert code == 2 and "--resolve" in message
+
+
 def register_source(name=SOURCE, *, policy="local-only", pages=0):
     """A connector this installation actually reads, optionally with a cursor."""
     from hermes_memory.sources.runtime import ConnectorRuntime
