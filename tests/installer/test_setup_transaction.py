@@ -919,3 +919,77 @@ def test_a_backend_directory_that_went_missing_reopens_the_step_that_owns_it(ins
                     ref=REF)["steps"]}["initialize"]
     assert settled["state"] == "resumed", ("the receipt records the absence this pass "
                                            "repaired, so the step is asked again forever")
+
+
+# -- the engine's own arithmetic ----------------------------------------------
+
+def backend_env(installation):
+    """The same installation with a backend route, and the file that unit starts with."""
+    from hermes_memory.install.services import layout
+
+    assert staged_backend(installation, imports={"hindsight_api": True,
+                                                 "hermes_memory": True}) == []
+    settings, environ = load_settings(), installation[1]
+    return settings, environ, layout(settings, environ=environ).hindsight_env
+
+
+def stage_blockers(settings, environ) -> list[str]:
+    """The blockers the stage step sees: it is where a release is proved runnable."""
+    proposal = plan(settings, hermes_home=Path(settings.home), environ=environ)
+    return [line for line in proposal["blocked"] if line.startswith("stage:")]
+
+
+def test_a_backend_environment_the_engine_would_refuse_is_refused_before_it_starts(
+        installation):
+    """`RETAIN_MAX_COMPLETION_TOKENS` has to exceed `RETAIN_CHUNK_SIZE`, or the engine quits.
+
+    Both units of a pinned backend were crash-looping on this arithmetic on a real machine:
+    the cap is ours to set and the chunk default is the engine's, and nothing between the two
+    noticed until `systemd` had restarted the service a hundred times.
+    """
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=2048\n", encoding="utf-8")
+    blockers = stage_blockers(settings, environ)
+    assert any("RETAIN_CHUNK_SIZE" in line and "RETAIN_MAX_COMPLETION_TOKENS" in line
+               for line in blockers), blockers
+    env.write_text(env.read_text(encoding="utf-8")
+                   + "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+    # The rule is "greater than", so the two meeting exactly is still a refusal.
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=1500\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=1500\n", encoding="utf-8")
+    assert stage_blockers(settings, environ), "an equal budget and chunk cannot answer"
+
+
+def test_an_engine_that_generates_nothing_is_not_checked_for_a_generation_budget(
+        installation):
+    """A provider switched off has no output to size.
+
+    Refusing it anyway would be the framework disagreeing with its own backend about what a
+    valid installation is, and the engine's validator makes exactly this exception.
+    """
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=none\n"
+                   "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=1\n", encoding="utf-8")
+    assert stage_blockers(settings, environ) == []
+
+
+def test_a_backend_environment_that_names_no_number_is_named_rather_than_guessed(
+        installation):
+    settings, environ, env = backend_env(installation)
+    env.write_text("HINDSIGHT_API_LLM_PROVIDER=openai\n"
+                   "HINDSIGHT_API_RETAIN_CHUNK_SIZE=smallish\n", encoding="utf-8")
+    assert any("not a number" in line for line in stage_blockers(settings, environ))
+
+
+def test_the_shipped_backend_environment_satisfies_the_checks_it_will_be_read_by():
+    """The template is what an operator copies; a template the engine refuses is a trap."""
+    from hermes_memory.config import env_file_values
+    from hermes_memory.install.setup import ENGINE_RETAIN_CAP, ENGINE_RETAIN_CHUNK
+
+    template = (Path(__file__).resolve().parents[2] / "deployment" / "env"
+                / "hindsight.env.example")
+    values = env_file_values(template)
+    assert int(values[ENGINE_RETAIN_CAP]) > int(values[ENGINE_RETAIN_CHUNK]), template

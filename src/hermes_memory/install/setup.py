@@ -249,10 +249,55 @@ def _stage(ctx: Context, *, apply: bool) -> dict[str, Any]:
         if not engine["ready"]:
             blocking.append(f"a backend route is configured and the worker's environment "
                             f"cannot run it: {engine['detail']}")
+    refused = _engine_configuration(ctx) if backend_configured else []
+    blocking += refused
     return {"actions": actions, "blocking": blocking,
             "inputs": {"release": str(release), "missing": missing,
                        "importable": importable, "backend": backend_configured,
-                       "engine": engine}}
+                       "engine": engine, "configuration": refused}}
+
+
+#: The arithmetic the pinned engine validates against its own environment file before it
+#: serves: a retain completion budget must exceed the retain chunk. The values below are the
+#: engine's 0.10.1 defaults, named because the alternative is a unit that starts, refuses its
+#: configuration and is restarted by the manager forever.
+ENGINE_RETAIN_CAP = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
+ENGINE_RETAIN_CHUNK = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
+ENGINE_RETAIN_DEFAULTS = {ENGINE_RETAIN_CAP: 64_000, ENGINE_RETAIN_CHUNK: 3_000}
+
+
+def _engine_configuration(ctx: Context) -> list[str]:
+    """What the engine would refuse about the environment file it is started with."""
+    from .services import layout
+
+    path = layout(ctx.settings, environ=ctx.environ).hindsight_env
+    if not path.is_file():
+        return []
+    values = env_file_values(path)
+    if values.get("HINDSIGHT_API_LLM_PROVIDER", "").strip().lower() == "none":
+        return []
+
+    def number(key: str) -> int | None:
+        raw = values.get(key)
+        if raw is None:
+            return ENGINE_RETAIN_DEFAULTS[key]
+        try:
+            return int(str(raw).strip())
+        except ValueError:
+            return None
+
+    cap, chunk = number(ENGINE_RETAIN_CAP), number(ENGINE_RETAIN_CHUNK)
+    if cap is None or chunk is None:
+        broken = ENGINE_RETAIN_CAP if cap is None else ENGINE_RETAIN_CHUNK
+        return [f"{path} sets {broken} to something that is not a number; the engine reads "
+                "an integer there and will refuse to start"]
+    if cap <= chunk:
+        return [f"{path.name}: {ENGINE_RETAIN_CAP}={cap} is not greater than "
+                f"{ENGINE_RETAIN_CHUNK}={chunk}, which is the arithmetic the pinned engine "
+                "validates before it serves. Lower the chunk or raise the cap; the gate's "
+                "own output cap is what actually limits a completion, so raising this one "
+                "above it would only move the truncation"]
+    return []
 
 
 def _engine_probe(release: Path) -> dict[str, Any]:
