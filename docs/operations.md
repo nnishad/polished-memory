@@ -146,7 +146,7 @@ connector no memory registers is refused too: a typo must not look like a hold.
 
 ```sh
 hermes-memory gate
-hermes-memory gate --resolve res_1a2b… --outcome cancelled --reason "cancel --operation "
+hermes-memory gate --resolve wait_9f2c1a… --outcome cancelled --reason "cancel --operation "
                    "op-117 was acknowledged by the backend"
 ```
 

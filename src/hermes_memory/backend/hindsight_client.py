@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -295,11 +296,17 @@ class HindsightClient:
                                        capability="bank_stats"), "bank_stats")
 
     def document_state(self, document_id: str) -> dict[str, Any]:
-        """Is this document present, and can we prove it? Absent-vs-unknown differs."""
+        """Is this document present, and can we prove it? Absent-vs-unknown differs.
+
+        The pinned backend filters this reading by one ``document_id`` query parameter, so
+        one call answers one mapping — which is also the only shape that keeps "absent"
+        meaningful: a batch answer could not distinguish the document that was not there
+        from the one it never looked up.
+        """
         self.capabilities.require("list_memories")
-        result = self._call("POST", self._path_for("list_memories"),
-                            {"document_ids": [document_id], "limit": 5},
-                            capability="list_memories")
+        asked = (f"{self._path_for('list_memories')}"
+                 f"?{urllib.parse.urlencode({'document_id': document_id, 'limit': 5})}")
+        result = self._call("GET", asked, None, capability="list_memories")
         if not result.ok:
             return {"document_id": document_id, "state": "unknown",
                     "reason": f"HTTP {result.status}"}

@@ -1,5 +1,5 @@
 {
-  "framework_digest": "b652bb9c9daf4e7aaa82bafbb5011fc34b33cc359376b4392cf952c984671409",
+  "framework_digest": "380922a53a39b16451ec8c21383f5764ee5aeb7f733bb87106b59e678c53e509",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",
@@ -29,7 +29,7 @@
         "since": "0.10.1"
       },
       {
-        "method": "POST",
+        "method": "GET",
         "name": "list_memories",
         "path": "/v1/default/banks/{bank_id}/memories/list",
         "since": "0.10.1"
@@ -41,7 +41,7 @@
         "since": "0.10.1"
       },
       {
-        "method": "PUT",
+        "method": "PATCH",
         "name": "update_memory",
         "path": "/v1/default/banks/{bank_id}/memories/{memory_id}",
         "since": "0.10.1"

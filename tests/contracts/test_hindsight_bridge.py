@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import uuid
 
 import pytest
 
-from hermes_memory.backend.capabilities import (PINNED_VERSION, UnsupportedCapability,
-                                                capabilities_for)
+from hermes_memory.backend.capabilities import (CAPABILITIES, PINNED_VERSION,
+                                                UnsupportedCapability, capabilities_for)
 from hermes_memory.backend.document_map import (ABSENT, QUEUED, VERIFIED,
                                    DocumentMap)
 from hermes_memory.backend.hindsight_client import (HindsightClient, HindsightError,
@@ -17,6 +18,7 @@ from hermes_memory.backend.hindsight_client import (HindsightClient, HindsightEr
 from conftest import envelope
 
 BANK = "hermes"
+ROUTES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "hindsight_0_10_1_routes.json"
 
 
 class Recorder:
@@ -35,10 +37,11 @@ class Recorder:
         self.calls.append({"method": method, "url": url, "payload": payload,
                            "headers": dict(headers)})
         for key, result in self.replies.items():
-            # A reply is registered as "VERB /path"; the client supplies the host,
-            # so compare the verb exactly and the path as a suffix.
+            # A reply is registered as "VERB /path"; the client supplies the host and the
+            # reading carries its filters as a query string, so compare the verb exactly and
+            # match the path on whatever comes before the "?".
             verb, _, path = key.partition(" ")
-            if verb == method and url.endswith(path):
+            if verb == method and url.split("?", 1)[0].endswith(path):
                 return result
         return self.default
 
@@ -222,7 +225,7 @@ def test_a_synchronous_submission_with_no_answer_is_settled_by_the_document_itse
     docs.begin(record, "1")
     assert docs.state(record, "1") == QUEUED
     client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
-    transport.when(f"POST /v1/default/banks/{BANK}/memories/list",
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/list",
                    TransportResult(200, {"memories": [{"id": "one"}]}))
 
     outcome = docs.reconcile(client=client)
@@ -236,7 +239,7 @@ def test_a_document_the_backend_does_not_have_is_recorded_as_gone(mapped, transp
     docs.begin(record, "1")
     document = docs.document_id(record, "1")
     client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
-    transport.when(f"POST /v1/default/banks/{BANK}/memories/list",
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/list",
                    TransportResult(200, {"memories": []}))
 
     outcome = docs.reconcile(client=client)
@@ -377,3 +380,41 @@ def test_a_sync_projection_stays_queued_until_something_happens(store, mapped):
     docs, record = mapped
     docs.begin(record, "1")
     assert docs.outstanding()[0]["operation_id"] is None
+
+
+# -- what the pinned revision actually serves ----------------------------------
+
+def test_every_declared_capability_is_a_route_the_pinned_backend_serves():
+    """A verb remembered wrongly is a HTTP 405 on the first call that matters.
+
+    Every other test in this file answers with a stand-in that serves whatever the table
+    asks for, so a row the pinned release does not have is invisible until a real
+    installation tries to reconcile a lost request — which is precisely the moment it has
+    to work. The table beside this file is a reading of that release's own OpenAPI
+    document, so the check is the machine's answer rather than somebody's note about it.
+    """
+    declared = {f"{item.method} {item.path}" for item in CAPABILITIES}
+    served = set(json.loads(ROUTES.read_text(encoding="utf-8"))["routes"])
+    assert declared <= served, f"this build asks for routes {sorted(declared - served)}"
+
+
+def test_the_route_table_read_belongs_to_the_revision_this_build_pins():
+    """A pin bump without a re-read of the release's routes is an unverified claim."""
+    recorded = json.loads(ROUTES.read_text(encoding="utf-8"))
+    assert recorded["pinned_version"] == PINNED_VERSION, \
+        "re-read /openapi.json from the new pinned backend and update the fixture"
+
+
+def test_the_reconciliation_reading_asks_as_a_filtered_get_with_the_document_named(
+        client, transport):
+    """A table row can name the right verb while the client still posts to it.
+
+    The filter lives in the query string on this revision, so the document being asked
+    about has to be visible in the URL: a GET with no filter answers "what is in this
+    bank", which would read as proof that a missing document is present.
+    """
+    transport.default = TransportResult(200, {"memories": [{"id": "hdoc1"}]})
+    assert client.document_state("hdoc1")["state"] == "present"
+    asked = transport.calls[-1]
+    assert asked["method"] == "GET" and asked["payload"] is None
+    assert "document_id=hdoc1" in asked["url"] and "limit=5" in asked["url"]
