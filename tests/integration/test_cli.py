@@ -15,7 +15,8 @@ from hermes_memory.config import load_settings
 from hermes_memory.install.release import carry
 from hermes_memory.install.profiles import InstallationError, ProfileRegistry
 from hermes_memory.knowledge.assertions import AssertionStore
-from hermes_memory.backend.document_map import DocumentMap
+from hermes_memory.backend.document_map import VERIFIED, DocumentMap
+from hermes_memory.backend.hindsight_client import HindsightUnavailable
 from hermes_memory.ids import now
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
@@ -1981,14 +1982,26 @@ def forming(tmp_path, monkeypatch):
 
 
 class Answers:
-    """The backend, stubbed: this suite must never reach for a model."""
+    """The backend, stubbed: this suite must never reach for a model.
+
+    A submission is answered with the operation identity it was made under, and the
+    operation is what reports the cost — nothing has been read at submission time.
+    """
 
     def __init__(self):
         self.retain_calls = []
+        self.asked: list[str] = []
 
-    def retain(self, **kwargs):
-        self.retain_calls.append(kwargs)
-        return {"ok": True, "usage": {"total_tokens": 321}}
+    def retain_async(self, items, *, submission_id):
+        self.retain_calls.append({"items": items, "submission_id": submission_id})
+        return {"ok": True, "operation_id": submission_id}
+
+    def operation(self, operation_id):
+        self.asked.append(operation_id)
+        return {"status": "completed", "usage": {"total_tokens": 321}}
+
+    def document_state(self, document_id):
+        return {"document_id": document_id, "state": "present", "count": 1}
 
 
 @pytest.fixture()
@@ -2059,6 +2072,51 @@ def test_an_operator_hold_stops_the_pass_that_was_approved_before_it(forming, st
     code, message = errors("form", "--review", plan["review_digest"], "--actor", OWNER)
     assert code == 2 and "does not match" in message
     assert stubbed.retain_calls == []
+
+
+def stranded_projection(settings, *, source_id="msg-stranded"):
+    """A projection that was submitted and whose answer never came back."""
+    with EvidenceStore(settings.db_path) as store:
+        record = store.commit(envelope(source_id=source_id, text="an old note"))["id"]
+        begun = DocumentMap(store, bank_id=settings.bank_id).begin(
+            record, "1", async_submission=True)
+    return record, begun["submission_id"]
+
+
+def test_form_reconcile_asks_the_backend_about_work_we_cannot_account_for(forming, stubbed):
+    record, submission = stranded_projection(forming)
+    code, report = run("form", "--reconcile")
+    assert code == 0
+    assert report["settled"] == 1 and report["verified"] == 1
+    assert report["asked"][0]["operation_id"] == submission
+    assert stubbed.asked == [submission] and stubbed.retain_calls == [], \
+        "reconciling asks about work already submitted; it does no work"
+    with EvidenceStore(forming.db_path) as store:
+        assert DocumentMap(store, bank_id=forming.bank_id).state(record, "1") == VERIFIED
+
+
+def test_form_reconcile_reports_a_question_the_backend_could_not_answer(forming, stubbed,
+                                                                       monkeypatch):
+    """An unreachable backend is not an outcome, and the door says so rather than 0."""
+    record, _ = stranded_projection(forming)
+
+    class Unreachable:
+        def operation(self, operation_id):
+            raise HindsightUnavailable("connection refused while asking about the operation")
+
+    from hermes_memory.processing import formation
+
+    monkeypatch.setattr(formation, "backend_client", lambda settings: Unreachable())
+    code, report = run("form", "--reconcile")
+    assert code == 0 and report["unreachable"] == 1 and report["verified"] == 0
+    with EvidenceStore(forming.db_path) as store:
+        assert DocumentMap(store, bank_id=forming.bank_id).state(record, "1") == "submitted"
+
+
+def test_form_reconcile_queues_nothing_so_it_asks_for_no_approval(forming, stubbed):
+    code, message = errors("form", "--reconcile", "--review", "any-digest", "--actor", OWNER)
+    assert code == 2 and "queues no work" in message
+    assert stubbed.asked == [] and stubbed.retain_calls == []
 
 
 def test_status_says_that_nothing_drains_the_queue_on_its_own(forming, stubbed):

@@ -12,12 +12,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import stat
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
 from conftest import envelope
-from hermes_memory.backend.document_map import DocumentMap
+from hermes_memory.backend.document_map import VERIFIED, DocumentMap
 from hermes_memory.backend.hindsight_client import HindsightUnavailable
 from hermes_memory.config import load_settings
 from hermes_memory.ids import backend_document_id
@@ -26,8 +27,9 @@ from hermes_memory.processing import formation
 from hermes_memory.processing.formation import (DEFAULT_BATCH, KIND, MAX_BATCH, MAX_JOBS,
                                                 FormationError, backend_client,
                                                 count_unprojected, formation_apply,
-                                                formation_plan, processor_fingerprint,
-                                                retain_route, unprojected)
+                                                formation_plan, formation_reconcile,
+                                                processor_fingerprint, retain_route,
+                                                unprojected)
 from hermes_memory.processing.instance_gate import gate_path, instance_gate
 from hermes_memory.processing.jobs import SUCCEEDED, UNCERTAIN, JobQueue
 from hermes_memory.storage.evidence import EvidenceStore
@@ -39,21 +41,39 @@ RETAIN_UPSTREAM = "http://127.0.0.1:11434/v1"
 
 
 class Answers:
-    """A backend that answers the way the pinned one does, and remembers being asked."""
+    """A backend that answers the way the pinned one does, and remembers being asked.
+
+    A submission says the work was accepted and reports no cost — the model has not run
+    yet. The operation is the answer that says it did, and usage arrives with it.
+    """
 
     def __init__(self):
         self.retain_calls = []
+        self.asked: list[str] = []
 
-    def retain(self, **kwargs):
-        self.retain_calls.append(kwargs)
-        return {"ok": True, "usage": {"total_tokens": 321}}
+    def retain_async(self, items, *, submission_id):
+        self.retain_calls.append({"items": items, "submission_id": submission_id})
+        return {"ok": True, "operation_id": submission_id}
+
+    def operation(self, operation_id):
+        self.asked.append(operation_id)
+        return {"status": "completed", "usage": {"total_tokens": 321}}
+
+    def document_state(self, document_id):
+        return {"document_id": document_id, "state": "present", "count": 1}
 
 
 class Unreachable:
     """The transport died mid-request, which is not the same as the work having failed."""
 
-    def retain(self, **kwargs):
+    def retain_async(self, items, *, submission_id):
         raise HindsightUnavailable("connection reset while the request was in flight")
+
+    def operation(self, operation_id):
+        raise HindsightUnavailable("connection reset while asking about an operation")
+
+    def document_state(self, document_id):
+        raise HindsightUnavailable("the backend could not be asked about the document")
 
 
 @pytest.fixture()
@@ -611,3 +631,76 @@ def test_a_period_of_the_reading_is_reported_as_the_day_the_budget_counts(instal
     assert plan["budget"]["ledger"] == "instance"
     assert plan["budget"]["remaining"] == 200000 - 500
     assert plan["budget"]["period"] == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# -- asking the backend about work this machine cannot account for -----------
+
+def strand(settings, *, text="an old note"):
+    """Commit a record and submit its projection without waiting for an answer."""
+    with EvidenceStore(settings.db_path) as store:
+        record = store.commit(envelope(source_id=f"msg-{text}", text=text))["id"]
+        begun = DocumentMap(store, bank_id=BANK).begin(record, "1", async_submission=True)
+    return record, begun["submission_id"]
+
+
+def test_reconcile_asks_the_backend_about_every_submission_we_cannot_account_for(installation):
+    record, submission = strand(installation)
+    backend = Answers()
+    report = formation_reconcile(installation, client=backend)
+    assert report["settled"] == 1 and report["verified"] == 1
+    assert backend.asked == [submission], "the identity on the row is the question asked"
+    with EvidenceStore(installation.db_path) as store:
+        assert DocumentMap(store, bank_id=BANK).state(record, "1") == VERIFIED
+
+
+def test_reconcile_needs_no_backend_when_there_is_nothing_to_ask(installation):
+    """An empty ledger is a complete answer, not a reason to open a socket.
+
+    A machine with no backend configured can still be asked whether it is waiting on one,
+    and the answer to that is not "refused: no endpoint".
+    """
+    without = replace(installation, hindsight_url="")
+    report = formation_reconcile(without)
+    assert report["ok"] is True and report["asked"] == [] and report["settled"] == 0
+    strand(without)
+    with pytest.raises(FormationError, match="no backend endpoint"):
+        formation_reconcile(without)
+
+
+def test_reconcile_asks_nothing_when_there_is_nothing_to_ask(installation):
+    backend = Answers()
+    report = formation_reconcile(installation, client=backend)
+    assert report["asked"] == [] and report["settled"] == 0
+    assert backend.asked == [], "an empty ledger is not a question to ask a backend"
+
+
+def test_reconcile_claims_no_coverage_the_backend_did_not_give(installation):
+    record, _ = strand(installation)
+    backend = Answers()
+    backend.operation = lambda operation_id: {"status": "processing"}
+    report = formation_reconcile(installation, client=backend)
+    assert report["pending"] == 1 and report["verified"] == 0
+    with EvidenceStore(installation.db_path) as store:
+        docs = DocumentMap(store, bank_id=BANK)
+        assert docs.state(record, "1") == "submitted"
+        assert count_unprojected(store, bank_id=BANK) == 4, \
+            "unresolved work is still unprojected, not coverage"
+
+
+def test_reconcile_spends_nothing_on_the_shared_device(installation):
+    """It asks about work already done; it does not do any, so it takes no slot."""
+    strand(installation)
+    with instance_gate(installation) as gate:
+        before = gate.usage()
+    formation_reconcile(installation, client=Answers())
+    with instance_gate(installation) as gate:
+        assert gate.usage() == before, "no token and no call was charged to the device"
+        assert gate.blocked_resources() == [], "and no slot was left claimed"
+
+
+def test_reconcile_refuses_an_unbounded_limit_and_an_absent_archive(installation):
+    with pytest.raises(FormationError, match="limit must be"):
+        formation_reconcile(installation, limit=0, client=Answers())
+    missing = replace(installation, db_path=installation.db_path.parent / "nope.db")
+    with pytest.raises(FormationError, match="no canonical store"):
+        formation_reconcile(missing, client=Answers())

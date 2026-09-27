@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = ["CAPABILITIES", "Capability", "Capabilities", "PINNED_VERSION",
-           "UnsupportedCapability"]
+           "UnsupportedCapability", "OPERATION_STATES", "OPERATION_DONE",
+           "OPERATION_RUNNING", "OPERATION_ABANDONED", "OPERATION_STOPPED"]
 
 PINNED_VERSION = "0.10.1"
 
@@ -80,6 +81,21 @@ CAPABILITIES: tuple[Capability, ...] = (
                "preview_prompt", "0.10.1"),
     Capability("list_banks", "GET", "/v1/default/banks", "list_banks", "0.10.1"),
 )
+
+# `OperationStatusResponse.status`, word for word. A job's whole recovery story depends on
+# being able to say "that answer means it is finished", "means it is still running" or
+# "means it will never answer", so the words live beside the pinned routes that produce
+# them rather than beside one caller. An answer from outside this list is not read as
+# either of the things it might be mistaken for.
+OPERATION_STATES: tuple[str, ...] = ("pending", "processing", "completed", "failed",
+                                     "cancelled", "not_found")
+OPERATION_DONE = frozenset({"completed"})
+OPERATION_RUNNING = frozenset({"pending", "processing"})
+# Nothing is running for these, so the device is free and the projection did not happen.
+OPERATION_ABANDONED = frozenset({"failed", "not_found"})
+# Somebody asked for this to stop. Resubmitting it would overrule them, so it is not in
+# the abandoned set even though nothing is running: the ending is the point of it.
+OPERATION_STOPPED = frozenset({"cancelled"})
 
 
 @dataclass(frozen=True)

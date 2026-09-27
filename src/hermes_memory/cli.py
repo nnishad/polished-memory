@@ -377,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
                       help="form the memory enrolled for this Hermes profile home")
     form.add_argument("--review", metavar="DIGEST",
                       help="the digest of the list that was actually shown")
+    form.add_argument("--reconcile", action="store_true",
+                      help="ask the backend what became of submissions we cannot account "
+                           "for; this sends no model request and spends no budget")
 
     summarize = sub.add_parser(
         "summarize",
@@ -1691,7 +1694,7 @@ def _form_command(settings, args) -> int:
     """
     from .install.profiles import InstallationError
     from .processing.formation import (DEFAULT_BATCH, MAX_JOBS, FormationError,
-                                       formation_apply, formation_plan)
+                                       formation_apply, formation_plan, formation_reconcile)
 
     try:
         settings = _memory_for_home(settings, args.hermes_home)
@@ -1699,6 +1702,19 @@ def _form_command(settings, args) -> int:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     limit = DEFAULT_BATCH if args.limit is None else args.limit
+    if args.reconcile:
+        # Nothing is dispatched and nothing is spent, so there is no list to approve — and
+        # an approval digest over work this command does not do is a category error.
+        if args.review or args.actor:
+            print("refused: --reconcile queues no work, so --review and --actor have "
+                  "nothing to authorise. Run it alone, or run the pass without it",
+                  file=sys.stderr)
+            return 2
+        try:
+            return _emit(formation_reconcile(settings, limit=limit))
+        except FormationError as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
     max_jobs = MAX_JOBS if args.max_jobs is None else args.max_jobs
     try:
         proposal = formation_plan(settings, limit=limit)

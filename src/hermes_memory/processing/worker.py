@@ -16,19 +16,46 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from ..backend.capabilities import (OPERATION_ABANDONED, OPERATION_DONE,
+                                    OPERATION_RUNNING, OPERATION_STOPPED)
 from ..backend.document_map import DocumentMap
-from ..backend.hindsight_client import HindsightError, HindsightUnavailable, SubmissionConflict
+from ..backend.hindsight_client import (HindsightError, HindsightUnavailable, SubmissionConflict,
+                                        operation_reason, operation_state)
 from .budgets import BudgetExhausted, Budgets
-from .jobs import JobQueue, QUEUED
-from .resource_gate import GatePaused, ResourceGate
+from .jobs import CANCELLED, JobQueue, QUEUED
+from .resource_gate import GateClosed, GatePaused, ResourceGate
 from .routes import RouteTable
 
-__all__ = ["FormationWorker", "AttemptOutcome"]
+__all__ = ["FormationWorker", "AttemptOutcome", "OperationAbandoned", "OperationStopped"]
 
 # A rough ceiling on what one retain will cost, used only to refuse a request
 # that cannot possibly fit today's allowance. Actual usage is charged from what
 # the backend reports.
 ESTIMATED_TOKENS_PER_ITEM = 2_000
+
+# How a job waits for the operation it started. The engine runs a consolidation long
+# after the submission has been answered, so the wait is the work, not a delay to
+# optimise away; it is bounded because a job that waits forever holds a physical
+# device forever, and every round renews the lease because an operation outlives any
+# ttl fixed when the slot was claimed.
+FOLLOW_POLL_S = 5.0
+FOLLOW_MAX_POLLS = 720
+
+
+class OperationAbandoned(HindsightError):
+    """The backend said this operation will not produce the projection."""
+
+
+class OperationStopped(Exception):
+    """The operation was cancelled — an ending somebody asked for, not a failure.
+
+    Deliberately not an ``HindsightError``: every backend failure this worker handles
+    is retried, and resubmitting work the operator stopped would undo their decision.
+    """
+
+    def __init__(self, message: str, *, operation_id: str):
+        super().__init__(message)
+        self.operation_id = operation_id
 
 
 @dataclass(frozen=True)
@@ -44,7 +71,9 @@ class AttemptOutcome:
 class FormationWorker:
     def __init__(self, *, store, jobs: JobQueue, gate: ResourceGate, budgets: Budgets,
                  documents: DocumentMap, client, routes: RouteTable, worker_id: str,
-                 sleeper: Callable[[float], None] = time.sleep):
+                 sleeper: Callable[[float], None] = time.sleep,
+                 follow_poll_s: float = FOLLOW_POLL_S,
+                 follow_max_polls: int = FOLLOW_MAX_POLLS):
         self.store = store
         self.jobs = jobs
         self.gate = gate
@@ -54,6 +83,8 @@ class FormationWorker:
         self.routes = routes
         self.worker_id = worker_id
         self.sleeper = sleeper
+        self.follow_poll_s = follow_poll_s
+        self.follow_max_polls = follow_max_polls
 
     def drain(self, *, max_jobs: int = 5, idle_wait: float = 0.0) -> dict[str, Any]:
         """Process until the queue is empty or the budget or pause says stop."""
@@ -114,14 +145,15 @@ class FormationWorker:
         try:
             try:
                 mappings = [self.documents.begin(record_id, job.input_revision,
-                                                async_submission=False)
+                                                async_submission=True)
                             for record_id in job.inputs]
             except Exception as error:
                 gate_outcome = "failed"
                 state = self.jobs.retry(job, error=f"mapping failed: {error}"[:400],
                                         backoff=60.0)
                 return AttemptOutcome(job.id, state, f"mapping failed: {error}")
-            self.jobs.begin_submission(job, submission_id=mappings[0]["document_id"])
+            self.jobs.begin_submission(job, submission_id=next(
+                (m["submission_id"] for m in mappings if m["submission_id"]), ""))
             covered: list[str] = []
             running = False
             for record_id, mapping in zip(job.inputs, mappings):
@@ -129,6 +161,12 @@ class FormationWorker:
                 # erasure or hidden by a supersession must never be re-projected
                 # into the derived backend, and it is not coverage.
                 if not self.store.live_and_visible(record_id):
+                    continue
+                if mapping.get("already_projected"):
+                    # A previous attempt confirmed this one. Re-sending it would spend the
+                    # device to ask a question that is already answered, and the job that
+                    # covers it stays coverage either way.
+                    covered.append(record_id)
                     continue
                 evidence = self.store.get(record_id)
                 if evidence is None:
@@ -141,38 +179,42 @@ class FormationWorker:
                     # The job is with the backend from the first request onwards, which is
                     # the one state a reader cannot recover afterwards: a worker that died
                     # here leaves a row saying `submitting`, and `running` says the slot was
-                    # paid for. The operation identity stays empty unless this backend names
-                    # one — a synchronous retain answers with content and no name, and
-                    # inventing an id would hand `cancel --job` an operation the backend
-                    # never heard of.
+                    # paid for.
                     self.jobs.mark_running(job)
                     running = True
-                body = self.client.retain(document_id=mapping["document_id"],
-                                          content=evidence.text,
-                                          timestamp=evidence.occurred_at,
-                                          metadata={"source": evidence.source,
-                                                    "record_id": record_id})
-                operation = body.get("operation_id") if isinstance(body, dict) else None
-                if operation and not job.backend_operation_id:
-                    self.jobs.mark_running(job, operation_id=str(operation))
+                body = self.client.retain_async(
+                    [{"content": evidence.text, "document_id": mapping["document_id"],
+                      "timestamp": evidence.occurred_at,
+                      "metadata": {"source": evidence.source, "record_id": record_id}}],
+                    submission_id=mapping["submission_id"])
+                operation = str(body.get("operation_id") or mapping["submission_id"])
+                self.jobs.mark_running(job, operation_id=operation)
+                # A submission is not a projection. The document is confirmed only once the
+                # operation the backend named has finished, because "queued" and "the model
+                # has read it" are different claims and coverage is the second one.
+                finished = self._follow(operation, reservation)
                 self.documents.confirm(record_id, job.input_revision)
                 covered.append(record_id)
-                tokens += _tokens_from(body)
+                tokens += _tokens_from(body, finished)
             outcome = self.jobs.complete(job, covered=covered, tokens=tokens)
             return AttemptOutcome(job.id, outcome["state"],
                                   f"covered {len(covered)}/{len(job.inputs)}")
+        except OperationStopped as error:
+            # The operator's decision to stop this work, reported by the backend. What
+            # earlier inputs of this job already spent is still charged.
+            gate_outcome = "cancelled"
+            self.jobs.cancel(job.id, actor="backend", reason=str(error)[:400])
+            return AttemptOutcome(job.id, CANCELLED, str(error))
         except SubmissionConflict as error:
             # The backend already holds this submission; reconcile, never resend.
             self.documents.reconcile(client=self.client, limit=max(1, len(job.inputs)))
-            self.jobs.uncertain(job, reason=str(error)[:400])
-            self.gate.mark_uncertain(reservation, reason=str(error)[:400])
+            self._quarantine(job, reservation, error)
             tokens = None  # slot is not being released; it is being quarantined
             return AttemptOutcome(job.id, "uncertain", str(error))
         except HindsightUnavailable as error:
             # We cannot claim the backend did not run this. Holding the slot as
             # uncertain is the honest state; a retry would double-spend the device.
-            self.jobs.uncertain(job, reason=str(error)[:400])
-            self.gate.mark_uncertain(reservation, reason=str(error)[:400])
+            self._quarantine(job, reservation, error)
             tokens = None
             return AttemptOutcome(job.id, "uncertain", str(error))
         except HindsightError as error:
@@ -190,13 +232,87 @@ class FormationWorker:
                 self.gate.release(reservation, outcome=gate_outcome, tokens=tokens,
                                   seconds=time.monotonic() - started)
 
+    def _quarantine(self, job, reservation, error: Exception) -> None:
+        """Write down that this work is unresolved, and hold the device if it is ours.
 
-def _tokens_from(body: dict[str, Any]) -> int:
-    usage = body.get("usage") if isinstance(body, dict) else None
-    if not isinstance(usage, dict):
-        return 0
-    total = usage.get("total_tokens") or usage.get("tokens") or 0
-    try:
-        return max(0, int(total))
-    except (TypeError, ValueError):
-        return 0
+        The slot may have been settled from outside while we waited — an operator's
+        ``gate --resolve`` says the device is free again. Re-blocking it here would
+        overrule that answer, so the refusal is absorbed; the job stays uncertain
+        either way, because nothing about the reservation says the model read anything.
+        """
+        self.jobs.uncertain(job, reason=str(error)[:400])
+        try:
+            self.gate.mark_uncertain(reservation, reason=str(error)[:400])
+        except GateClosed:
+            pass
+
+    # -- waiting for the operation the submission started ---------------------
+
+    def _follow(self, operation: str, reservation) -> dict[str, Any]:
+        """Wait for the operation this job started, vouching for the slot each round.
+
+        The submission's own answer says only that the engine accepted the work; whether
+        the model then read it is a separate question with a separate answer, and the
+        device stays busy either way. So the lease is renewed rather than assumed, and the
+        wait has an end, because a worker that waited forever would hold a physical
+        resource forever on behalf of a job nobody is listening to.
+        """
+        for _ in range(self.follow_max_polls):
+            if self.gate.renew(reservation) is None:
+                # Somebody else has answered for this slot by now — an operator settling it,
+                # or the expiry of a lease this worker stopped vouching for. Continuing to
+                # use the device would be a second claim on one resource, and the identity
+                # on the row is enough to finish the question without resubmitting the work.
+                raise HindsightUnavailable(
+                    f"operation {operation} is unfinished and the "
+                    f"{reservation.resource!r} slot is no longer ours to hold; the submission "
+                    f"identity is on the job, so `hermes-memory form --reconcile` can finish "
+                    "the question without this process resubmitting it")
+            answer = self.client.operation(operation)
+            state = operation_state(answer)
+            if state in OPERATION_DONE:
+                return answer
+            if state in OPERATION_STOPPED:
+                raise OperationStopped(f"operation {operation} was cancelled"
+                                       f"{_because(answer)}", operation_id=operation)
+            if state in OPERATION_ABANDONED:
+                raise OperationAbandoned(
+                    f"operation {operation} ended {state}{_because(answer)}; nothing of this "
+                    "submission is still running on the device")
+            if state not in OPERATION_RUNNING:
+                raise OperationAbandoned(
+                    f"operation {operation} answered {state!r}, which the pinned backend does "
+                    "not document. An answer nobody recognises is neither evidence that the "
+                    "projection happened nor evidence that it will")
+            self.sleeper(self.follow_poll_s)
+        raise HindsightUnavailable(
+            f"operation {operation} was still unfinished after {self.follow_max_polls} looks "
+            f"({self.follow_max_polls * self.follow_poll_s:g}s). The device may still be busy "
+            "with it, so the slot is held rather than handed out again, and the identity on "
+            "the job is what `hermes-memory form --reconcile` asks the backend about")
+
+
+def _tokens_from(*bodies: dict[str, Any]) -> int:
+    """The first answer that names a cost.
+
+    An async submission reports none at submission time and the completed operation may
+    report the whole run, so both are asked and the one that knows is charged — never both.
+    """
+    for body in bodies:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        total = usage.get("total_tokens") or usage.get("tokens") or 0
+        try:
+            tokens = max(0, int(total))
+        except (TypeError, ValueError):
+            continue
+        if tokens:
+            return tokens
+    return 0
+
+
+def _because(answer: dict[str, Any]) -> str:
+    """What the backend said why, when it said any why at all."""
+    reason = operation_reason(answer)
+    return f": {reason[:300]}" if reason else ""

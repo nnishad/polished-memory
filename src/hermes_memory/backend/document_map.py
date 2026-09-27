@@ -17,6 +17,9 @@ from typing import Any
 
 from ..ids import backend_document_id, now
 from ..storage.evidence import EvidenceError
+from .capabilities import (OPERATION_ABANDONED, OPERATION_DONE, OPERATION_RUNNING,
+                           OPERATION_STOPPED)
+from .hindsight_client import operation_reason, operation_state
 
 __all__ = ["DocumentMap", "QUEUED", "SUBMITTED", "VERIFIED", "FAILED", "ABSENT"]
 
@@ -185,16 +188,27 @@ class DocumentMap:
                     (str(error)[:500], row["record_id"], row["revision"], self.backend,
                      self.bank_id))
                 continue
-            state = str(operation.get("state") or operation.get("status") or "")
+            state = operation_state(operation)
             settled += 1
-            if state in {"completed", "succeeded"}:
+            if state in OPERATION_DONE:
                 self.confirm(row["record_id"], row["revision"])
                 verified += 1
-            elif state in {"failed", "cancelled"}:
+            elif state in OPERATION_ABANDONED | OPERATION_STOPPED:
+                # `not_found` belongs here: an operation the backend has no record of is a
+                # question that can never be answered, and leaving the row open would ask it
+                # every pass forever while the coverage claim sat in limbo. Closing it as
+                # failed makes the record unprojected again, so the next pass forms it
+                # deliberately instead of waiting for a reply that will not come.
+                reason = operation_reason(operation)
                 self.fail(row["record_id"], row["revision"],
-                          error=f"backend operation {state}")
+                          error=f"backend operation {state}"
+                          + (f": {reason[:300]}" if reason else ""))
+            elif state in OPERATION_RUNNING:
+                still_pending += 1
             else:
                 still_pending += 1
+                self._note(row, f"the backend answered {state!r} about the operation, which "
+                                "is neither finished nor one of the states it documents")
         return {"settled": settled, "verified": verified, "pending": still_pending,
                 "absent": absent, "unreachable": unknown}
 

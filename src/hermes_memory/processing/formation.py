@@ -32,7 +32,8 @@ from .worker import ESTIMATED_TOKENS_PER_ITEM, FormationWorker
 
 __all__ = ["KIND", "ROUTE_NAME", "DEFAULT_BATCH", "MAX_BATCH", "MAX_JOBS",
            "FormationError", "retain_route", "processor_fingerprint", "unprojected",
-           "count_unprojected", "formation_plan", "formation_apply", "backend_client"]
+           "count_unprojected", "formation_plan", "formation_apply", "formation_reconcile",
+           "backend_client"]
 
 KIND = "raw-facts"
 ROUTE_NAME = "retain"
@@ -275,6 +276,50 @@ def formation_apply(settings, *, review: str, actor: str, limit: int = DEFAULT_B
                     "usage charged to the instance gate from what the backend reported",
                 ],
             }
+
+
+def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = None) -> dict:
+    """Ask the backend what became of submissions this machine cannot account for.
+
+    A worker that stopped waiting leaves an operation identity on the row and nothing more;
+    whether the engine then ran the work is a question only it can answer. This is the door
+    that closes that loop, and the reason a bounded wait is allowed to end at all — without
+    it, uncertainty would be permanent rather than deferred. No model request is sent and no
+    budget is spent, so this is bounded but not gated, and asks about a countable list.
+    """
+    from ..storage.evidence import EvidenceStore
+
+    _bounded(limit)
+    if not settings.db_path.is_file():
+        raise FormationError(f"no canonical store at {settings.db_path}; run "
+                             "`hermes-memory init` first")
+    empty = {"settled": 0, "verified": 0, "pending": 0, "absent": 0, "unreachable": 0}
+    with EvidenceStore(settings.db_path) as store:
+        docs = DocumentMap(store, bank_id=settings.bank_id)
+        asked = docs.outstanding(limit=limit)
+        outcome = empty if not asked else docs.reconcile(
+            client=client or backend_client(settings), limit=limit)
+        return {
+            "ok": True,
+            "performed_at": now(),
+            "profile": settings.profile,
+            "bank_id": settings.bank_id,
+            "limit": int(limit),
+            "asked": [{"record_id": row["record_id"], "state": row["state"],
+                       "operation_id": row["operation_id"]} for row in asked],
+            **outcome,
+            "projections": docs.as_dict(),
+            "performed": [
+                f"the backend was asked about {len(asked)} submission(s)",
+                "a projection it confirmed is written down as verified coverage",
+            ],
+            "not_performed": [
+                "no model request was sent, so nothing new was formed",
+                "no document the backend did not name was written as present",
+                "no gate slot was claimed and no budget was charged",
+            ],
+            "note": "a row still in `pending` was asked and is not finished; run this again",
+        }
 
 
 def backend_client(settings) -> Any:

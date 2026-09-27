@@ -260,6 +260,44 @@ def test_unresolved_lists_the_rows_that_block_a_device_with_nobody_left_to_answe
     assert rows[0]["holder"] == "worker"
 
 
+# -- vouching for a lease that is still being used -----------------------------
+
+def test_renewing_a_live_lease_moves_the_deadline_and_says_so(gate, clock):
+    reservation = take(gate, ttl=60)
+    clock.advance(20)
+    until = gate.renew(reservation, ttl=60)
+    assert until == clock.value + 60 and gate.held()[0]["lease_until"] == until
+    rows = gate.db.execute("SELECT event, detail FROM gate_ledger WHERE reservation_id=? "
+                           "ORDER BY rowid", (reservation.id,)).fetchall()
+    assert [row["event"] for row in rows] == ["acquired", "renewed"], \
+        "who vouched, and when, is the answer an expiry later needs"
+
+
+def test_a_promise_that_ran_out_is_not_renewed_into_existence(gate, clock):
+    """The state can still say `held` for as long as nothing reaps it. That is not ours.
+
+    Another admission may have been promoted over the top of the lapsed row, so vouching
+    for it again would be a second claim on one device made by the process that lost it.
+    """
+    reservation = take(gate, ttl=60)
+    clock.advance(61)
+    assert gate.renew(reservation) is None
+    assert gate.blocked_resources() == [REMOTE], "lapsed is not the same as free"
+
+
+def test_a_released_reservation_is_not_renewable(gate):
+    reservation = take(gate)
+    gate.release(reservation, outcome="succeeded")
+    assert gate.renew(reservation) is None
+
+
+def test_a_renewal_outside_the_lease_window_is_refused(gate):
+    reservation = take(gate)
+    for ttl in (0, 3601, -5):
+        with pytest.raises(EvidenceError, match="between 1 and 3600"):
+            gate.renew(reservation, ttl=ttl)
+
+
 # -- operator pause ----------------------------------------------------------
 
 def test_an_operator_pause_denies_new_dispatch_immediately(gate):

@@ -9,7 +9,7 @@ import pytest
 
 from hermes_memory.backend.capabilities import (CAPABILITIES, PINNED_VERSION,
                                                 UnsupportedCapability, capabilities_for)
-from hermes_memory.backend.document_map import (ABSENT, QUEUED, VERIFIED,
+from hermes_memory.backend.document_map import (ABSENT, FAILED, QUEUED, VERIFIED,
                                    DocumentMap)
 from hermes_memory.backend.hindsight_client import (HindsightClient, HindsightError,
                                                    HindsightUnavailable, SubmissionConflict,
@@ -193,10 +193,46 @@ def test_reconciliation_leaves_a_still_running_operation_pending(mapped, transpo
     begun = docs.begin(record, "1", async_submission=True)
     client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
     transport.when(f"GET /v1/default/banks/{BANK}/operations/{begun['submission_id']}",
-                   TransportResult(200, {"state": "running"}))
+                   TransportResult(200, {"status": "processing"}))
     outcome = docs.reconcile(client=client)
     assert outcome["pending"] == 1 and outcome["verified"] == 0
     assert docs.state(record, "1") == "submitted"
+    assert store_row(docs.store, record)["error"] is None, \
+        "an ordinary 'not yet' must not look like an anomaly to whoever reads it next"
+
+
+def test_an_undocumented_operation_answer_is_written_down_not_guessed(mapped, transport):
+    """A word the pinned release does not use is neither finished nor running.
+
+    Reading it as pending without a reason would leave the row looking like ordinary
+    waiting, which is the one state an operator has no reason to look at.
+    """
+    docs, record = mapped
+    begun = docs.begin(record, "1", async_submission=True)
+    client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
+    transport.when(f"GET /v1/default/banks/{BANK}/operations/{begun['submission_id']}",
+                   TransportResult(200, {"status": "quiescing"}))
+    outcome = docs.reconcile(client=client)
+    assert outcome["pending"] == 1 and outcome["verified"] == 0
+    assert docs.state(record, "1") == "submitted"
+    assert "quiescing" in str(store_row(docs.store, record)["error"])
+
+
+def test_an_operation_the_backend_has_no_record_of_is_closed_rather_than_asked_forever(
+        mapped, transport):
+    """'Not yet' and 'never' are different answers, and only one is worth waiting on.
+
+    A 404 is the engine's own ``not_found``, so it is settled as a failed projection — which
+    makes the record unprojected again and lets the next pass form it deliberately.
+    """
+    docs, record = mapped
+    begun = docs.begin(record, "1", async_submission=True)
+    client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
+    transport.default = TransportResult(404, {"detail": "no such operation"})
+    outcome = docs.reconcile(client=client)
+    assert outcome["settled"] == 1 and outcome["pending"] == 0
+    assert docs.state(record, "1") == FAILED
+    assert "not_found" in str(store_row(docs.store, record)["error"])
 
 
 def test_reconciliation_does_not_invent_an_outcome_when_the_backend_is_down(mapped, transport):

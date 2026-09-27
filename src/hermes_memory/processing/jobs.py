@@ -211,9 +211,9 @@ class JobQueue:
     def mark_running(self, job: Job, *, operation_id: str | None = None) -> None:
         """The work is with the backend now.
 
-        ``operation_id`` is recorded only when the backend named one. A synchronous retain
-        answers with content and no operation identity, and inventing an id here would give
-        ``cancel --job`` a thing to ask a backend about that the backend never heard of.
+        ``operation_id`` is written only when there is one to write: a synchronous retain
+        names no operation, and inventing an id here would give ``cancel --job`` a thing to
+        ask a backend about that the backend never heard of.
         """
         self._transition(job.id, RUNNING, operation_id=operation_id)
 

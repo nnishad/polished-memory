@@ -24,12 +24,31 @@ from .capabilities import (CAPABILITIES, PINNED_VERSION, Capabilities,
                            UnsupportedCapability, capabilities_for)
 
 __all__ = ["HindsightClient", "HindsightError", "HindsightUnavailable", "SubmissionConflict",
-           "RecallOutcome", "TransportResult", "http_transport"]
+           "RecallOutcome", "TransportResult", "http_transport", "operation_state",
+           "operation_reason"]
 
 DEFAULT_TIMEOUT_S = 20.0
 # Kept well under Hindsight's own limits: a query the backend rejects for
 # length is a wasted round trip, and a truncated result must be visible to us.
 _MAX_QUERY_TOKENS = 512
+
+
+def operation_state(answer: dict[str, Any]) -> str:
+    """What the backend said about an operation, in the pinned release's own words.
+
+    An answer with no state is ``""`` rather than a guess: both callers have to decide what
+    to do with a thing they cannot name, and "unknown" would read like a state the engine
+    reports when it has none of its own.
+    """
+    if not isinstance(answer, dict):
+        return ""
+    return str(answer.get("status") or answer.get("state") or "")
+
+
+def operation_reason(answer: dict[str, Any]) -> str:
+    """Why an operation ended the way it did, when the backend gave a why at all."""
+    reason = str(answer.get("error_message") or "").strip() if isinstance(answer, dict) else ""
+    return reason
 
 
 class HindsightError(Exception):
@@ -280,7 +299,10 @@ class HindsightClient:
         result = self._call("GET", self._path_for("get_operation", operation_id=operation_id),
                             None, capability="get_operation")
         if result.status == 404:
-            return {"state": "unknown", "operation_id": operation_id}
+            # `not_found` is the engine's own word for this, and the two readers of an
+            # operation answer already have to handle it: inventing a third word here would
+            # be a state nothing else documents.
+            return {"status": "not_found", "operation_id": operation_id}
         return self._unwrap(result, "get_operation")
 
     def cancel_operation(self, operation_id: str) -> dict[str, Any]:

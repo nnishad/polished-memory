@@ -27,16 +27,30 @@ FINGERPRINT = "extractor-v3"
 
 @pytest.fixture()
 def transport():
+    """A backend that answers like the pinned release.
+
+    A submission reports no cost — nothing has been read yet, and it may name no operation
+    of its own. The operation is the answer that says the model ran, and usage appears there.
+    """
     class T:
         def __init__(self):
             self.calls = []
-            self.reply = TransportResult(200, {"ok": True, "usage": {"total_tokens": 321}})
+            self.reply = TransportResult(200, {"ok": True})
+            self.operation = TransportResult(200, {"status": "completed",
+                                                   "usage": {"total_tokens": 321}})
 
         def __call__(self, method, url, payload, headers):
             self.calls.append((method, url, payload))
+            if "/operations/" in url:
+                return self.operation
             return self.reply
 
     return T()
+
+
+def submissions(transport):
+    """The retains that left the process, ignoring the questions asked about them."""
+    return [call for call in transport.calls if "/operations/" not in call[1]]
 
 
 @pytest.fixture()
@@ -47,8 +61,10 @@ def harness(store, transport):
     budgets = Budgets(store, daily={REMOTE: Budget(tokens=100_000)})
     docs = DocumentMap(store, bank_id=BANK)
     client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
+    waits: list[float] = []
     worker = FormationWorker(store=store, jobs=jobs, gate=gate, budgets=budgets, documents=docs,
-                            client=client, routes=ROUTES, worker_id="w1")
+                             client=client, routes=ROUTES, worker_id="w1",
+                             sleeper=waits.append, follow_poll_s=0.5, follow_max_polls=3)
 
     counter = iter(range(1, 10_000))
 
@@ -64,7 +80,7 @@ def harness(store, transport):
 
     return SimpleNamespace(store=store, jobs=jobs, gate=gate, budgets=budgets, docs=docs,
                            client=client, worker=worker, record=record, enqueue=enqueue,
-                           transport=transport)
+                           transport=transport, waits=waits)
 
 
 # -- the happy path ----------------------------------------------------------
@@ -96,25 +112,29 @@ def test_a_job_says_it_is_running_before_the_request_leaves(harness):
     job_id = harness.enqueue(record)
     harness.client.transport = Watches(harness.client.transport, harness.jobs, job_id)
     harness.worker.run_once()
-    assert harness.client.transport.states == ["running"], \
-        "the state is written once, before the first retain, not after the answer"
+    assert harness.client.transport.states[0] == "running", \
+        "the state is written before the first request leaves, not after the answer"
+    assert set(harness.client.transport.states) == {"running"}, \
+        "waiting for the operation is still the same running job, not a new one"
 
 
-def test_an_operation_identity_is_recorded_only_when_the_backend_names_one(harness):
+def test_the_operation_is_asked_about_under_the_identity_the_submission_carried(harness):
+    """A name we invented would be a question about nothing; theirs is a receipt."""
     record = harness.record()
-    job_id = harness.enqueue(record)
-    assert harness.jobs.get(job_id).backend_operation_id is None
+    harness.enqueue(record)
     harness.worker.run_once()
-    assert harness.jobs.get(job_id).backend_operation_id is None, \
-        "a synchronous retain answers with content and no name; inventing one would give " \
-        "cancellation an operation the backend never heard of"
+    submission = submissions(harness.transport)[-1][2]["operation_id"]
+    asked = [call for call in harness.transport.calls if "/operations/" in call[1]]
+    assert len(asked) == 1 and asked[0][1].endswith(f"/operations/{submission}"), \
+        "the durable submission id is the operation id the backend dedupes on"
+    assert submissions(harness.transport)[-1][2]["async"] is True, \
+        "the slot is not held open by an http request that would time out first"
 
 
 def test_an_async_answer_correlates_the_job_with_the_operation(harness):
     record = harness.record()
     job_id = harness.enqueue(record)
-    harness.transport.reply = TransportResult(
-        200, {"ok": True, "usage": {"total_tokens": 12}, "operation_id": "op-42"})
+    harness.transport.reply = TransportResult(200, {"ok": True, "operation_id": "op-42"})
     harness.worker.run_once()
     assert harness.jobs.get(job_id).backend_operation_id == "op-42"
 
@@ -138,7 +158,7 @@ def test_the_retain_carries_the_real_event_time_and_source(harness):
     record = harness.record()
     harness.enqueue(record)
     harness.worker.run_once()
-    payload = harness.transport.calls[-1][2]
+    payload = submissions(harness.transport)[-1][2]
     item = payload["items"][0]
     assert item["timestamp"] == "2026-09-24T07:15:00+00:00", "the occurred time, not ingest time"
     assert item["metadata"]["source"] == "gmail" and item["metadata"]["record_id"] == record
@@ -196,6 +216,194 @@ def test_an_empty_queue_is_not_an_error(harness):
     assert harness.worker.drain()["attempted"] == 0
 
 
+# -- waiting for the operation ------------------------------------------------
+
+class OperationScript:
+    """A prepared answer for each question asked about an operation.
+
+    Anything else the client asks goes to the transport underneath, so a test that
+    scripts the waiting still sees the submissions that caused it.
+    """
+
+    def __init__(self, inner, answers):
+        self.inner, self.answers = inner, list(answers)
+        self.asks: list[str] = []
+
+    def __call__(self, method, url, payload, headers):
+        if "/operations/" not in url:
+            return self.inner(method, url, payload, headers)
+        self.asks.append(url)
+        if self.answers:
+            return self.answers.pop(0)
+        return TransportResult(200, {"status": "completed",
+                                     "usage": {"total_tokens": 321}})
+
+
+def waiting_for(harness, *answers) -> OperationScript:
+    script = OperationScript(harness.client.transport, list(answers))
+    harness.client.transport = script
+    return script
+
+
+def test_a_still_running_operation_is_awaited_not_guessed(harness):
+    record = harness.record()
+    harness.enqueue(record)
+    script = waiting_for(harness, TransportResult(200, {"status": "pending"}),
+                         TransportResult(200, {"status": "processing"}))
+    assert harness.worker.run_once().state == "succeeded"
+    assert len(script.asks) == 3, "two looks that said not yet, a third that said done"
+    assert harness.waits == [0.5, 0.5], "each unfinished answer costs one bounded wait"
+    assert len(submissions(harness.transport)) == 1, "waiting for the work is not resending it"
+
+
+def test_the_slot_is_vouched_for_while_the_backend_is_still_working(harness):
+    """An operation outlives the lease it was claimed under unless it is renewed."""
+    record = harness.record()
+    harness.enqueue(record)
+    waiting_for(harness, TransportResult(200, {"status": "processing"}))
+    renewals: list[float | None] = []
+    real = harness.gate.renew
+
+    def renew(reservation, **kwargs):
+        answer = real(reservation, **kwargs)
+        renewals.append(answer)
+        return answer
+
+    harness.gate.renew = renew
+    assert harness.worker.run_once().state == "succeeded"
+    assert renewals and all(renewals), "every round of waiting renews the claim on the device"
+
+
+def test_a_lease_that_ran_out_stops_the_wait(harness):
+    """A promise that has expired is not renewed into existence.
+
+    Nothing here can say whether another admission was promoted over the top of it, and
+    the honest answer for work nobody is vouching for is uncertainty, not the device.
+    """
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    waiting_for(harness, TransportResult(200, {"status": "processing"}))
+
+    def outlive_the_lease(seconds):
+        harness.waits.append(seconds)
+        harness.gate.clock = lambda: 10 ** 12
+
+    harness.worker.sleeper = outlive_the_lease
+    outcome = harness.worker.run_once()
+    assert outcome.state == "uncertain"
+    assert harness.jobs.get(job_id).state == UNCERTAIN
+    assert harness.gate.blocked_resources() == [REMOTE], "nobody has established its end yet"
+    assert len(harness.waits) == 1, "the wait stops at the round the promise ran out"
+
+
+def test_a_slot_somebody_else_settled_stops_the_wait(harness):
+    """The worker must not re-block a device an operator has just freed.
+
+    The sequence is the real one: the lease runs out, the gate reads that as abandoned
+    work, and the settle door records who established its end. What the job was doing is
+    still unresolved — nothing about the reservation says the model read the document.
+    """
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    waiting_for(harness, TransportResult(200, {"status": "processing"}))
+
+    def settle_while_waiting(seconds):
+        harness.waits.append(seconds)
+        harness.gate.clock = lambda: 10 ** 12
+        assert harness.gate.reap_expired(), "the gate reads its own expiry as abandoned work"
+        stranded = harness.gate.unresolved()[0]
+        harness.gate.resolve(stranded["id"], outcome="cancelled", actor="owner",
+                             reason="the gpu is needed elsewhere")
+
+    harness.worker.sleeper = settle_while_waiting
+    outcome = harness.worker.run_once()
+    assert outcome.state == "uncertain"
+    assert harness.jobs.get(job_id).state == UNCERTAIN
+    assert harness.gate.blocked_resources() == [], "their answer stands; we do not overrule it"
+
+
+def test_an_operation_that_never_arrived_is_not_waited_for(harness):
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    waiting_for(harness, TransportResult(404, {"detail": "no such operation"}))
+    outcome = harness.worker.run_once()
+    assert outcome.state == "retry_wait", "an operation that never existed may be submitted again"
+    assert harness.jobs.get(job_id).attempts == 1
+    assert harness.gate.blocked_resources() == [], "the device is provably not busy with it"
+
+
+def test_an_operation_the_backend_failed_says_why(harness):
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    waiting_for(harness, TransportResult(
+        200, {"status": "failed", "error_message": "extraction produced no facts"}))
+    outcome = harness.worker.run_once()
+    assert "extraction produced no facts" in outcome.detail, "the reason, not just the state"
+    assert harness.jobs.get(job_id).last_error == outcome.detail
+    assert harness.gate.blocked_resources() == []
+
+
+def test_an_operation_the_operator_cancelled_ends_the_job_instead_of_resubmitting(harness):
+    """A retry would undo their decision, so this answer is not a backend failure."""
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    waiting_for(harness, TransportResult(200, {"status": "cancelled"}))
+    outcome = harness.worker.run_once()
+    assert outcome.state == "cancelled"
+    assert harness.jobs.get(job_id).state == "cancelled"
+    assert len(submissions(harness.transport)) == 1, "stopped work is not work to retry"
+
+
+def test_work_the_backend_already_did_is_still_paid_for_when_the_rest_is_stopped(harness):
+    """An end to the job is not an erasure of the spend inside it."""
+    first, second = harness.record(), harness.record()
+    harness.enqueue(first, second)
+    waiting_for(harness,
+                TransportResult(200, {"status": "completed", "usage": {"total_tokens": 321}}),
+                TransportResult(200, {"status": "cancelled"}))
+    outcome = harness.worker.run_once()
+    assert outcome.state == "cancelled"
+    assert harness.budgets.used(REMOTE)["tokens"] == 321, \
+        "the device spent what it spent, whatever happened to the rest"
+    assert harness.docs.state(first, "1") == VERIFIED
+    assert harness.docs.state(second, "1") == "submitted", "stopped work is not coverage"
+
+
+def test_a_state_the_pinned_backend_does_not_document_is_not_guessed(harness):
+    """`succeeded` is not in the operation enum; reading it as `completed` would be a lie."""
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    waiting_for(harness, TransportResult(200, {"status": "succeeded"}))
+    outcome = harness.worker.run_once()
+    assert outcome.state == "retry_wait" and "succeeded" in outcome.detail
+    assert harness.docs.state(record, "1") == "submitted", "no coverage claimed for it"
+
+
+def test_a_wait_that_runs_out_holds_the_device_and_names_the_operation(harness):
+    """The operation may still be running, so freeing the slot would be the second lie."""
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    script = waiting_for(harness, *[TransportResult(200, {"status": "processing"})] * 5)
+    outcome = harness.worker.run_once()
+    assert outcome.state == "uncertain"
+    assert len(script.asks) == 3 == harness.worker.follow_max_polls, "bounded, not forever"
+    assert "reconcile" in outcome.detail
+    assert harness.jobs.get(job_id).state == UNCERTAIN
+    assert harness.gate.blocked_resources() == [REMOTE]
+    assert harness.jobs.get(job_id).backend_operation_id, \
+        "the identity left on the row is what a later pass asks the backend about"
+
+
+def test_a_job_that_partially_landed_does_not_resend_what_is_already_verified(harness):
+    """A second submission of a document already projected would spend the device twice."""
+    first, second = harness.record(), harness.record()
+    harness.docs.begin(first, "1", async_submission=True)
+    harness.docs.confirm(first, "1")
+    harness.enqueue(first, second)
+    assert harness.worker.run_once().state == "succeeded"
+    assert len(submissions(harness.transport)) == 1, "one submission for the one open question"
+    assert harness.docs.state(second, "1") == VERIFIED
+
 # -- failure semantics -------------------------------------------------------
 
 def test_an_unreachable_backend_holds_the_slot_as_uncertain(harness):
@@ -237,8 +445,8 @@ def test_evidence_forged_mid_flight_is_not_counted_as_coverage(harness, store):
 def test_a_worker_defect_is_labelled_as_one(harness, monkeypatch):
     record = harness.record()
     harness.enqueue(record)
-    monkeypatch.setattr(harness.client, "retain",
-                        lambda **kwargs: (_ for _ in ()).throw(ZeroDivisionError("bug")))
+    monkeypatch.setattr(harness.client, "retain_async",
+                        lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("bug")))
     outcome = harness.worker.run_once()
     assert "worker error" in outcome.detail
     assert harness.gate.blocked_resources() == []

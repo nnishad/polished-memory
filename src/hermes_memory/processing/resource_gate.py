@@ -187,6 +187,39 @@ class ResourceGate:
             self.db.execute("ROLLBACK")
             raise
 
+    def renew(self, reservation: Reservation, *, ttl: float | None = None) -> float | None:
+        """Vouch for a slot that is still being used, and say whether it is still ours.
+
+        A long operation outlives any lease fixed at its start, and a lease that cannot be
+        renewed forces a choice between two false reports: that the device is free when it
+        is busy, or that the worker died when it did not. The answer comes back rather than
+        being assumed, because the row may have been settled from outside in the meantime —
+        an operator, or the expiry of a lease this worker stopped vouching for.
+
+        A promise that has run out is not renewed into existence either. The state alone
+        can still say ``held`` for as long as nothing has reaped it, and another admission
+        may already have been promoted over the top of it at the next reaping, so the clock
+        is part of the question.
+        """
+        ttl = self.default_ttl if ttl is None else ttl
+        if not 1 <= ttl <= 3600:
+            raise EvidenceError("ttl must be between 1 and 3600 seconds")
+        until = self.clock() + ttl
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            moved = self.db.execute(
+                "UPDATE gate_reservations SET lease_until=? WHERE id=? AND state=? "
+                "AND lease_until>=?", (until, reservation.id, HELD, self.clock()))
+            held = moved.rowcount == 1
+            if held:
+                self._log(reservation.id, reservation.resource, reservation.route,
+                          reservation.holder, "renewed", {"lease_until": until, "ttl": ttl})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return until if held else None
+
     def resolve(self, reservation_id: str, *, outcome: str, actor: str,
                 reason: str) -> dict[str, Any]:
         """Establish what happened to a slot this process could not prove, and free it.

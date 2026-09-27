@@ -173,6 +173,8 @@ hermes-memory form                       # the bounded list, and nothing else
 hermes-memory form --limit 40 --max-jobs 5
 hermes-memory form --actor "$USER" --review <digest the list printed>
 hermes-memory form --hermes-home ~/.hermes/profiles/work --review <digest>
+hermes-memory form --reconcile           # ask the backend about submissions we stopped
+                                         # being able to answer for
 ```
 
 `form` is the whole of formation: it selects records that have no verified projection at
@@ -181,6 +183,20 @@ exactly the approved list — one job per record, keyed on that record's own rev
 run when an operator runs it. There is no daemon, no cron entry and no service that does
 this by itself, and `status`, `doctor` and `capabilities` all say so
 (`formation_unattended: false`) rather than letting an empty queue look like a settled one.
+
+A dispatch is submitted asynchronously and then *followed*: the submission's own answer says
+only that the engine accepted the work, and the projection is confirmed when the operation
+reaches `completed`. The device slot is renewed each round of waiting rather than assumed, so
+a consolidation that takes an hour does not turn into a lapsed lease that some other caller is
+promoted into. Each ending is reported as what it was: `failed` and `not_found` retry,
+`cancelled` ends the job rather than resubmitting the work somebody stopped, and a wait that
+runs out holds the slot as uncertain with the operation identity left on the row — because the
+model may still be reading the document, and a free device would be the second lie.
+
+That is what `--reconcile` is for. It sends no model request and charges no budget, so it
+needs no approval digest; it asks the backend, one bounded list at a time, what became of the
+submissions this machine cannot account for, and writes down the answer it was given. A row it
+cannot settle stays outstanding and is asked again next time.
 
 The approval is a digest of the list, not of a flag: selected record ids, the route facts,
 the processor fingerprint, the token ceiling and `blocking` are all inside it. A hold set
@@ -674,12 +690,14 @@ reading above is complete.
   does both inline, atomically, before the store is readable — which is the only way either
   should be reached in ordinary operation. There is no command because a hand-merged ledger
   is not a routine act.
-- **The client maps routes the product does not yet call.** `HindsightClient.retain_async`
-  and `stats` stand behind the same pinned capability table as the routes in use, so a
-  contract is stated in one place: `retain` answers synchronously and yields an operation id
-  only when the backend names one, and `stats` is a coverage *basis*, never proof. A stage
-  that needs either asks for the capability and refuses to work when the running build does
-  not route it.
+- **The client maps routes the product does not yet call.** `HindsightClient.stats` stands
+  behind the same pinned capability table as the routes in use, so a contract is stated in
+  one place: `stats` is a coverage *basis*, never proof. A stage that needs a capability
+  asks for it by name and refuses to work when the running build does not route it.
+  `retain_async` and `operation` no longer belong on this list: a formation pass submits its
+  work under the durable submission identity and then waits for the operation, and
+  `hermes-memory form --reconcile` is the door that asks the backend about a submission this
+  machine stopped waiting for.
 
 `hermes-memory explain` and the audit trail remain the way to see what *was* done: a
 capability with no door is also a capability that leaves no records.
