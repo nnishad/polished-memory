@@ -19,6 +19,7 @@ REMOTE = Route("retain", "remote-9b", "chat", "http://127.0.0.1:8080/v1", "cred"
 MAINT = Route("consolidate", "remote-9b", "chat", "http://127.0.0.1:8080/v1", "cred2",
               "maintenance", 2048)
 FINGERPRINT = "extractor-v3"
+RECONCILER = "reconciling-operator"
 
 
 @pytest.fixture()
@@ -143,13 +144,17 @@ def test_an_answered_submission_closes_the_job_that_carried_it(jobs, store):
     themselves", forever, next to four completed operations.
     """
     job_id = stranded(jobs)
-    assert jobs.settle_established(["sub-answered"]) == 1
+    assert jobs.settle_established(["sub-answered"], actor=RECONCILER) == 1
     fresh = jobs.get(job_id)
     assert fresh.state == SUCCEEDED
     assert fresh.tokens_used == 0, "the answer says the work landed, not what it cost"
     assert fresh.last_error is None, "settled work does not keep the old complaint"
     assert store.db.execute("SELECT count(*) FROM audit WHERE action="
                             "'job_settled_by_reconciliation'").fetchone()[0] == 1
+    entry = store.db.execute("SELECT metadata FROM audit WHERE action="
+                             "'job_settled_by_reconciliation'").fetchone()
+    assert json.loads(entry["metadata"])["actor"] == RECONCILER, \
+        "the door is run by somebody, and the ledger says who rather than guessing"
 
 
 def test_a_late_answer_does_not_resurrect_work_the_operator_stopped(jobs):
@@ -160,14 +165,14 @@ def test_a_late_answer_does_not_resurrect_work_the_operator_stopped(jobs):
     """
     job_id = stranded(jobs)
     jobs.cancel(job_id, actor="operator", reason="superseded by hand")
-    assert jobs.settle_established(["sub-answered"]) == 0
+    assert jobs.settle_established(["sub-answered"], actor=RECONCILER) == 0
     assert jobs.get(job_id).state == CANCELLED
 
 
 def test_only_the_row_that_carried_the_answer_is_closed(jobs):
     answered = stranded(jobs, submission="sub-answered", inputs=("rec_a",))
     still_open = stranded(jobs, submission="sub-still-open", inputs=("rec_b",))
-    assert jobs.settle_established(["sub-answered"]) == 1
+    assert jobs.settle_established(["sub-answered"], actor=RECONCILER) == 1
     assert jobs.get(answered).state == SUCCEEDED
     assert jobs.get(still_open).state == UNCERTAIN, \
         "one submission's answer is not the backlog's answer"
@@ -179,7 +184,7 @@ def test_a_row_that_is_not_waiting_on_an_answer_is_left_alone(jobs):
     job = jobs.claim(worker="w1")
     jobs.begin_submission(job, submission_id="sub-retry")
     jobs.retry(jobs.get(job.id), error="the backend refused", backoff=30.0)
-    assert jobs.settle_established(["sub-retry"]) == 0
+    assert jobs.settle_established(["sub-retry"], actor=RECONCILER) == 0
     assert jobs.get(job.id).state in {RETRY_WAIT, QUARANTINED}
 
 
@@ -196,7 +201,7 @@ def test_an_empty_answer_takes_no_write_lock_off_a_busy_store(jobs, store):
     blocker.isolation_level = None
     blocker.execute("BEGIN EXCLUSIVE")
     try:
-        assert jobs.settle_established([]) == 0
+        assert jobs.settle_established([], actor=RECONCILER) == 0
         assert jobs.settle_refused([], actor="operator", reason="nothing was answered") == 0
         assert jobs.settle_ended([], actor="operator", reason="nothing was answered") == 0
     finally:
@@ -219,7 +224,7 @@ def test_an_empty_answer_asks_the_store_for_nothing_at_all(jobs, store):
     blocker.isolation_level = None
     blocker.execute("BEGIN EXCLUSIVE")
     try:
-        assert jobs.settle_established([]) == 0
+        assert jobs.settle_established([], actor=RECONCILER) == 0
         assert jobs.settle_refused([], actor="operator", reason="nothing was answered") == 0
         assert jobs.settle_ended([], actor="operator", reason="nothing was answered") == 0
     finally:
@@ -270,7 +275,7 @@ def test_a_row_a_worker_is_watching_is_not_rewritten_by_an_answer(jobs):
     jobs.begin_submission(job, submission_id="sub-live")
     jobs.mark_running(jobs.get(job.id), operation_id="op-live")
     assert jobs.settle_refused(["sub-live"], actor="operator", reason="denied") == 0
-    assert jobs.settle_established(["sub-live"]) == 0
+    assert jobs.settle_established(["sub-live"], actor=RECONCILER) == 0
     assert jobs.get(job.id).state == RUNNING
 
 
@@ -299,7 +304,7 @@ def test_work_that_already_finished_is_never_moved_by_an_answer(jobs):
     jobs.begin_submission(job, submission_id="sub-done")
     jobs.mark_running(jobs.get(job.id), operation_id="sub-done")
     jobs.complete(jobs.get(job.id), covered=["rec_done"], tokens=11)
-    assert jobs.settle_established(["sub-done"]) == 0
+    assert jobs.settle_established(["sub-done"], actor=RECONCILER) == 0
     assert jobs.settle_ended(["sub-done"], actor="operator", reason="the record was forgotten") == 0
     fresh = jobs.get(job.id)
     assert fresh.state == SUCCEEDED and fresh.tokens_used == 11

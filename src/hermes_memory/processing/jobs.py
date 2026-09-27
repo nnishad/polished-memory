@@ -288,7 +288,7 @@ class JobQueue:
         """We do not know whether the backend did it. The slot stays claimed."""
         self._transition(job.id, UNCERTAIN, error=reason, release_lease=True)
 
-    def settle_established(self, identities: list[str], *, actor: str = "operator") -> int:
+    def settle_established(self, identities: list[str], *, actor: str) -> int:
         """Close the in-flight work a backend answer has now accounted for.
 
         Uncertainty is a question — *did this reach the engine* — and reconciliation is the
