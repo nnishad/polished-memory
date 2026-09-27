@@ -196,12 +196,21 @@ this by itself, and `status`, `doctor` and `capabilities` all say so
 
 A dispatch is submitted asynchronously and then *followed*: the submission's own answer says
 only that the engine accepted the work, and the projection is confirmed when the operation
-reaches `completed`. The device slot is renewed each round of waiting rather than assumed, so
-a consolidation that takes an hour does not turn into a lapsed lease that some other caller is
-promoted into. Each ending is reported as what it was: `failed` and `not_found` retry,
-`cancelled` ends the job rather than resubmitting the work somebody stopped, and a wait that
-runs out holds the slot as uncertain with the operation identity left on the row — because the
-model may still be reading the document, and a free device would be the second lie.
+reaches `completed`. The slot is held for the submissions and handed back before the wait,
+because the model work that follows is done by the engine's own worker, which asks this same
+gate for this same device. Holding one slot across a run that needs admission on it is not
+caution: on a single-slot GPU it is a deadlock, and a live installation showed exactly that —
+the pass renewing its lease while the engine timed out four times trying to extract the facts and
+rescheduled the task. The engine holds its own admission for exactly as long as it is running,
+which is what keeps the invariant true; a second claim from the submitter would only double-book
+the device.
+
+Each ending is reported as what it was: `failed` and `not_found` retry, `cancelled` ends the job
+rather than resubmitting the work somebody stopped, and a wait that runs out leaves the row
+uncertain with the operation identity on it for `--reconcile` to ask about. What the device
+already spent is charged in every one of those cases — an ending is not a rebate — and the
+charge is recorded as tokens rather than as another admission, because the admission for this
+work was already counted when the submission released its slot.
 
 That is what `--reconcile` is for. It sends no model request and charges no budget, so it
 needs no approval digest; it asks the backend, one bounded list at a time, what became of the

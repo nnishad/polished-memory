@@ -12,6 +12,7 @@ from hermes_memory.processing.jobs import QUEUED, UNCERTAIN, JobQueue
 from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import PRIORITY, RouteTable, Route
 from hermes_memory.processing.worker import FormationWorker
+from hermes_memory.storage.evidence import EvidenceError
 
 from conftest import envelope
 
@@ -154,6 +155,33 @@ def test_the_backend_document_is_verified_after_a_successful_retain(harness):
     assert harness.docs.state(record, "1") == VERIFIED
 
 
+def test_a_charge_records_spend_without_claiming_another_admission(harness):
+    """The engine's run cost tokens after our slot was released; it was not a second request.
+
+    `calls` is how many times this installation was admitted to the device. Counting the
+    follow-up charge as one more would make the day's busiest-looking number a fiction, and the
+    budget that refuses work on it would be refusing on a count nobody made.
+    """
+    harness.gate.charge(REMOTE, tokens=120, seconds=1.5, note="operation(s) of job_x")
+    used = harness.budgets.used(REMOTE)
+    assert used["tokens"] == 120
+    assert used["calls"] == 0, "spend arrived without a second admission"
+    entry = harness.gate.db.execute("SELECT event, detail FROM gate_ledger WHERE event='charged'"
+                                    ).fetchone()
+    assert "job_x" in entry["detail"], "the ledger says what the charge was for"
+
+
+def test_a_charge_cannot_refund_the_day_or_name_nothing(harness):
+    """A primitive that writes usage must refuse an input that would unwrite it."""
+    with pytest.raises(EvidenceError):
+        harness.gate.charge(REMOTE, tokens=-5, seconds=0.0)
+    with pytest.raises(EvidenceError):
+        harness.gate.charge("", tokens=5, seconds=0.0)
+    with pytest.raises(EvidenceError):
+        harness.gate.charge(REMOTE, tokens="many", seconds=0.0)
+    assert harness.budgets.used(REMOTE)["tokens"] == 0, "and none of it reached the ledger"
+
+
 def test_the_retain_carries_the_real_event_time_and_source(harness):
     record = harness.record()
     harness.enqueue(record)
@@ -256,70 +284,78 @@ def test_a_still_running_operation_is_awaited_not_guessed(harness):
     assert len(submissions(harness.transport)) == 1, "waiting for the work is not resending it"
 
 
-def test_the_slot_is_vouched_for_while_the_backend_is_still_working(harness):
-    """An operation outlives the lease it was claimed under unless it is renewed."""
+def test_the_device_is_handed_back_before_the_engine_is_waited_for(harness):
+    """Holding the slot across the engine's run is a deadlock, not caution.
+
+    On the live machine this was the whole failure: the pass kept renewing a lease on
+    `remote-9b` while it polled, and the engine's own worker — which asks that same gate for
+    the same single slot in order to extract the facts — timed out four times and rescheduled
+    the task. The thing being waited for can only finish if the waiter is not standing on it.
+    """
     record = harness.record()
     harness.enqueue(record)
-    waiting_for(harness, TransportResult(200, {"status": "processing"}))
-    renewals: list[float | None] = []
-    real = harness.gate.renew
+    waiting_for(harness, TransportResult(200, {"status": "processing"}),
+                TransportResult(200, {"status": "completed",
+                                      "usage": {"total_tokens": 321}}))
+    seen: list[list[str]] = []
+    renewals: list[object] = []
 
-    def renew(reservation, **kwargs):
-        answer = real(reservation, **kwargs)
-        renewals.append(answer)
-        return answer
+    def watch(seconds):
+        seen.append(harness.gate.blocked_resources())
+        harness.waits.append(seconds)
 
-    harness.gate.renew = renew
+    real_renew = harness.gate.renew
+    harness.gate.renew = lambda reservation, **kwargs: (
+        renewals.append(1), real_renew(reservation, **kwargs))[1]
+    harness.worker.sleeper = watch
     assert harness.worker.run_once().state == "succeeded"
-    assert renewals and all(renewals), "every round of waiting renews the claim on the device"
+    assert seen and all(blocked == [] for blocked in seen), \
+        "every round of the wait finds the device free for the engine to admit itself"
+    assert not renewals, "a wait that renews a lease it no longer needs is the bug, not the fix"
 
 
-def test_a_lease_that_ran_out_stops_the_wait(harness):
-    """A promise that has expired is not renewed into existence.
+def test_a_second_job_is_admitted_while_the_first_operation_is_still_running(harness):
+    """One device, one in-flight inference — and the inference is the engine's, not ours."""
+    first, second = harness.record(), harness.record()
+    harness.enqueue(first)
+    harness.enqueue(second)
+    waiting_for(harness,
+                TransportResult(200, {"status": "processing"}),
+                TransportResult(200, {"status": "completed", "usage": {"total_tokens": 321}}),
+                TransportResult(200, {"status": "completed", "usage": {"total_tokens": 321}}))
 
-    Nothing here can say whether another admission was promoted over the top of it, and
-    the honest answer for work nobody is vouching for is uncertainty, not the device.
+    def admit_the_next_while_waiting(seconds):
+        harness.waits.append(seconds)
+        if harness.gate.occupancy():
+            return
+        granted = harness.gate.try_acquire(route="retain", holder="somebody-else",
+                                           resource=REMOTE, priority=1)
+        assert granted is not None, "the slot is not ours to reserve while we only poll"
+        harness.gate.release(granted, outcome="succeeded", tokens=0, seconds=0.0)
+
+    harness.worker.sleeper = admit_the_next_while_waiting
+    assert harness.worker.run_once().state == "succeeded"
+
+
+def test_a_wait_that_runs_out_leaves_the_job_uncertain_and_frees_everything(harness):
+    """An answer that never came is uncertainty about the job, not a claim on the device.
+
+    The old code held the slot as uncertain on the reasoning that the model might still be
+    reading the document. That reasoning belongs to the engine, which holds its own admission
+    for exactly as long as it is running; a second claim from the submitter would be the
+    double-booking that starved it.
     """
     record = harness.record()
     job_id = harness.enqueue(record)
-    waiting_for(harness, TransportResult(200, {"status": "processing"}))
-
-    def outlive_the_lease(seconds):
-        harness.waits.append(seconds)
-        harness.gate.clock = lambda: 10 ** 12
-
-    harness.worker.sleeper = outlive_the_lease
+    script = waiting_for(harness, *[TransportResult(200, {"status": "processing"})] * 5)
     outcome = harness.worker.run_once()
     assert outcome.state == "uncertain"
+    assert len(script.asks) == 3 == harness.worker.follow_max_polls, "bounded, not forever"
+    assert "reconcile" in outcome.detail
     assert harness.jobs.get(job_id).state == UNCERTAIN
-    assert harness.gate.blocked_resources() == [REMOTE], "nobody has established its end yet"
-    assert len(harness.waits) == 1, "the wait stops at the round the promise ran out"
-
-
-def test_a_slot_somebody_else_settled_stops_the_wait(harness):
-    """The worker must not re-block a device an operator has just freed.
-
-    The sequence is the real one: the lease runs out, the gate reads that as abandoned
-    work, and the settle door records who established its end. What the job was doing is
-    still unresolved — nothing about the reservation says the model read the document.
-    """
-    record = harness.record()
-    job_id = harness.enqueue(record)
-    waiting_for(harness, TransportResult(200, {"status": "processing"}))
-
-    def settle_while_waiting(seconds):
-        harness.waits.append(seconds)
-        harness.gate.clock = lambda: 10 ** 12
-        assert harness.gate.reap_expired(), "the gate reads its own expiry as abandoned work"
-        stranded = harness.gate.unresolved()[0]
-        harness.gate.resolve(stranded["id"], outcome="cancelled", actor="owner",
-                             reason="the gpu is needed elsewhere")
-
-    harness.worker.sleeper = settle_while_waiting
-    outcome = harness.worker.run_once()
-    assert outcome.state == "uncertain"
-    assert harness.jobs.get(job_id).state == UNCERTAIN
-    assert harness.gate.blocked_resources() == [], "their answer stands; we do not overrule it"
+    assert harness.gate.blocked_resources() == [], "the engine owns its own admission now"
+    assert harness.jobs.get(job_id).backend_operation_id, \
+        "the identity left on the row is what a later pass asks the backend about"
 
 
 def test_an_operation_that_never_arrived_is_not_waited_for(harness):
@@ -377,21 +413,6 @@ def test_a_state_the_pinned_backend_does_not_document_is_not_guessed(harness):
     outcome = harness.worker.run_once()
     assert outcome.state == "retry_wait" and "succeeded" in outcome.detail
     assert harness.docs.state(record, "1") == "submitted", "no coverage claimed for it"
-
-
-def test_a_wait_that_runs_out_holds_the_device_and_names_the_operation(harness):
-    """The operation may still be running, so freeing the slot would be the second lie."""
-    record = harness.record()
-    job_id = harness.enqueue(record)
-    script = waiting_for(harness, *[TransportResult(200, {"status": "processing"})] * 5)
-    outcome = harness.worker.run_once()
-    assert outcome.state == "uncertain"
-    assert len(script.asks) == 3 == harness.worker.follow_max_polls, "bounded, not forever"
-    assert "reconcile" in outcome.detail
-    assert harness.jobs.get(job_id).state == UNCERTAIN
-    assert harness.gate.blocked_resources() == [REMOTE]
-    assert harness.jobs.get(job_id).backend_operation_id, \
-        "the identity left on the row is what a later pass asks the backend about"
 
 
 def test_a_job_that_partially_landed_does_not_resend_what_is_already_verified(harness):

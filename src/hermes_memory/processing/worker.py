@@ -133,15 +133,23 @@ class FormationWorker:
     # -- the guarded request -------------------------------------------------
 
     def _execute(self, job, route, reservation, started):
-        """Run one job, then always give the slot back or mark it uncertain.
+        """Submit while the slot is ours, then wait for the engine without holding it.
 
-        The release lives in ``finally`` rather than at the end of the body:
-        a success path that returns from inside a ``try`` would otherwise leave
-        the physical slot claimed forever, which is exactly the failure mode the
-        gate exists to prevent.
+        Two things own the release. The first is the ``finally`` below: a success path that
+        returned from inside a ``try`` would leave the physical slot claimed forever, which is
+        the failure mode the gate exists to prevent. The second is the release inside the body,
+        taken the moment the last submission is answered — because the model work that follows
+        is done by the engine's own worker, which asks this same gate for the same device.
+        Holding a single slot across a run that needs admission on that slot is not caution, it
+        is a deadlock: the pass watches an operation that can only progress once the pass stops
+        occupying the resource. The live machine proved it — four timed-out extraction attempts
+        and a task rescheduled while the submitter politely renewed a lease nothing else could
+        use. So the device is handed back before the wait, and what the wait is for is stated
+        by the answer the engine gives rather than by a claim this process can no longer justify.
         """
         tokens = 0
         gate_outcome = "succeeded"
+        released = False
         try:
             try:
                 mappings = [self.documents.begin(record_id, job.input_revision,
@@ -155,6 +163,7 @@ class FormationWorker:
             self.jobs.begin_submission(job, submission_id=next(
                 (m["submission_id"] for m in mappings if m["submission_id"]), ""))
             covered: list[str] = []
+            submitted: list[tuple[str, str, dict[str, Any]]] = []
             running = False
             for record_id, mapping in zip(job.inputs, mappings):
                 # live_and_visible, not include_hidden: a record deleted by an
@@ -189,16 +198,13 @@ class FormationWorker:
                     submission_id=mapping["submission_id"])
                 operation = str(body.get("operation_id") or mapping["submission_id"])
                 self.jobs.mark_running(job, operation_id=operation)
-                # A submission is not a projection. The document is confirmed only once the
-                # operation the backend named has finished, because "queued" and "the model
-                # has read it" are different claims and coverage is the second one.
-                finished = self._follow(operation, reservation)
-                self.documents.confirm(record_id, job.input_revision)
-                covered.append(record_id)
-                tokens += _tokens_from(body, finished)
-            outcome = self.jobs.complete(job, covered=covered, tokens=tokens)
-            return AttemptOutcome(job.id, outcome["state"],
-                                  f"covered {len(covered)}/{len(job.inputs)}")
+                submitted.append((record_id, operation, body))
+            # The submissions are the only part of this job that used the device through us.
+            self.gate.release(reservation, outcome="succeeded",
+                              tokens=sum(_tokens_from(body) for _, _, body in submitted),
+                              seconds=time.monotonic() - started)
+            released = True
+            return self._await(job, submitted, covered)
         except OperationStopped as error:
             # The operator's decision to stop this work, reported by the backend. What
             # earlier inputs of this job already spent is still charged.
@@ -228,7 +234,7 @@ class FormationWorker:
         finally:
             # None means the slot was quarantined as uncertain instead of freed;
             # releasing it there would hand out a device that may still be busy.
-            if tokens is not None:
+            if tokens is not None and not released:
                 self.gate.release(reservation, outcome=gate_outcome, tokens=tokens,
                                   seconds=time.monotonic() - started)
 
@@ -248,26 +254,58 @@ class FormationWorker:
 
     # -- waiting for the operation the submission started ---------------------
 
-    def _follow(self, operation: str, reservation) -> dict[str, Any]:
-        """Wait for the operation this job started, vouching for the slot each round.
+    def _await(self, job, submitted: list[tuple[str, str, dict[str, Any]]],
+               covered: list[str]) -> AttemptOutcome:
+        """Turn each answered operation into coverage, one honest outcome at a time.
 
-        The submission's own answer says only that the engine accepted the work; whether
-        the model then read it is a separate question with a separate answer, and the
-        device stays busy either way. So the lease is renewed rather than assumed, and the
-        wait has an end, because a worker that waited forever would hold a physical
-        resource forever on behalf of a job nobody is listening to.
+        A submission is not a projection: the document is confirmed only once the operation the
+        backend named has finished, because "queued" and "the model has read it" are different
+        claims and coverage is the second one. Nothing here holds a device — the engine is using
+        it under its own admission — so the outcomes are written straight to the job: a stop ends
+        it, an operation that ended badly is the ordinary failed attempt, and an answer that
+        never came leaves the row uncertain for `form --reconcile`, which is the door built for
+        exactly that question.
+        """
+        tokens = 0
+        waiting = time.monotonic()
+        try:
+            for record_id, operation, body in submitted:
+                try:
+                    finished = self._follow(operation)
+                except OperationStopped as error:
+                    self.jobs.cancel(job.id, actor="backend", reason=str(error)[:400])
+                    return AttemptOutcome(job.id, CANCELLED, str(error))
+                except OperationAbandoned as error:
+                    state = self.jobs.retry(job, error=str(error)[:400], backoff=60.0)
+                    return AttemptOutcome(job.id, state, str(error))
+                except HindsightUnavailable as error:
+                    self.jobs.uncertain(job, reason=str(error)[:400])
+                    return AttemptOutcome(job.id, "uncertain", str(error))
+                self.documents.confirm(record_id, job.input_revision)
+                covered.append(record_id)
+                tokens += _tokens_from(body, finished)
+            outcome = self.jobs.complete(job, covered=covered, tokens=tokens)
+            return AttemptOutcome(job.id, outcome["state"],
+                                  f"covered {len(covered)}/{len(job.inputs)}")
+        finally:
+            if tokens:
+                # The device spent what it spent, whatever happened to the rest of the job. An
+                # ending — a stop, an abandoned operation, a wait that ran out — is not a
+                # rebate, and a daily budget blind to it would refuse nothing when it should.
+                self.gate.charge(job.resource, tokens=tokens,
+                                 seconds=time.monotonic() - waiting,
+                                 note=f"operation(s) of job {job.id}")
+
+    def _follow(self, operation: str) -> dict[str, Any]:
+        """Ask the engine, on a bounded schedule, whether its operation finished.
+
+        A status read is not a use of the device: it is the engine's own worker that runs the
+        model, and it asks the gate for that. So this waits without holding anything, and the
+        wait still has an end — a worker that polled forever would report a job as live long
+        after anybody who could answer had stopped listening. When the end comes the honest
+        state is uncertainty, and the identity on the job row is what settles it later.
         """
         for _ in range(self.follow_max_polls):
-            if self.gate.renew(reservation) is None:
-                # Somebody else has answered for this slot by now — an operator settling it,
-                # or the expiry of a lease this worker stopped vouching for. Continuing to
-                # use the device would be a second claim on one resource, and the identity
-                # on the row is enough to finish the question without resubmitting the work.
-                raise HindsightUnavailable(
-                    f"operation {operation} is unfinished and the "
-                    f"{reservation.resource!r} slot is no longer ours to hold; the submission "
-                    f"identity is on the job, so `hermes-memory form --reconcile` can finish "
-                    "the question without this process resubmitting it")
             answer = self.client.operation(operation)
             state = operation_state(answer)
             if state in OPERATION_DONE:
@@ -287,9 +325,10 @@ class FormationWorker:
             self.sleeper(self.follow_poll_s)
         raise HindsightUnavailable(
             f"operation {operation} was still unfinished after {self.follow_max_polls} looks "
-            f"({self.follow_max_polls * self.follow_poll_s:g}s). The device may still be busy "
-            "with it, so the slot is held rather than handed out again, and the identity on "
-            "the job is what `hermes-memory form --reconcile` asks the backend about")
+            f"({self.follow_max_polls * self.follow_poll_s:g}s). This process holds no slot "
+            "for it — the engine runs the operation under its own admission — so the job waits "
+            "as uncertain work, and the identity on the row is what `hermes-memory form "
+            "--reconcile` asks the backend about")
 
 
 def _tokens_from(*bodies: dict[str, Any]) -> int:

@@ -164,6 +164,35 @@ class ResourceGate:
             self.db.execute("ROLLBACK")
             raise
 
+    def charge(self, resource: str, *, tokens: int, seconds: float,
+               reservation: Reservation | None = None, note: str = "") -> None:
+        """Record measured device use that had no admission of its own to release.
+
+        A submission handed the slot back and the engine then ran the model under its own
+        admission; the cost of that run is still this installation's spending, and a daily
+        budget that only counts what a caller held the slot for would understate the device
+        and let a pass refuse nothing when it should. This is an accounting entry, not a key:
+        it grants no access, holds no slot and cannot make a resource busy — which is why it
+        takes a resource name where every other method takes a reservation.
+        """
+        if not isinstance(resource, str) or not resource.strip():
+            raise EvidenceError("a charge names the resource that earned it")
+        if not isinstance(tokens, int) or isinstance(tokens, bool):
+            raise EvidenceError("tokens must be an integer")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # No call is counted here: `calls` is how many times this installation was admitted
+            # to the device, and the admission that covered this work was already counted when
+            # the submission released its slot. Only the spend arrives after the fact.
+            self._charge(resource, tokens=tokens, seconds=seconds, calls=0)
+            self._log(reservation.id if reservation else "-", resource, "-", "system",
+                      "charged", {"tokens": tokens, "seconds": round(seconds, 3),
+                                  "note": note[:300]})
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
     def mark_uncertain(self, reservation: Reservation, *, reason: str) -> None:
         """Record that we do not know whether the upstream finished.
 
@@ -395,17 +424,17 @@ class ResourceGate:
             raise GateClosed(f"unknown reservation {reservation_id!r}")
         return row
 
-    def _charge(self, resource: str, *, tokens: int, seconds: float) -> None:
-        if tokens < 0 or seconds < 0:
+    def _charge(self, resource: str, *, tokens: int, seconds: float, calls: int = 1) -> None:
+        if tokens < 0 or seconds < 0 or calls < 0:
             raise EvidenceError("usage cannot be negative")
         period = now()[:10]
         self.db.execute(
             "INSERT INTO budget_usage(scope, period, resource, tokens, calls, seconds) "
-            "VALUES('global',?,?,?,1,?) "
+            "VALUES('global',?,?,?,?,?) "
             "ON CONFLICT(scope, period, resource) DO UPDATE SET "
-            "tokens=budget_usage.tokens+excluded.tokens, calls=budget_usage.calls+1, "
+            "tokens=budget_usage.tokens+excluded.tokens, calls=budget_usage.calls+excluded.calls, "
             "seconds=budget_usage.seconds+excluded.seconds",
-            (period, resource, tokens, seconds),
+            (period, resource, tokens, calls, seconds),
         )
 
     def _log(self, reservation_id: str, resource: str, route: str, holder: str,
