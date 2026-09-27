@@ -31,6 +31,14 @@ def host(home, **extra):
     release = home / "release"
     (release / "bin").mkdir(parents=True, exist_ok=True)
     (release / "bin" / "hermes-memory").write_text("#!/bin/sh\n", encoding="utf-8")
+    # A staged release carries its plugin beside its runtime — `release` refuses to stage one
+    # that does not — and `register-plugin` now checks the two halves of the contract against
+    # each other, so the fixture has to be the tree the door would actually have produced.
+    carried = release / "integrations" / "hermes-memory"
+    carried.mkdir(parents=True)
+    for source in sorted((Path(__file__).resolve().parents[2]
+                          / "integrations" / "hermes-memory").glob("*.py")):
+        (carried / source.name).write_text(source.read_text(encoding="utf-8"))
     lines = [f"HERMES_MEMORY_DATA_DIR={home / 'data'}",
              "HERMES_MEMORY_INFERENCE_ENABLED=false",
              f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}"]
@@ -761,3 +769,36 @@ def test_a_worker_interpreter_that_cannot_run_is_reported_as_one_that_cannot_run
                                                      "hermes_memory": True}, exit_code=3)
     assert any("not importable" in line or "could not run" in line
                for line in blockers), blockers
+
+
+# -- what the host is actually pointed at -------------------------------------
+
+def test_the_host_is_given_a_git_tree_because_that_is_all_it_accepts(installation):
+    """A staged release has no ``.git``, and the host clones rather than copies.
+
+    Verified against the installed host: `hermes plugins install` names a catalog entry, a Git
+    URL or an owner/repo, and `--ref` is a commit inside that repository. The runtime still
+    comes from the release, which is why the two are compared below rather than merged.
+    """
+    settings, environ = installation
+    context = transaction._context(settings, hermes_home=Path(settings.home),
+                                  environ=environ)
+    install = next(argv for argv, name in transaction.host_commands(context)
+                   if name == "install")
+    url = str(install[3])
+    checkout = Path(__file__).resolve().parents[2]
+    assert url == f"file://{checkout}#integrations/hermes-memory"
+    assert str(environ["HERMES_MEMORY_RELEASE"]) not in url
+
+
+def test_a_release_whose_plugin_disagrees_with_the_checkout_is_not_registered(installation,
+                                                                             monkeypatch):
+    """§10.3's pairing, enforced where it can still stop something."""
+    settings, environ = installation
+    carried = Path(environ["HERMES_MEMORY_RELEASE"]) / "integrations" / "hermes-memory"
+    (carried / "provider.py").write_text("# a different contract than the checkout runs\n",
+                                         encoding="utf-8")
+    proposal = plan(settings, hermes_home=Path(settings.home), environ=environ,
+                    ref="0" * 40)
+    assert any("does not match the one this release carries" in line
+               for line in proposal["blocked"]), proposal["blocked"]

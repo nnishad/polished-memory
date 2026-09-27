@@ -403,11 +403,26 @@ def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
     """
     commands = [argv for argv, name in host_commands(ctx) if name != "activate"]
     actions = [" ".join(str(part) for part in argv) for argv in commands]
-    actions.append(f"plugin files at the source tree digest {_tree_digest()}")
+    release = _release_root(ctx)
+    actions.append(f"plugin files at the release tree digest {_tree_digest(ctx)}")
     blocking = []
     if not (ctx.ref and _HEX.fullmatch(ctx.ref)):
         blocking.append("--ref must be the 40-character commit this release was cut at; "
                         "setup will not install a moving pointer")
+    registration = _registration_source()
+    if registration is None:
+        blocking.append("the host installs a plugin only from a git repository, and no "
+                        "checkout carrying integrations/hermes-memory is reachable from "
+                        "here; run setup from the release's source checkout, or publish it "
+                        "and register from the remote")
+    elif (_plugin_digest(registration / "integrations" / "hermes-memory")
+          != _tree_digest(ctx)):
+        # The runtime comes from the release and the host's copy comes from the checkout, so
+        # an agreement between them is the whole of §10.3's pairing. Without it the plugin
+        # would keep calling a contract the installed code no longer has.
+        blocking.append("the plugin in the checkout does not match the one this release "
+                        "carries; registering it would pair a new runtime with an old host "
+                        "half of the same contract")
     if ctx.runner is None:
         blocking.append("no host command executor was provided, so the plugin cannot be "
                         "registered from here")
@@ -419,7 +434,7 @@ def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
                     f"`{' '.join(str(part) for part in argv)}` failed ({code}): "
                     f"{output.strip()[:300]}")
     return {"actions": actions, "blocking": blocking,
-            "inputs": {"ref": ctx.ref or "unset", "tree": _tree_digest(),
+            "inputs": {"ref": ctx.ref or "unset", "tree": _tree_digest(ctx),
                        "commands": actions[:len(commands)],
                        "executor": ctx.runner is not None}}
 
@@ -656,11 +671,18 @@ def profile_name(home: Path) -> str:
 
 
 def host_commands(ctx: Context) -> list[tuple[list[str], str]]:
-    """Every host command this transaction can run, so a reviewer sees them together."""
-    root = _source_root()
+    """Every host command this transaction can run, so a reviewer sees them together.
+
+    The install URL names a *git* tree on purpose, and it is not the release the runtime runs
+    from: verified against the host, `hermes plugins install` accepts a catalog entry, a Git
+    URL, or an owner/repo shorthand, and `--ref` must be a commit inside that repository. An
+    unpacked release has no `.git`, so pointing the host at one makes the clone fail — which is
+    what the first real installation of this discovered.
+    """
+    source = _registration_source() or Path("<no git checkout carrying the plugin>")
     return [
         (["hermes", "plugins", "install",
-          f"file://{root}#integrations/hermes-memory", "--ref", ctx.ref or "",
+          f"file://{source}#integrations/hermes-memory", "--ref", ctx.ref or "",
           "--no-enable"], "install"),
         (["hermes", "plugins", "enable", "hermes-memory",
           "--no-allow-tool-override"], "enable"),
@@ -668,27 +690,35 @@ def host_commands(ctx: Context) -> list[tuple[list[str], str]]:
     ]
 
 
-def _source_root() -> Path:
-    """The tree whose plugin the host is being asked to register.
+def _registration_source() -> Path | None:
+    """The checkout the host can clone this plugin from, when one is reachable."""
+    from .compatibility import source_checkout
 
-    A checkout answers, and so does the staged release a wheel was installed from — which
-    matters, because the units start the release's binary and the host registers a plugin from
-    whichever directory this names. Counting parents from ``site-packages`` would hand the
-    host a path with no plugin in it.
-    """
-    from .compatibility import tree_root
-
-    root = tree_root()
-    if root is None:
-        raise SetupError("this build carries no tree with its plugin files; run setup from a "
-                         "checkout or from a staged release")
-    return root
+    checkout = source_checkout()
+    if checkout is None or not (checkout / ".git").exists():
+        return None
+    return checkout if (checkout / "integrations" / "hermes-memory").is_dir() else None
 
 
-def _tree_digest() -> str:
-    root = _source_root()
-    files = sorted((root / "integrations" / "hermes-memory").glob("*.py"))
+def _plugin_digest(directory: Path) -> str:
+    """Names and bytes of a plugin tree, so "do these two halves agree" is answerable."""
+    files = sorted(Path(directory).glob("*.py"))
     return digest([[path.name, content_digest(path.read_bytes())] for path in files])
+
+
+def _release_root(ctx: Context) -> Path:
+    """The release this installation runs from — the pointer, not wherever the code lives.
+
+    Asking which tree this build belongs to would answer with a source checkout when setup is
+    being run from one, and the point of comparing the two halves is that the *runtime* came
+    from the release while the host's copy is about to be cloned from git.
+    """
+    return Path((ctx.environ or {}).get("HERMES_MEMORY_RELEASE")
+                or Path(ctx.settings.home) / "runtime" / "current")
+
+
+def _tree_digest(ctx: Context) -> str:
+    return _plugin_digest(_release_root(ctx) / "integrations" / "hermes-memory")
 
 
 def _provider(config: Path) -> str:
