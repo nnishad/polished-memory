@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from hermes_memory.backend.capabilities import PINNED_VERSION
 from hermes_memory.config import load_settings
+from hermes_memory.ids import content_digest
 from hermes_memory.install.release import (BACKEND_SPEC, MANIFEST, ReleaseError, apply,
                                            plan, verify)
 
@@ -269,8 +270,114 @@ def test_a_wheel_build_that_produced_nothing_is_reported_as_a_failure(instance, 
                     path.unlink()
             return result
 
-    with pytest.raises(ReleaseError, match="no wheel"):
+    with pytest.raises(ReleaseError, match="left 0 wheels"):
         staged(instance, source, tmp_path, runner=BuildLie())
+
+
+def test_a_build_that_left_two_wheels_installs_neither_of_them(instance, source, tmp_path):
+    """Choosing "the newest" is how a release ends up holding something else's bytes."""
+    class TwoWheels(Fake):
+        def __call__(self, argv, **kwargs):
+            result = super().__call__(argv, **kwargs)
+            if argv[:2] == ["uv", "build"]:
+                out = Path(argv[argv.index("--out-dir") + 1])
+                (out / "hermes_memory-0.0.9-py3-none-any.whl").write_text("the old one\n")
+            return result
+
+    with pytest.raises(ReleaseError, match="left 2 wheels"):
+        staged(instance, source, tmp_path, runner=TwoWheels())
+    assert not (tmp_path / "release").exists(), "an ambiguous build leaves no release behind"
+
+
+# -- which revision a release is ---------------------------------------------
+
+def a_repository(source):
+    """The source fixture as a real checkout standing at a real commit."""
+    def git(*arguments):
+        return subprocess.run(["git", "-c", "user.email=release@example.invalid",
+                               "-c", "user.name=Release Test", *arguments],
+                              cwd=source, check=True, capture_output=True, text=True).stdout
+
+    git("init", "-q")
+    return commit_all(source)
+
+
+def commit_all(source):
+    """Commit whatever the tree holds now, and say which commit that made.
+
+    The identity and signing flags are given rather than inherited: a test that wrote
+    commits with the machine owner's key, or refused because their global config demands
+    one, would be a function of the user rather than of this build.
+    """
+    def git(*arguments):
+        return subprocess.run(["git", "-c", "user.email=release@example.invalid",
+                               "-c", "user.name=Release Test", "-c", "commit.gpgsign=false",
+                               *arguments],
+                              cwd=source, check=True, capture_output=True, text=True).stdout
+
+    git("add", "-A")
+    git("commit", "-q", "--allow-empty", "-m", "staged as shown")
+    return git("rev-parse", "HEAD").strip()
+
+
+def test_an_unrevisioned_source_says_so_rather_than_being_refused(instance, source, tmp_path):
+    report = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert report["source_commit"] == "" and report["blocking"] == [], \
+        "a checkout that cannot be asked is reported as unasked, not as broken"
+
+
+def test_a_tree_inside_someone_elses_repository_is_not_staged_as_that_one(instance, source,
+                                                                         tmp_path):
+    """The upward search is the trap: one directory up is not the revision in hand."""
+    a_repository(tmp_path)
+    report = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert report["source_commit"] == "" and report["blocking"] == []
+
+
+def test_the_plan_names_the_commit_it_would_stage(instance, source, tmp_path):
+    commit = a_repository(source)
+    report = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert report["source_commit"] == commit
+    assert any(f"commit {commit[:12]}" in line for line in report["actions"])
+
+
+def test_the_record_says_which_commit_and_exactly_which_wheel_it_is(instance, source,
+                                                                   tmp_path):
+    commit = a_repository(source)
+    report = staged(instance, source, tmp_path, runner=Fake())
+    record = json.loads((Path(report["staged"]) / MANIFEST).read_text(encoding="utf-8"))
+    assert record["source_commit"] == commit and record["source_dirty"] is False
+    assert Path(record["wheel"]).parent == Path(report["staged"]) / "wheel", \
+        "the artefact lives with the release that installed it"
+    assert record["wheel_digest"] == content_digest(Path(record["wheel"]).read_bytes())
+
+
+def test_a_dirty_checkout_is_not_staged_under_a_clean_commit_name(instance, source, tmp_path):
+    a_repository(source)
+    (source / "not_committed.py").write_text("x = 1\n", encoding="utf-8")
+    report = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert report["source_dirty"] is True, "the reading says the tree differs before it refuses"
+    assert any("uncommitted changes" in line for line in report["blocking"]), \
+        "the wheel would be built from bytes no revision names"
+
+
+def test_a_tree_named_for_another_commit_is_not_staged_there(instance, source, tmp_path):
+    a_repository(source)
+    report = plan(settings=instance[1], into=tmp_path / ("f" * 40), source=source)
+    assert any("does not hold" in line for line in report["blocking"])
+
+
+def test_a_different_revision_is_a_different_approval(instance, source, tmp_path):
+    """An approval is for the revision that was shown, not for the directory named."""
+    commit = a_repository(source)
+    shown = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    (source / "later.py").write_text("y = 2\n", encoding="utf-8")
+    assert commit_all(source) != commit, "a source change this build cannot see in its digests"
+    moved = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert moved["review_digest"] != shown["review_digest"]
+    with pytest.raises(ReleaseError, match="the plan changed"):
+        apply(settings=instance[1], into=tmp_path / "release", source=source, actor=OWNER,
+              review=shown["review_digest"], runner=Fake())
 
 
 # -- the door itself ---------------------------------------------------------

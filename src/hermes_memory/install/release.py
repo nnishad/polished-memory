@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -111,6 +112,18 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
     distribution = Path(wheel).expanduser() if wheel else None
     if distribution is not None and not distribution.is_file():
         blocking.append(f"{distribution} is not a file")
+    commit, dirty = _revision(root) if root is not None else (None, False)
+    if commit:
+        actions.append(f"stage commit {commit[:12]} of {root}")
+    named = re.fullmatch(r"[0-9a-f]{40}", target.name)
+    if named and commit and target.name != commit:
+        blocking.append(f"{target} is named for commit {target.name[:12]}, but the source at "
+                        f"{root} is at {commit[:12]}; a release tree that claims a revision it "
+                        "does not hold is worse than one that claims none")
+    if commit and dirty:
+        blocking.append(f"{root} has uncommitted changes; the wheel would be built from bytes "
+                        "no revision names, and the release would record a commit it is not. "
+                        "Commit them, or stage from a clean checkout")
     actions.append(f"build the wheel from {root}" if distribution is None
                    else f"stage from {distribution}")
     actions.append(f"create the runtime environment at {target}")
@@ -131,10 +144,13 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
     # file is not vouching for the file that is still there when the work starts.
     wheel_digest = content_digest(distribution.read_bytes()) \
         if distribution is not None and distribution.is_file() else None
-    review = digest([str(target), str(root or ""), wheel_digest or "build-at-apply",
+    review = digest([str(target), str(root or ""), commit or "unrevisioned",
+                     "dirty" if dirty else "clean",
+                     wheel_digest or "build-at-apply",
                      BACKEND_SPEC if backend else "no-backend",
                      json.dumps(fingerprints, sort_keys=True)])
     return {"into": str(target), "source": str(root or ""), "wheel": str(distribution or ""),
+            "source_commit": commit or "", "source_dirty": bool(dirty),
             "backend": backend, "actions": actions, "carried": tree,
             "fingerprints": fingerprints, "blocking": blocking, "review_digest": review}
 
@@ -168,7 +184,7 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
     try:
         distribution = Path(staged["wheel"])
         if not distribution.is_file():
-            distribution = _build_wheel(root, run=run)
+            distribution = _build_wheel(root, into=target, run=run)
         _run(run, ["uv", "venv", str(target), "--quiet"], stage="runtime venv")
         environments = [target]
         if backend:
@@ -182,7 +198,13 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
                        "--quiet", str(distribution)], stage="hermes-memory")
         carry(source=root, into=target, names=tuple(staged["carried"]))
         manifest = {**{key: staged[key] for key in
-                       ("into", "source", "wheel", "backend", "review_digest")},
+                       ("into", "source", "source_commit", "source_dirty", "backend",
+                        "review_digest")},
+                    # The wheel that was actually installed, and its bytes: a plan that
+                    # named none built one, and a release record that could not say which
+                    # artefact the environments hold would answer no question at all.
+                    "wheel": str(distribution),
+                    "wheel_digest": content_digest(distribution.read_bytes()),
                     "backend_spec": BACKEND_SPEC if backend else None,
                     "framework_version": _version(),
                     "staged_by": actor.strip(), "python": sys.version.split()[0],
@@ -266,14 +288,47 @@ def _version() -> str | None:
         return None
 
 
-def _build_wheel(root: Path, *, run: Callable) -> Path:
-    into = root / "dist"
-    into.mkdir(parents=True, exist_ok=True)
-    _run(run, ["uv", "build", "--out-dir", str(into), str(root)], stage="wheel")
-    built = sorted(into.glob("hermes_memory-*.whl"), key=lambda p: p.stat().st_mtime)
-    if not built:
-        raise ReleaseError(f"uv build produced no wheel under {into}")
-    return built[-1]
+def _revision(root: Path) -> tuple[str | None, bool]:
+    """Which commit this checkout is at, and whether its working tree differs from it.
+
+    ``(None, False)`` when the source carries no repository of its own — an unpacked tree is
+    entitled to say nothing rather than to be refused, and a ``git`` run from a directory
+    *inside* somebody else's repository would report that one as if it were this. The
+    upward search is what the ``.git`` guard is for.
+    """
+    if not (root / ".git").exists():
+        return None, False
+
+    def ask(*arguments: str) -> str | None:
+        try:
+            answer = subprocess.run(["git", "-C", str(root), *arguments],
+                                    capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return answer.stdout.strip() if answer.returncode == 0 else None
+
+    commit = ask("rev-parse", "HEAD")
+    if commit is None or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        return None, False
+    return commit, bool(ask("status", "--porcelain", "--untracked-files=all"))
+
+
+def _build_wheel(root: Path, *, into: Path, run: Callable) -> Path:
+    """Compile the distribution *inside* the release being staged.
+
+    A checkout's ``dist/`` holds every build that machine has ever run, so choosing the
+    newest wheel there can install something this call never compiled. One directory per
+    release, holding exactly the artefact that went into both of its environments, is the
+    difference between a record and a guess.
+    """
+    target = into / "wheel"
+    target.mkdir(parents=True, exist_ok=True)
+    _run(run, ["uv", "build", "--quiet", "--out-dir", str(target), str(root)], stage="wheel")
+    built = sorted(target.glob("hermes_memory-*.whl"))
+    if len(built) != 1:
+        raise ReleaseError(f"the build left {len(built)} wheels under {target}; a release "
+                           "installs exactly one")
+    return built[0]
 
 
 def _run(run: Callable, argv: list[str], *, stage: str) -> None:
