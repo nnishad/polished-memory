@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..ids import document_id_is_ambiguous
 from .capabilities import (CAPABILITIES, PINNED_VERSION, Capabilities,
                            UnsupportedCapability, capabilities_for)
 
@@ -161,7 +162,7 @@ class HindsightClient:
         back to the revision that produced them.
         """
         self.capabilities.require("retain")
-        if not document_id or "_" in document_id or "~" in document_id:
+        if document_id_is_ambiguous(document_id):
             raise HindsightError(
                 "document_id must be nonempty and free of '_' and '~': Hindsight escapes "
                 "them when composing chunk IDs, and an ambiguous chunk ID cannot be mapped "

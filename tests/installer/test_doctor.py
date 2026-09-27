@@ -15,8 +15,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_memory.backend.hindsight_client import HindsightError
 from hermes_memory.config import load_settings
-from hermes_memory.operations.doctor import FAIL, OK, WARN, Doctor, Finding
+from hermes_memory.ids import document_id_is_ambiguous
+from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, WARN, Doctor,
+                                             Finding)
 from hermes_memory.storage.evidence import EvidenceStore
 
 APPROVED_LAN = "192.168.68.65"
@@ -61,6 +64,10 @@ class FakeBackend:
         self.calls.append("retain")
         if "retain" in self.fail_on:
             raise RuntimeError("the backend is read-only")
+        # The real client refuses such an id before it sends anything. A fake that took any
+        # id at all let the probe keep a name that could never work outside these tests.
+        if document_id_is_ambiguous(kwargs["document_id"]):
+            raise HindsightError(f"ambiguous document id {kwargs['document_id']!r}")
         return {"document_id": kwargs["document_id"]}
 
     def recall(self, query, **kwargs):
@@ -569,6 +576,17 @@ def test_a_round_trip_probe_cleans_up_after_itself(store):
     finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip()
     assert finding.severity == OK
     assert backend.calls == ["retain", "recall", "delete"]
+
+
+def test_the_probe_retains_under_a_name_the_client_will_accept():
+    """The probe's own id is checked by the same rule that checks an owner's.
+
+    It used to carry an underscore, which is precisely what the engine escapes when it
+    composes chunk ids, and the refusal is in this framework rather than in the backend — so
+    the one opt-in model-backed health door the plan promises could not open at all, and every
+    test around it passed because the fake took any name it was given.
+    """
+    assert not document_id_is_ambiguous(PROBE_DOCUMENT_ID)
 
 
 def test_the_probe_document_is_deleted_even_when_the_round_trip_fails(store):

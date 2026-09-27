@@ -35,6 +35,11 @@ SCAN_RECORDS = 500
 # How old an uncheckpointed WAL may get before it is worth mentioning, in bytes.
 WAL_WARN_BYTES = 64 * 1024 * 1024
 PROBE_TEXT = "Hermes doctor synthetic probe. This sentence is a connectivity test."
+#: The id the probe retains under. It cannot contain `_` or `~`, because the engine escapes
+#: them when it composes chunk ids and an escaped chunk cannot be traced back to a document —
+#: and this framework refuses such an id rather than sending it, so a name written with an
+#: underscore here fails the probe before it ever reaches the backend.
+PROBE_DOCUMENT_ID = "doctor-probe"
 
 
 @dataclass(frozen=True)
@@ -524,9 +529,8 @@ class Doctor:
         if client is None:
             return Finding("synthetic-probe", WARN, "no backend to probe",
                            "configure a route first")
-        document_id = "doctor_probe"
         try:
-            client.retain(document_id=document_id, content=PROBE_TEXT,
+            client.retain(document_id=PROBE_DOCUMENT_ID, content=PROBE_TEXT,
                           metadata={"probe": "doctor"})
             found = client.recall("doctor synthetic probe", max_tokens=64)
         except Exception as error:
@@ -536,7 +540,7 @@ class Doctor:
                            {"error": str(error)[:300]})
         finally:
             try:
-                client.delete_document(document_id)
+                client.delete_document(PROBE_DOCUMENT_ID)
             except Exception:
                 pass
         if not found.results:

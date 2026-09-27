@@ -13,9 +13,21 @@ import uuid
 from datetime import datetime, timezone
 
 __all__ = ["digest", "content_digest", "now", "record_id", "record_pk",
-           "backend_document_id", "timestamp", "intervals_overlap", "interval_contains"]
+           "backend_document_id", "document_id_is_ambiguous", "timestamp",
+           "intervals_overlap", "interval_contains"]
 
 _INVALID_BACKEND_CHARS = re.compile(r"[~_]")
+
+
+def document_id_is_ambiguous(document_id: str) -> bool:
+    """Whether the engine would have to escape this id to compose chunk ids out of it.
+
+    The rule that keeps ``backend_document_id`` reversible, written once so that anything
+    naming a document — the projection path, the doctor's probe — answers the same question
+    before it sends. An escaped chunk id cannot be mapped back to a revision, and the refusal
+    is ours rather than the backend's: such an id never reaches a model.
+    """
+    return not document_id or bool(_INVALID_BACKEND_CHARS.search(document_id))
 
 
 def digest(value) -> str:
@@ -87,7 +99,7 @@ def backend_document_id(record: str, revision: str) -> str:
     never have to string-parse a chunk ID to recover a record (§1.3).
     """
     candidate = "hdoc" + digest([record, revision])[:32]
-    assert not _INVALID_BACKEND_CHARS.search(candidate)
+    assert not document_id_is_ambiguous(candidate)
     return candidate
 
 
