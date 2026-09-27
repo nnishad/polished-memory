@@ -378,19 +378,24 @@ def _initialize(ctx: Context, *, apply: bool) -> dict[str, Any]:
         return {"actions": ["no profile is enrolled yet, so there is no store to create"],
                 "blocking": ["the configure step must enroll this profile first"],
                 "inputs": {"store": "no profile enrolled"}}
-    if path.exists() and not apply:
+    # A step resumes on the digest of its inputs, so the inputs have to name the things this
+    # step is responsible for finding. A store or a data directory that went missing after
+    # the receipt was written left the transaction reporting itself finished on top of an
+    # installation that could not start, with the refusal arriving at the unit's exec time.
+    absent = [str(missing) for missing in (path, *_backend_directories(ctx))
+              if not missing.exists()]
+    if not absent and not apply:
         return {"actions": [f"{path} already exists and is left exactly as it is"],
-                "inputs": {"store": str(path)}}
+                "inputs": {"store": str(path), "absent": absent}}
     actions = ([f"{path} already exists and is left exactly as it is"] if path.exists()
                else [f"would create and migrate {path}"])
     # The directories the backend unit binds have to exist before the manager can spawn it:
     # under `ProtectSystem=strict` a missing `ReadWritePaths` entry is a mount-namespace
     # failure at exec time, which is a very late way to report a missing mkdir. Created here
-    # rather than by the unit because this installation owns the layout, and created on every
-    # pass rather than only on the first because a resumed transaction may have stopped
-    # between the store and the services.
+    # rather than by the unit because this installation owns the layout.
     for directory in _backend_directories(ctx):
-        actions.append(f"would create {directory}")
+        if not directory.is_dir():
+            actions.append(f"would create {directory}")
         if apply:
             directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     if apply:
@@ -403,7 +408,11 @@ def _initialize(ctx: Context, *, apply: bool) -> dict[str, Any]:
         Path(scoped.blob_dir).mkdir(parents=True, mode=0o700, exist_ok=True)
         with EvidenceStore(path):
             pass
-    return {"actions": actions, "inputs": {"store": str(path)}}
+        # What the receipt records is the world this step leaves behind, so the next pass
+        # finds the digest it expects and resumes. Recording the absence this pass repaired
+        # would reopen the step forever.
+        absent = []
+    return {"actions": actions, "inputs": {"store": str(path), "absent": absent}}
 
 
 def _backend_directories(ctx: Context) -> list[Path]:

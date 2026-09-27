@@ -884,3 +884,38 @@ def test_a_host_holding_a_different_commit_is_told_so_rather_than_overwritten(in
                     runner=lambda argv: (0, ""))
     assert any("registers hermes-memory at " in line for line in proposal["blocked"]), \
         proposal["blocked"]
+
+
+def test_a_backend_directory_that_went_missing_reopens_the_step_that_owns_it(installation,
+                                                                             tmp_path):
+    """The receipt says the layout was made; the filesystem no longer agrees.
+
+    Resumption is by input digest, so inputs that leave out what the step created let a
+    finished transaction hand the manager a unit that cannot spawn — the very failure those
+    directories exist to prevent. It arrives as exit 226 at exec time, in a service log, on
+    the machine that is supposed to be working.
+    """
+    from hermes_memory.install.services import layout
+
+    assert staged_backend(installation, imports={"hindsight_api": True,
+                                                 "hermes_memory": True}) == []
+    settings, environ = load_settings(), installation[1]
+    home = activity(tmp_path)
+    runner = Heremes(home / "config.yaml")
+    approve(settings, home, environ, runner=runner, ref=REF)
+    placed = layout(settings, environ=environ)
+    assert placed.hindsight_dir.is_dir(), "the step never made the directory it claims"
+    placed.hindsight_dir.rmdir()
+
+    proposal = plan(settings, hermes_home=home, environ=environ, runner=runner, ref=REF)
+    entry = {item["step"]: item for item in proposal["steps"]}["initialize"]
+    assert entry["state"] == "pending", "the layout is gone and the receipt says it is not"
+    assert any(str(placed.hindsight_dir) in action for action in entry["actions"]), entry
+    run(settings, hermes_home=home, actor=OWNER, review=proposal["review_digest"],
+        environ=environ, runner=runner, ref=REF)
+    assert placed.hindsight_dir.is_dir()
+    settled = {item["step"]: item for item in
+               plan(settings, hermes_home=home, environ=environ, runner=runner,
+                    ref=REF)["steps"]}["initialize"]
+    assert settled["state"] == "resumed", ("the receipt records the absence this pass "
+                                           "repaired, so the step is asked again forever")
