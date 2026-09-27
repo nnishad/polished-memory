@@ -35,7 +35,9 @@ ProtectHome=read-only
 # ProtectSystem=strict.
 ReadWritePaths=@INSTANCE_HOME@ @HINDSIGHT_DATA_DIR@ @PG0_DIR@
 EnvironmentFile=@HINDSIGHT_ENV@
-Environment=PG0_HOME=@PG0_DIR@
+# The same home for the same reason: resolving the embedded cluster's DSN asks pg0
+# where its instances live, and that answer is read from ~/.pg0.
+Environment=HOME=@PG0_DIR@
 Environment=PYTHONDONTWRITEBYTECODE=1
 
 # One slot only. Native reservations are floors, not ceilings, so a default

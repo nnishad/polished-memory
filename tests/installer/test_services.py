@@ -192,14 +192,20 @@ def test_the_backend_is_told_where_its_own_database_lives(instance):
     """An unstated pg0 location means whichever old database is already there.
 
     §10.5: the backend gets a data location of its own, and the worker reads the same
-    one rather than starting a second embedded instance somewhere in the account.
+    one rather than starting a second embedded instance somewhere in the account. The
+    engine's own cluster directory is not configurable — pg0 takes it as a flag the
+    engine never passes and otherwise writes `~/.pg0` — so what the unit can do is give
+    the process a home inside the installation, which is also the only place its
+    read-only-`ProtectHome` sandbox is allowed to write.
     """
     _, settings = instance
     rendered = render(settings, environ=environment())
     for name in (BACKEND_UNIT, WORKER_UNIT):
-        assert f"Environment=PG0_HOME={settings.home / 'pg0'}" in rendered[name]
+        pg0 = str(settings.home / "pg0")
+        assert f"Environment=HOME={pg0}" in rendered[name], name
         assert "ReadWritePaths=" in rendered[name]
-        assert str(settings.home / "pg0") in rendered[name].split("ReadWritePaths=")[1]
+        assert pg0 in rendered[name].split("ReadWritePaths=")[1]
+        assert pg0.startswith(str(settings.home)), "the cluster stays inside the installation"
 
 
 FORGED = [("ReadWritePaths=@INSTANCE_HOME@", "ReadWritePaths=/home/other/.hermes"),

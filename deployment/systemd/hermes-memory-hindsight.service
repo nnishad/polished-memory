@@ -33,8 +33,12 @@ ProtectHome=read-only
 # second instance.
 ReadWritePaths=@HINDSIGHT_DATA_DIR@ @PG0_DIR@
 EnvironmentFile=@HINDSIGHT_ENV@
-# A dedicated data location, never an implicitly selected ~/.pg0/instances.
-Environment=PG0_HOME=@PG0_DIR@
+# pg0 keeps its cluster under ~/.pg0/instances/<name>/data and takes a different place
+# only as a command-line flag the engine never passes, so the process is given a HOME
+# inside this installation's own tree. Without it the cluster lands in the owner's real
+# home, which `ProtectHome=read-only` correctly refuses - a startup failure that reads
+# as a broken disk rather than as the layout decision it is.
+Environment=HOME=@PG0_DIR@
 Environment=HF_HOME=@INSTANCE_HOME@/cache/huggingface
 Environment=TOKENIZERS_PARALLELISM=false
 Environment=PYTHONDONTWRITEBYTECODE=1
