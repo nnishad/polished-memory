@@ -693,3 +693,71 @@ def test_an_already_selected_provider_says_so_instead_of_taking_another_snapshot
     assert sorted(path.name for path in settings.home.glob("config.yaml.before-*")) == before
     assert (settings.home / "provider-selection.json").read_text(
         encoding="utf-8").count("pg0-memory") == 1, "the prior is recorded once"
+
+
+# -- whose interpreter is asked -----------------------------------------------
+
+def a_worker_interpreter(release, *, imports, exit_code=0):
+    """The engine's venv as a staged release carries it: an interpreter that answers a probe.
+
+    The probe is a subprocess by design — the question is about the interpreter the worker
+    unit starts, not about the process doing the installing — so the stand-in has to be a
+    program that really runs.
+    """
+    python = release / "hindsight" / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nprintf '%s' '" + json.dumps(imports) + f"'\nexit {exit_code}\n",
+                      encoding="utf-8")
+    python.chmod(0o755)
+    return python
+
+
+def staged_backend(installation, *, imports, exit_code=0, interpreter=True):
+    """An installation with a backend route, and a worker environment shaped as asked for."""
+    settings, environ = installation
+    home = Path(settings.home)
+    release = Path(environ["HERMES_MEMORY_RELEASE"])
+    # Naming a backend route is what makes the other two units exist, so the executables
+    # they start have to be there for the stage step to be about the probe rather than about
+    # a missing binary.
+    (release / "hindsight" / "bin").mkdir(parents=True, exist_ok=True)
+    (release / "hindsight" / "bin" / "hindsight-api").write_text("#!/bin/sh\n", encoding="utf-8")
+    env_file = home / "hermes-memory.env"
+    env_file.write_text(env_file.read_text(encoding="utf-8")
+                        + "\nHERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8888\n"
+                          "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS=127.0.0.1\n",
+                        encoding="utf-8")
+    if interpreter:
+        a_worker_interpreter(release, imports=imports, exit_code=exit_code)
+    proposal = plan(load_settings(), hermes_home=home, environ=environ)
+    # Only the stage step's blockers: a pytest temporary path contains the word "worker",
+    # and a filter that matches prose in someone else's sentence proves nothing.
+    return [line for line in proposal["blocked"] if line.startswith("stage:")]
+
+
+def test_a_gate_that_imports_nothing_from_the_engine_is_a_correct_installation(installation):
+    """The bug this replaces blocked a staged release for having its environments separate.
+
+    The framework's bridge is HTTP: no package from the backend is importable in the gate's
+    own venv, and that is the design rather than a degraded form of it.
+    """
+    assert staged_backend(installation, imports={"hindsight_api": True,
+                                                 "hermes_memory": True}) == []
+
+
+def test_a_release_with_no_worker_environment_says_which_interpreter_is_missing(installation):
+    blockers = staged_backend(installation, imports={}, interpreter=False)
+    assert any("hindsight/bin/python" in line for line in blockers), blockers
+
+
+def test_an_engine_absent_from_the_worker_environment_is_named_not_guessed(installation):
+    blockers = staged_backend(installation, imports={"hindsight_api": False,
+                                                     "hermes_memory": True})
+    assert any("hindsight_api" in line for line in blockers), blockers
+
+
+def test_a_worker_interpreter_that_cannot_run_is_reported_as_one_that_cannot_run(installation):
+    blockers = staged_backend(installation, imports={"hindsight_api": True,
+                                                     "hermes_memory": True}, exit_code=3)
+    assert any("not importable" in line or "could not run" in line
+               for line in blockers), blockers

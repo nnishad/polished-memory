@@ -32,9 +32,10 @@ def _configuration(settings) -> dict[str, Any]:
         "background_budget_tokens": settings.background_budget_tokens,
         "foreground_deadline_s": settings.foreground_deadline_s,
         "owner_principal": settings.owner_principal or "unset",
-        # An absent backend package means degraded capture and lexical recall, and is
-        # never a reason for the framework to refuse to start.
-        "hindsight_client_importable": find_spec("hindsight_client") is not None,
+        # Deliberately no "is the engine's SDK importable here": this framework's bridge is
+        # HTTP and imports nothing from the backend, so that fact said nothing about whether
+        # capture or recall were degraded, and a missing package in the gate's own venv is a
+        # correct installation rather than a diminished one.
     }
 
 

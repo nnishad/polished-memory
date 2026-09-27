@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass
 from importlib import util as _import_util
 from pathlib import Path
@@ -233,20 +234,58 @@ def _stage(ctx: Context, *, apply: bool) -> dict[str, Any]:
         wanted = []
         blocking.append(str(error))
     missing = [str(path) for path in wanted if not path.is_file()]
-    importable = {"hermes_memory": _import_util.find_spec("hermes_memory") is not None,
-                  "hindsight_client": _import_util.find_spec("hindsight_client") is not None}
+    importable = {"hermes_memory": _import_util.find_spec("hermes_memory") is not None}
+    engine = _engine_probe(release) if backend_configured else None
     actions = [f"release {release}: " + ", ".join(
         f"{name} {'importable' if found else 'absent'}"
         for name, found in sorted(importable.items())),
         "units would start: " + (", ".join(str(path) for path in wanted) or "nothing rendered")]
     blocking += [f"{path} is not staged; unpack the pinned release there or point "
                  "HERMES_MEMORY_RELEASE at it" for path in missing]
-    if backend_configured and not importable["hindsight_client"]:
-        blocking.append("a backend route is configured and hindsight_client is not "
-                        "importable; install the backend extra rather than the metapackage")
+    if engine is not None:
+        actions.append(f"worker environment: {engine['detail']}")
+        if not engine["ready"]:
+            blocking.append(f"a backend route is configured and the worker's environment "
+                            f"cannot run it: {engine['detail']}")
     return {"actions": actions, "blocking": blocking,
             "inputs": {"release": str(release), "missing": missing,
-                       "importable": importable, "backend": backend_configured}}
+                       "importable": importable, "backend": backend_configured,
+                       "engine": engine}}
+
+
+def _engine_probe(release: Path) -> dict[str, Any]:
+    """Ask the interpreter the worker unit starts what it can actually import.
+
+    The gate's own bridge is HTTP and needs no package from the engine, so the only backend
+    import that decides whether this installation can form anything is ``hindsight_api`` in
+    the *worker's* venv — and asking the process doing the installing instead reported the
+    gate's environment and blocked a correctly staged release whose two halves were exactly as
+    designed. That is a question about a different interpreter, so it is put to that
+    interpreter.
+    """
+    interpreter = release / "hindsight" / "bin" / "python"
+    if not interpreter.is_file():
+        return {"ready": False, "interpreter": str(interpreter),
+                "detail": f"{interpreter} is not there; the worker unit names it"}
+    script = ("import importlib.util as u, json;"
+              "print(json.dumps({n: u.find_spec(n) is not None"
+              " for n in ('hindsight_api', 'hermes_memory')}))")
+    try:
+        done = subprocess.run([str(interpreter), "-c", script], capture_output=True,
+                              text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"ready": False, "interpreter": str(interpreter),
+                "detail": f"the probe could not run: {str(error)[:160]}"}
+    try:
+        found = json.loads(done.stdout.strip() or "{}")
+    except ValueError:
+        found = {}
+    absent = [name for name in ("hindsight_api", "hermes_memory") if not found.get(name)]
+    detail = ("both importable" if not absent and done.returncode == 0 else
+              f"{', '.join(absent) or 'nothing'} not importable"
+              + (f": {(done.stderr or '').strip()[:160]}" if done.returncode else ""))
+    return {"ready": not absent and done.returncode == 0, "interpreter": str(interpreter),
+            "detail": detail}
 
 
 def _configure(ctx: Context, *, apply: bool) -> dict[str, Any]:
