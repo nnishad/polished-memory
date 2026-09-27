@@ -41,6 +41,8 @@ STEPS: tuple[str, ...] = ("inventory", "plan", "stage", "configure", "initialize
                           "canary", "finish")
 
 PLAN_VERSION = "setup-plan-v1"
+#: The key the host files its own registration record under.
+PLUGIN_KEY = "hermes-memory"
 INPUT_VERSION = "setup-step-v1"
 _HEX = re.compile(r"[0-9a-f]{40}")
 CANARY_SOURCE = "setup-canary"
@@ -379,9 +381,8 @@ def _initialize(ctx: Context, *, apply: bool) -> dict[str, Any]:
     if path.exists() and not apply:
         return {"actions": [f"{path} already exists and is left exactly as it is"],
                 "inputs": {"store": str(path)}}
-    if path.exists():
-        actions = [f"{path} already exists and is left exactly as it is"]
-    actions = [f"would create and migrate {path}"]
+    actions = ([f"{path} already exists and is left exactly as it is"] if path.exists()
+               else [f"would create and migrate {path}"])
     # The directories the backend unit binds have to exist before the manager can spawn it:
     # under `ProtectSystem=strict` a missing `ReadWritePaths` entry is a mount-namespace
     # failure at exec time, which is a very late way to report a missing mkdir. Created here
@@ -416,6 +417,23 @@ def _backend_directories(ctx: Context) -> list[Path]:
             Path(placed.instance_home) / "cache" / "huggingface"]
 
 
+def _registered_revision(hermes_home: Path) -> str | None:
+    """Which commit the host says it registered this plugin at, read from its own record.
+
+    Read rather than asked: an inventory of the installation must not run the host to find out
+    what the host wrote down, and the metadata file is the record the host itself uses.
+    """
+    record = Path(hermes_home) / "plugins" / ".install-metadata.json"
+    if not record.is_file():
+        return None
+    try:
+        recorded = json.loads(record.read_text(encoding="utf-8")).get(PLUGIN_KEY) or {}
+    except ValueError:
+        return None
+    revision = str(recorded.get("revision") or "").strip()
+    return revision or None
+
+
 def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
     """The host's own install path, with the reviewed commit pinned.
 
@@ -425,15 +443,29 @@ def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
     clothes.
     """
     commands = [argv for argv, name in host_commands(ctx) if name != "activate"]
-    actions = [" ".join(str(part) for part in argv) for argv in commands]
     release = _release_root(ctx)
+    registered = _registered_revision(ctx.hermes_home)
+    blocking: list[str] = []
+    if registered and registered == ctx.ref:
+        # The host already registers exactly this commit, so the transaction says so instead
+        # of running the command again — and it must, because `hermes plugins install` refuses
+        # a plugin that is already there, which made a second `setup` of an already-registered
+        # installation fail at the step that had nothing left to do. A resumed transaction has
+        # to be able to call a finished host action finished.
+        commands = []
+        actions = [f"the host already registers hermes-memory at {registered}; nothing repeated"]
+    else:
+        actions = [" ".join(str(part) for part in argv) for argv in commands]
     actions.append(f"plugin files at the release tree digest {_tree_digest(ctx)}")
-    blocking = []
+    if registered and registered != ctx.ref:
+        blocking.append(f"the host registers hermes-memory at {registered} and this release is "
+                        f"{ctx.ref}; replacing a registered plugin is the host's --force, and "
+                        "setup will not rewrite a host's mind on a reviewer's behalf")
     if not (ctx.ref and _HEX.fullmatch(ctx.ref)):
         blocking.append("--ref must be the 40-character commit this release was cut at; "
                         "setup will not install a moving pointer")
     registration = _registration_source()
-    if registration is None:
+    if commands and registration is None:
         blocking.append("the host installs a plugin only from a git repository, and no "
                         "checkout carrying integrations/hermes-memory is reachable from "
                         "here; run setup from the release's source checkout, or publish it "

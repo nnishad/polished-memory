@@ -459,6 +459,47 @@ def test_setup_over_an_installation_that_already_has_memory_leaves_it_alone(
     assert [row["source"] for row in rows] == ["gmail", transaction.CANARY_SOURCE]
 
 
+def test_a_restarted_installation_does_not_migrate_over_the_records_it_lost_the_receipt_of(
+        installation, tmp_path):
+    """The one window where `initialize` is applied to a store that already has memories.
+
+    A run that died after writing the archive and before recording its receipt comes back to
+    an existing file, and this step is what decides whether that means "leave it" or "start
+    over". Starting over is how an installation loses a person's memory on the second try, so
+    the claim has to be in the receipt this run writes, not only in the plan it was approved
+    from.
+    """
+    settings, environ = installation
+    home = activity(tmp_path)
+    runner = Heremes(home / "config.yaml")
+    approve(settings, home, environ, runner=runner, ref=REF)
+    with ProfileRegistry.open(settings) as ledger:
+        store_path = ledger.profile("work").db_path
+        with EvidenceStore(store_path) as store:
+            kept = store.commit({"source": "gmail", "source_id": "keep-me", "revision": "1",
+                                 "kind": "email",
+                                 "text": "A real message from before the crash.",
+                                 "observed_at": "2026-09-01T00:00:00+00:00",
+                                 "occurred_at": "2026-09-01T00:00:00+00:00",
+                                 "occurred_precision": "second", "metadata": {}})["id"]
+        # The crash: the store is on disk, its receipt is not.
+        ledger.db.execute("DELETE FROM setup_steps WHERE step='initialize'")
+        ledger.db.commit()
+
+    proposal = plan(settings, hermes_home=home, environ=environ, runner=runner, ref=REF)
+    entry = {item["step"]: item for item in proposal["steps"]}["initialize"]
+    assert entry["state"] == "pending"
+    assert any("left exactly as it is" in action for action in entry["actions"]), entry
+    run(settings, hermes_home=home, actor=OWNER, review=proposal["review_digest"],
+        environ=environ, runner=runner, ref=REF)
+    with ProfileRegistry.open(settings) as ledger:
+        recorded = json.loads(ledger.db.execute(
+            "SELECT actions FROM setup_steps WHERE step='initialize'").fetchone()[0])
+        with EvidenceStore(store_path) as store:
+            assert store.get(kept) is not None, "the rerun reset the archive"
+    assert any("left exactly as it is" in action for action in recorded), recorded
+
+
 def test_a_canary_that_cannot_be_found_is_a_failed_installation(installation, tmp_path,
                                                                 monkeypatch):
     """The canary is the proof, so a proof that cannot be read has to stop the run."""
@@ -799,3 +840,47 @@ def test_a_release_whose_plugin_disagrees_with_the_checkout_is_not_registered(in
                     ref="0" * 40)
     assert any("does not match the one this release carries" in line
                for line in proposal["blocked"]), proposal["blocked"]
+
+
+# -- a host action that already happened --------------------------------------
+
+def registered_host(tmp_path, revision):
+    """A Hermes home whose own record says the plugin is already installed at `revision`."""
+    home = tmp_path / "homes" / "registered"
+    (home / "plugins").mkdir(parents=True)
+    (home / "plugins" / ".install-metadata.json").write_text(json.dumps({
+        "hermes-memory": {"pinned": True, "revision": revision,
+                          "source": "file:///somewhere#integrations/hermes-memory"}}),
+        encoding="utf-8")
+    (home / "config.yaml").write_text("model:\n  provider: openai\n  model: m\n",
+                                      encoding="utf-8")
+    return home
+
+
+def test_a_registration_that_already_happened_is_not_happening_again(installation):
+    """`hermes plugins install` refuses a plugin that is there, so a re-run used to fail."""
+    settings, environ = installation
+    revision = "b" * 40
+    activity = registered_host(Path(settings.home).parent, revision)
+    runner = Heremes(activity / "config.yaml")
+
+    proposal = plan(settings, hermes_home=activity, environ=environ, ref=revision,
+                    runner=runner)
+    # Other steps still have their ordering to work through; what must be silent here is the
+    # one that would re-run a host action the host has already recorded.
+    assert not any(line.startswith("register-plugin:") for line in proposal["blocked"]), \
+        proposal["blocked"]
+    run(settings, hermes_home=activity, actor=OWNER, review=proposal["review_digest"],
+        environ=environ, ref=revision, runner=runner)
+    assert not any(call[1:3] == ["plugins", "install"] for call in runner.calls), runner.calls
+    assert any(call[1:3] == ["config", "set"] for call in runner.calls), \
+        "activating the provider is still this transaction's to do"
+
+
+def test_a_host_holding_a_different_commit_is_told_so_rather_than_overwritten(installation):
+    settings, environ = installation
+    activity = registered_host(Path(settings.home).parent, "c" * 40)
+    proposal = plan(settings, hermes_home=activity, environ=environ, ref="d" * 40,
+                    runner=lambda argv: (0, ""))
+    assert any("registers hermes-memory at " in line for line in proposal["blocked"]), \
+        proposal["blocked"]
