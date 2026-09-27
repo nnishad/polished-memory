@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from types import SimpleNamespace
 
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 
 from hermes_memory.cli import main
 from hermes_memory.config import load_settings
+from hermes_memory.install.release import carry
 from hermes_memory.install.profiles import InstallationError, ProfileRegistry
 from hermes_memory.knowledge.assertions import AssertionStore
 from hermes_memory.backend.document_map import DocumentMap
@@ -1065,6 +1067,8 @@ def staged(home, tmp_path, monkeypatch):
     release = home / "runtime" / "current"
     (release / "bin").mkdir(parents=True)
     (release / "bin" / "hermes-memory").write_text("#!/bin/sh\n", encoding="utf-8")
+    carry(source=Path(__file__).resolve().parents[2], into=release,
+          names=("integrations",))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     activity = tmp_path / "homes" / "work"
     activity.mkdir(parents=True)
@@ -1537,6 +1541,9 @@ def test_an_upgrade_with_no_target_named_is_a_hop_not_a_switch(home, service_hom
 
 def test_a_release_tree_missing_its_plugin_is_only_half_an_upgrade(home, staged):
     activity, _ = staged
+    # The fixture stages a whole release, so take the half away to state the case: a tree
+    # whose runtime is there and whose plugin is not must not be offered as an upgrade.
+    shutil.rmtree(home / "runtime" / "current" / "integrations")
     _code, report = run("upgrade", "--version", str(home / "runtime" / "current"),
                         "--hermes-home", str(activity))
     assert any("plugin" in line for line in report["blocking"])

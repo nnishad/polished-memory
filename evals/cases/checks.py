@@ -26,6 +26,7 @@ from typing import Any, Callable
 from hermes_memory.ids import record_id
 from hermes_memory.proactive.policy import POLICY_VERSION
 from hermes_memory.storage.evidence import EvidenceStore, prepare_envelope
+from hermes_memory.install.release import carry
 from hermes_memory.storage.lineage import Lineage
 
 import corpus
@@ -1179,6 +1180,9 @@ def check_install(env: Environment) -> list[dict[str, Any]]:
     release = instance / "release"
     (release / "bin").mkdir(parents=True, exist_ok=True)
     (release / "bin" / "hermes-memory").write_text("#!/bin/sh\n", encoding="utf-8")
+    # A staged release carries its plugin beside its runtime, and `register-plugin` now checks
+    # the two halves against each other, so this is what `release` would have produced.
+    carry(source=Path(__file__).resolve().parents[2], into=release, names=("integrations",))
     (instance / "hermes-memory.env").write_text(
         f"HERMES_MEMORY_DATA_DIR={root / 'data'}\n"
         "HERMES_MEMORY_INFERENCE_ENABLED=false\n"

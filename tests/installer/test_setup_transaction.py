@@ -20,6 +20,7 @@ from hermes_memory.install.profiles import ProfileRegistry
 from hermes_memory.install.inventory import listening_ports
 from hermes_memory.install.services import unit_directory
 from hermes_memory.install.setup import STEPS, SetupError, plan, profile_name, run
+from hermes_memory.install.release import carry
 from hermes_memory.storage.evidence import EvidenceStore
 
 OWNER = "jugaadu"
@@ -34,11 +35,7 @@ def host(home, **extra):
     # A staged release carries its plugin beside its runtime — `release` refuses to stage one
     # that does not — and `register-plugin` now checks the two halves of the contract against
     # each other, so the fixture has to be the tree the door would actually have produced.
-    carried = release / "integrations" / "hermes-memory"
-    carried.mkdir(parents=True)
-    for source in sorted((Path(__file__).resolve().parents[2]
-                          / "integrations" / "hermes-memory").glob("*.py")):
-        (carried / source.name).write_text(source.read_text(encoding="utf-8"))
+    carry(source=Path(__file__).resolve().parents[2], into=release, names=("integrations",))
     lines = [f"HERMES_MEMORY_DATA_DIR={home / 'data'}",
              "HERMES_MEMORY_INFERENCE_ENABLED=false",
              f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}"]

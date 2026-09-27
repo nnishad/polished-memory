@@ -40,8 +40,8 @@ from ..ids import content_digest, digest
 from .compatibility import source_checkout
 from .services import executables, render
 
-__all__ = ["ReleaseError", "plan", "apply", "verify", "BACKEND_SPEC", "MANIFEST",
-           "CARRIED", "release_root"]
+__all__ = ["ReleaseError", "plan", "apply", "verify", "carry", "BACKEND_SPEC",
+           "MANIFEST", "CARRIED", "release_root"]
 
 #: The backend this build is written against, as one spec string.
 BACKEND_SPEC = f"hindsight-api-slim[embedded-db]=={PINNED_VERSION}"
@@ -180,9 +180,7 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
         for environment in environments:
             _run(run, ["uv", "pip", "install", "--python", str(_python(environment)),
                        "--quiet", str(distribution)], stage="hermes-memory")
-        for name in staged["carried"]:
-            shutil.copytree(root / name, target / name, ignore=shutil.ignore_patterns(
-                "__pycache__", "*.pyc"), dirs_exist_ok=True)
+        carry(source=root, into=target, names=tuple(staged["carried"]))
         manifest = {**{key: staged[key] for key in
                        ("into", "source", "wheel", "backend", "review_digest")},
                     "backend_spec": BACKEND_SPEC if backend else None,
@@ -236,6 +234,24 @@ def verify(*, settings, into: Path | str,
             "plugin_digest": digest([[p.name, content_digest(p.read_bytes())] for p in plugin])
             if plugin else None,
             "missing": missing}
+
+
+def carry(*, source: Path, into: Path, names: tuple[str, ...] = CARRIED) -> list[str]:
+    """Copy the halves of a checkout that a release has to carry beside its runtime.
+
+    One implementation, because a staged tree that carries one half and not the other is the
+    exact drift the compatibility manifest and `register-plugin` exist to catch.
+    """
+    copied: list[str] = []
+    for name in names:
+        origin = Path(source) / name
+        if not origin.is_dir():
+            continue
+        shutil.copytree(origin, Path(into) / name,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                        dirs_exist_ok=True)
+        copied.append(name)
+    return copied
 
 
 def _version() -> str | None:
