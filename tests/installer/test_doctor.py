@@ -682,9 +682,11 @@ def _waiting(store, *, fire_at="2026-09-15T09:00:00+00:00"):
            state="pending", created_at=fire_at)
 
 
-def _heartbeat(store, *, at="2026-09-15T09:00:00+00:00", created_at=None):
+def _heartbeat(store, *, at="2026-09-15T09:00:00+00:00", created_at=None, **metadata):
+    columns = {"at": at}
+    columns.update(metadata)
     insert(store, "audit", action="maintenance_pass", object_id="maintenance",
-           created_at=created_at or at, metadata=json.dumps({"at": at}))
+           created_at=created_at or at, metadata=json.dumps(columns))
 
 
 def looped_settings(interval):
@@ -711,6 +713,25 @@ def test_a_dead_scheduler_with_a_reminder_waiting_is_a_warning_with_a_remedy(sto
     assert "1 reminder(s) are due" in finding.detail
     assert "hermes-memory maintain" in finding.remedy
     assert finding.evidence["waiting"] == 1 and finding.evidence["behind"] is True
+
+
+def test_a_scheduler_that_runs_but_cannot_finish_a_pass_is_a_failure_not_an_healthy_loop(
+        store):
+    """The distinction this machine got wrong for hours: not "not running", but "raising".
+
+    A pass that breaks in one section stops there, so every section after it silently stops
+    happening while the loop keeps its period and nothing is recorded. The heartbeat now
+    carries where it broke, and the check says that instead of reporting an on-time pass.
+    """
+    from hermes_memory.ids import now
+
+    _heartbeat(store, created_at=now(), failed_section="queue",
+               error="OperationalError: attempt to write a readonly database")
+    finding = Doctor(store, settings=looped_settings(900)).background()
+    assert finding.severity == FAIL, finding.detail
+    assert "raised in section 'queue'" in finding.detail
+    assert "hermes-memory maintain" in finding.remedy
+    assert finding.evidence["failed_section"] == "queue"
 
 
 def test_a_pass_that_recorded_its_own_run_stops_the_alarm(store):

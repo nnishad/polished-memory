@@ -250,6 +250,14 @@ class Doctor:
                            "start the runtime unit, or set "
                            "HERMES_MEMORY_MAINTENANCE_INTERVAL_S to how often it should "
                            "look; `hermes-memory maintain` is the pass itself", report)
+        if report["failed_section"]:
+            return Finding("background", FAIL,
+                           f"the background pass raised in section "
+                           f"{report['failed_section']!r}: {report['error']}",
+                           "the loop is running but the pass never finishes, so every "
+                           "section after it is not happening on any period — reproduce it "
+                           "with `hermes-memory maintain`, which raises the same error in "
+                           "your own terminal", report)
         if report["behind"] and report["waiting"]:
             return Finding("background", WARN,
                            f"{report['waiting']} reminder(s) are due and {report['note']}",

@@ -562,14 +562,19 @@ class StatusReporter:
         # loop that is not running.
         behind = age is not None and interval and age > interval * 3
         never = last is None and interval > 0
+        failed = last.get("failed_section") if last else None
         return {"scheduled": interval > 0, "interval_seconds": interval,
                 "last_pass_at": None if last is None else last["created_at"],
                 "seconds_since_last_pass": None if age is None else round(age, 1),
                 "last_report": None if last is None else {
                     key: value for key, value in last.items() if key != "created_at"},
-                "waiting": waiting, "behind": bool(behind or never),
+                "failed_section": failed,
+                "error": last.get("error") if failed else None,
+                "waiting": waiting, "behind": bool(behind or never or failed),
                 "note": ("nothing is scheduled to run by itself; `hermes-memory maintain` "
                          "is the pass, and the owner decides when" if interval <= 0 else
+                         f"the last pass raised in section {failed!r}: {last['error']}; the "
+                         "scheduler is running but the pass is not finishing" if failed else
                          "no pass has been recorded since this installation started"
                          if never else
                          "the last pass is older than three periods, so the runtime unit's "

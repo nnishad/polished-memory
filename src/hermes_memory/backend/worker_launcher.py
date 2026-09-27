@@ -15,6 +15,12 @@ is stated plainly: the fake proves *our* shape, and only the version contract be
 that the real thing still has it. An unverified revision refuses to start rather than
 guessing at a construction that would fail mid-request.
 
+An operator's hold on inference is waited out rather than treated as a startup failure.
+§10.5 keeps a pause durable across a restart on purpose, so a worker that exited whenever
+the models were stopped would be restarted into the same exit until its start limit
+silenced the unit — and the operations it exists to drain would stay pending after the
+hold lifted, with nothing left to run them.
+
 The resolved database DSN is never printed. It carries credentials, and a worker that logs
 its own connection string leaks the whole machine's memory into a journal.
 """
@@ -32,8 +38,9 @@ from ..processing.instance_gate import GateStore, gate_path
 from ..processing.routes import build_routes
 from .capabilities import PINNED_VERSION
 
-__all__ = ["LAUNCHER_VERSION", "REQUIRED_IMPORTS", "LauncherRefused", "version_contract",
-           "slot_contract", "OperationLedger", "attribute_tasks", "compose", "check", "main"]
+__all__ = ["LAUNCHER_VERSION", "REQUIRED_IMPORTS", "HOLD_POLL_SECONDS", "LauncherRefused",
+           "version_contract", "slot_contract", "inference_hold", "wait_for_inference",
+           "bring_up", "OperationLedger", "attribute_tasks", "compose", "check", "main"]
 
 LAUNCHER_VERSION = "worker-launcher-v1"
 
@@ -63,9 +70,109 @@ TERMINAL = frozenset({"finished", "cancelled", "refused"})
 # and never answered.
 CANCELLATION_OWED = "cancellation='requested'"
 
+# How often a worker that is waiting out an operator hold looks again. It spends nothing
+# while it waits, so the only cost of asking often is a wakeup.
+HOLD_POLL_SECONDS = 15.0
+
+# The hold is one row in the admission ledger, for the whole machine.
+INFERENCE_STAGE = ("global", "inference")
+
 
 class LauncherRefused(Exception):
     """The composition this launcher would perform is not safe to perform."""
+
+
+def _announce(payload: dict[str, Any]) -> None:
+    """One journal line about what this process is doing and why.
+
+    A worker that goes quiet for an hour looks dead to whoever runs ``status``, and the
+    honest answer — "I am waiting because you told me to" — has to be in the journal or it
+    is not an answer at all.
+    """
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+# -- the operator's hold ------------------------------------------------------
+
+def inference_hold(store) -> dict[str, Any] | None:
+    """What the owner wrote down about this machine's models, or None when nothing is held.
+
+    Read from the admission ledger rather than asked across the gate's HTTP port: the
+    worker already has that ledger open, and whether the owner said "stop" is answered by
+    the row the owner wrote, not by a dispatch that would itself be refused. One query
+    decides it, because a reading that asked two questions of the same row would have to
+    decide what to do when they disagreed.
+    """
+    control = store.control(*INFERENCE_STAGE)
+    if not control or control.get("state") != "paused":
+        return None
+    return control
+
+
+async def wait_for_inference(store, *, sleep: Callable[[float], Any],
+                             poll_s: float = HOLD_POLL_SECONDS,
+                             announce: Callable[[dict], Any] = _announce) -> float:
+    """Sleep while inference is held, saying so once on each side of the wait.
+
+    Returns the seconds waited. This is the difference between a worker the owner stopped
+    and a worker that crashed: both leave operations pending, but only the second one
+    leaves an exit status, and a manager that restarts on failure will eventually refuse to
+    start the process again over a hold that is still in force.
+    """
+    held = inference_hold(store)
+    if held is None:
+        return 0.0
+    announce({"worker": "waiting", "reason": "inference is paused by the operator",
+              "actor": held.get("actor"), "since": held.get("changed_at"),
+              "poll_seconds": poll_s})
+    waited = 0.0
+    while inference_hold(store) is not None:
+        await sleep(poll_s)
+        waited += poll_s
+    announce({"worker": "resumed", "waited_seconds": round(waited, 1)})
+    return waited
+
+
+async def bring_up(build: Callable[[], Mapping[str, Any]], store, *,
+                   sleep: Callable[[float], Any],
+                   poll_s: float = HOLD_POLL_SECONDS,
+                   announce: Callable[[dict], Any] = _announce) -> dict[str, Any]:
+    """Build and initialize the engine, but never against a hold and never fatally because of one.
+
+    The engine's own startup probe asks for a single embedding, and while inference is held
+    the gate answers 503. That is an operator's decision rather than a broken environment,
+    so the wait happens first and an attempt that raced a hold arriving mid-startup is torn
+    down and retried with a *fresh* engine — the half-initialized one has already opened
+    whatever its failing task managed to open, and asking it to initialize twice is not a
+    thing this launcher is willing to assume is safe.
+
+    Any other startup failure propagates untouched: a real misconfiguration still exits.
+    """
+    while True:
+        await wait_for_inference(store, sleep=sleep, poll_s=poll_s, announce=announce)
+        built = build()
+        try:
+            await built["memory"].initialize()
+        except Exception as error:
+            if inference_hold(store) is None:
+                raise
+            await _discard(built["memory"], error=error, announce=announce)
+            continue
+        return dict(built)
+
+
+async def _discard(memory: Any, *, error: BaseException,
+                   announce: Callable[[dict], Any]) -> None:
+    """Tear down an engine a hold stopped half-started. Its shutdown gets no veto."""
+    announcement = {"worker": "held during startup", "attempt": 1,
+                    "error": f"{type(error).__name__}: {str(error)[:200]}",
+                    "next": "waiting for the hold to lift, then building a fresh engine"}
+    try:
+        await memory.shutdown()
+    except Exception as shutdown_error:
+        announcement["shutdown_error"] = (
+            f"{type(shutdown_error).__name__}: {str(shutdown_error)[:200]}")
+    announce(announcement)
 
 
 # -- the two contracts -------------------------------------------------------
@@ -484,24 +591,31 @@ def _launch(settings, *, modules: Mapping[str, Any], config: Any,
 
     with GateStore(gate_path(settings)) as ledger_store:
         ledger = OperationLedger(ledger_store)
-        built = compose(
-            modules={"MemoryEngine": modules["hindsight_api"].MemoryEngine,
-                     "WorkerTaskBackend":
-                         modules["hindsight_api.engine.task_backend"].WorkerTaskBackend,
-                     "WorkerPoller": modules["hindsight_api.worker.poller"].WorkerPoller,
-                     "config": modules["hindsight_api.config"]},
-            config=config, worker_id=worker_id, ledger=ledger,
-            routes=_routes(settings))
-        memory = built["memory"]
-        if not getattr(memory._backend, "supports_worker_poller", False):
-            # The pinned main exits here rather than running operations inline in a
-            # process that was not asked to run them.
-            raise LauncherRefused("this database backend has no worker poller; the API "
-                                  "process runs operations itself")
-        poller = built["poller_factory"](**built["poller_arguments"])
+
+        def build() -> dict[str, Any]:
+            built = compose(
+                modules={"MemoryEngine": modules["hindsight_api"].MemoryEngine,
+                         "WorkerTaskBackend":
+                             modules["hindsight_api.engine.task_backend"].WorkerTaskBackend,
+                         "WorkerPoller": modules["hindsight_api.worker.poller"].WorkerPoller,
+                         "config": modules["hindsight_api.config"]},
+                config=config, worker_id=worker_id, ledger=ledger,
+                routes=_routes(settings))
+            if not getattr(built["memory"]._backend, "supports_worker_poller", False):
+                # The pinned main exits here rather than running operations inline in a
+                # process that was not asked to run them.
+                raise LauncherRefused("this database backend has no worker poller; the API "
+                                      "process runs operations itself")
+            return dict(built)
 
         async def run() -> None:
-            await memory.initialize()
+            # The hold is asked of the ledger before the engine is asked for anything: an
+            # installation whose owner stopped the models has a queue nobody may drain, and
+            # a worker that exited over that would be restarted into the same exit until its
+            # start limit silenced the unit for the rest of the hold.
+            built = await bring_up(build, ledger_store, sleep=asyncio.sleep)
+            memory = built["memory"]
+            poller = built["poller_factory"](**built["poller_arguments"])
             try:
                 await poller.run()
             finally:

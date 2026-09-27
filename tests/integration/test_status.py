@@ -890,6 +890,23 @@ def test_a_pass_that_has_never_been_recorded_while_reminders_wait_is_behind(stor
     assert "no pass has been recorded" in report["note"]
 
 
+def test_a_heartbeat_that_records_a_failure_is_not_reported_as_a_healthy_period(store):
+    """A loop that raises every period still writes a heartbeat, at the moment it broke.
+
+    Age alone would call that on schedule, so the reading carries the section and the error:
+    "the scheduler is running but the pass is not finishing" is a different finding from
+    "the scheduler is not running", and the two had the same report.
+    """
+    a_heartbeat(store, failed_section="queue",
+                error="OperationalError: attempt to write a readonly database")
+    report = StatusReporter(store,
+                            settings=settings(maintenance_interval_s=900)).background_pass()
+    assert report["failed_section"] == "queue"
+    assert "readonly" in report["error"] and report["behind"] is True
+    assert "raised in section" in report["note"] and "not finishing" in report["note"]
+    assert report["last_report"]["failed_section"] == "queue"
+
+
 def test_a_recent_heartbeat_stops_the_alarm_and_says_what_it_did(store):
     a_goal(store)
     a_due_event(store, fire_at=PAST)

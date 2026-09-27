@@ -92,7 +92,19 @@ class Maintenance:
                                   "inference_paused": bool(self.gate is not None
                                                            and self.gate.paused)}
         for name in wanted:
-            report[name] = getattr(self, f"_{name}")(moment=moment, limit=_bounded(limit))
+            try:
+                report[name] = getattr(self, f"_{name}")(moment=moment,
+                                                         limit=_bounded(limit))
+            except Exception as error:
+                # The sections run in order, so a raise halfway through means this pass would
+                # record nothing at all — and a scheduler that is alive but failing every
+                # period would report exactly like one that stopped. Name what broke, then let
+                # it propagate: the caller still gets the exception, and the next healthy pass
+                # writes a better line over it.
+                report["failed_section"] = name
+                report["error"] = f"{type(error).__name__}: {str(error)[:200]}"
+                self._heartbeat(report)
+                raise
         # The pass writes down that it happened. `status` and `doctor` run in other
         # processes, so the loop's own thread cannot be their evidence: without this line
         # an installation whose scheduler died would report exactly what one that is
@@ -103,12 +115,18 @@ class Maintenance:
     def _heartbeat(self, report: dict[str, Any]) -> None:
         proactive = report.get("proactive") or {}
         summaries = report.get("summaries") or {}
-        self.store._audit("maintenance_pass", "maintenance", {
-            "at": report["at"], "sections": report["sections"],
-            "prepared": proactive.get("prepared"), "deferred": proactive.get("deferred"),
-            "suppressed": proactive.get("suppressed"),
-            "refreshes_promised": summaries.get("promised"),
-            "inference_paused": report["inference_paused"]})
+        line = {"at": report["at"], "sections": report["sections"],
+                "prepared": proactive.get("prepared"), "deferred": proactive.get("deferred"),
+                "suppressed": proactive.get("suppressed"),
+                "refreshes_promised": summaries.get("promised"),
+                "inference_paused": report["inference_paused"]}
+        if "failed_section" in report:
+            # Absent on a pass that ran to the end. Recorded on one that did not, because
+            # a failed pass and a skipped period otherwise look identical to every reading
+            # that exists to notice the difference.
+            line["failed_section"] = report["failed_section"]
+            line["error"] = report["error"]
+        self.store._audit("maintenance_pass", "maintenance", line)
 
     @classmethod
     def last_pass(cls, store) -> dict[str, Any] | None:
@@ -283,14 +301,17 @@ class Ticker:
 def run(settings, *, limit: int = DEFAULT_LIMIT, at: str | None = None,
         sections: tuple[str, ...] = (), store: EvidenceStore | None = None) -> dict[str, Any]:
     """The door: one pass over the installation this settings object names."""
-    from ..processing.instance_gate import status_gate
+    from ..processing.instance_gate import writable_gate
     from ..sources.sync import SyncController
 
     if not store and not settings.db_path.exists():
         return {"ok": False, "refused": f"no canonical store at {settings.db_path}; run "
                                         "`hermes-memory init` or `hermes-memory setup` first"}
     opened = store or EvidenceStore(settings.db_path)
-    gate = status_gate(settings)
+    # Not ``status_gate``: this pass reaps expired leases, which is a write to the
+    # admission ledger, and a read-only connection would raise partway through — losing
+    # the heartbeat and making a live-but-failing scheduler look dead.
+    gate = writable_gate(settings)
     try:
         report = Maintenance(opened, owner_principal=settings.owner_principal,
                              sync=SyncController(opened), gate=gate).pass_now(

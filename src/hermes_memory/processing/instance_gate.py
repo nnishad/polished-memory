@@ -29,7 +29,7 @@ from ..storage.migrations import (BUDGET_STATEMENTS, CONTROLS_STATEMENTS,
 from .resource_gate import ResourceGate
 
 __all__ = ["GATE_FILENAME", "GATE_SCHEMA_VERSION", "SCHEMA_STEPS", "GateStore", "GateError",
-           "gate_path", "instance_gate", "status_gate"]
+           "gate_path", "instance_gate", "status_gate", "writable_gate"]
 
 GATE_FILENAME = "gate.db"
 # The whole of it: reservations, their accounting, the measured consumption the gate
@@ -175,6 +175,25 @@ def status_gate(settings) -> ResourceGate | None:
         return instance_gate(settings, create=False)
     except GateError:
         return None
+
+
+def writable_gate(settings, *, default_ttl: float = 300.0) -> ResourceGate | None:
+    """The gate for a caller that has to change admission state, or None if there is no ledger.
+
+    The mode cannot be an afterthought of ``create``: a reading that must not invent a file
+    needs a connection that refuses writes, and a pass that reaps expired leases needs one
+    that allows them. Asking a read-only gate to reap raises ``attempt to write a readonly
+    database`` in the middle of the pass, so the run never records its heartbeat and a
+    scheduler that is alive but failing reports exactly like one that stopped.
+
+    ``None`` when no ledger exists yet is the same answer :func:`status_gate` gives: nothing
+    has been queued from here, so there is no lease to reap, and a background pass has no
+    business creating the file.
+    """
+    path = gate_path(settings)
+    if not path.is_file():
+        return None
+    return ResourceGate(GateStore(path), default_ttl=default_ttl)
 
 
 _CREATED = re.compile(r"^\s*CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?"

@@ -10,6 +10,7 @@ slot, no attempt from a job's budget — because that is what makes it safe to r
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 import time
 
 import pytest
@@ -571,7 +572,123 @@ def test_the_door_runs_the_pass_over_the_installation_it_names(tmp_path):
     assert run(settings, at=MORNING, sections=("queue",))["sections"] == ["queue"]
 
 
+# -- the ledger the pass writes to ----------------------------------------------
+
+def an_expired_lease(settings, *, resource="local-gpu"):
+    """One reservation in the instance admission ledger whose holder stopped answering."""
+    from hermes_memory.processing.instance_gate import GateStore, gate_path
+
+    clock = {"now": 1000.0}
+    store = GateStore(gate_path(settings))
+    gate = ResourceGate(store, clock=lambda: clock["now"], default_ttl=30.0)
+    held = gate.try_acquire(route="retain", holder="worker-that-died", resource=resource,
+                            priority=2)
+    clock["now"] = 2000.0
+    store.close()
+    return held
+
+
+def a_ledger_state(settings, reservation_id):
+    from hermes_memory.processing.instance_gate import GateStore, gate_path
+
+    store = GateStore(gate_path(settings), create=False)
+    try:
+        return [row[0] for row in store.db.execute(
+            "SELECT state FROM gate_reservations WHERE id=?", (reservation_id,))]
+    finally:
+        store.close()
+
+
+def test_the_door_reaps_against_a_ledger_it_is_allowed_to_write(tmp_path):
+    """A reaping is a write, so the pass cannot ask the reading connection to perform it.
+
+    The bug this pins: ``run()`` handed the pass ``status_gate`` — read-only, correctly,
+    because a reading must not invent a ledger — and the queue section reaps expired
+    leases. The raise landed after the identity section, so the scheduler kept ticking
+    while the pass stopped recording that it ran, and an expired lease kept its device
+    occupied for the rest of the installation's life.
+    """
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    settings = Settings(tmp_path)
+    with EvidenceStore(settings.db_path):
+        pass
+    held = an_expired_lease(settings)
+
+    report = run(settings, at=MORNING)
+    assert report["ok"] is True and report["queue"]["leases_uncertain"] == 1
+    assert a_ledger_state(settings, held.id) == [UNCERTAIN], \
+        "the lease was reaped in the file, not only in the report"
+
+
+def test_a_pass_invents_no_admission_ledger_to_reap_from(tmp_path):
+    """Nothing has been queued from a fresh installation, and that is the answer.
+
+    ``None`` from the ledger is not an error to work around: the pass runs, reports no
+    uncertain leases, and leaves no file behind — the same rule ``status`` follows, which
+    is why the writable form asks rather than creates.
+    """
+    from hermes_memory.processing.instance_gate import gate_path
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    settings = Settings(tmp_path)
+    with EvidenceStore(settings.db_path):
+        pass
+    report = run(settings, at=MORNING)
+    assert report["ok"] is True and report["queue"]["leases_uncertain"] == 0
+    assert not gate_path(settings).exists()
+
+
+def test_the_two_ledger_forms_differ_exactly_in_whether_they_can_write(tmp_path):
+    """``writable_gate`` and ``status_gate`` read one file; only one of them may change it.
+
+    The distinction is the mode of the connection, so a test that reached the pass through
+    the other form would not have caught what happened: the reading is correct for
+    ``status``, and wrong for a reaping.
+    """
+    from hermes_memory.processing.instance_gate import (GateStore, gate_path, status_gate,
+                                                        writable_gate)
+
+    settings = Settings(tmp_path)
+    with GateStore(gate_path(settings)):
+        pass
+
+    gate = writable_gate(settings)
+    gate.pause(actor=OWNER, reason="the models are stopped for the night")
+    reading = status_gate(settings)
+    assert reading.paused is True and gate.hold()["actor"] == OWNER
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        reading.pause(actor=OWNER, reason="a reading cannot hold the models")
+
+
 # -- the heartbeat -------------------------------------------------------------
+
+def test_a_pass_that_raised_records_where_it_broke_instead_of_recording_nothing(store, loop,
+                                                                               monkeypatch):
+    """A half-run pass and a skipped period have to be two different reports.
+
+    The sections run in order, so an exception anywhere after the first loses the
+    heartbeat the pass exists to write. Recording the failure is what turns "the scheduler
+    is not running" — the wrong conclusion this machine actually produced — into the right
+    one: it is running, and this section raises every period.
+    """
+    def broken(self, *, moment, limit):
+        raise RuntimeError("attempt to write a readonly database")
+
+    monkeypatch.setattr(Maintenance, "_queue", broken)
+    with pytest.raises(RuntimeError, match="readonly"):
+        loop().pass_now(at=MORNING)
+
+    last = Maintenance.last_pass(store)
+    assert last["failed_section"] == "queue"
+    assert "readonly database" in last["error"]
+    assert last["at"] == MORNING, "the sections that did run are still said to have run"
+
+    monkeypatch.undo()
+    loop().pass_now(at=LATER, sections=("queue",))
+    assert "failed_section" not in Maintenance.last_pass(store), \
+        "a healthy pass overwrites the failure rather than accumulating it"
+
 
 def test_the_pass_writes_down_that_it_ran(store, loop):
     """Status and doctor run in other processes; this line is their only evidence."""

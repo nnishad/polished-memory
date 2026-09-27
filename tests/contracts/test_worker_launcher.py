@@ -18,12 +18,14 @@ import sys
 
 import pytest
 
-from hermes_memory.backend.worker_launcher import (LAUNCHER_VERSION, OPERATION_KEY,
-                                                   RETRY_KEY, LauncherRefused,
-                                                   OperationLedger, attribute_tasks, check,
-                                                   compose, main, memory_arguments,
-                                                   poller_arguments, slot_contract,
-                                                   version_contract)
+from hermes_memory.backend.worker_launcher import (HOLD_POLL_SECONDS, LAUNCHER_VERSION,
+                                                   OPERATION_KEY, RETRY_KEY,
+                                                   LauncherRefused, OperationLedger,
+                                                   attribute_tasks, bring_up, check,
+                                                   compose, inference_hold, main,
+                                                   memory_arguments, poller_arguments,
+                                                   slot_contract, version_contract,
+                                                   wait_for_inference)
 from hermes_memory.config import load_settings
 from hermes_memory.processing.instance_gate import (GATE_SCHEMA_VERSION, GateStore,
                                                    gate_path)
@@ -461,19 +463,16 @@ def test_a_present_backend_missing_a_pinned_symbol_is_refused_by_name(monkeypatc
         worker_launcher._import_backend()
 
 
-def test_the_real_launch_path_composes_the_pinned_construction_end_to_end(tmp_path,
-                                                                         monkeypatch):
-    """``main([])`` with a backend present: engine built, poller started, our wrapper in it.
+def a_worker_installation(tmp_path, monkeypatch, *, engine=Engine, poller=Poller):
+    """An owned installation whose backend is a fake with the pinned keywords.
 
-    This is the only place the whole path is exercised, and it is the path the worker unit
-    runs, so the assertion that matters is that the executor the poller was handed is the
-    one that writes the ledger before the engine is asked for anything.
+    The env file is part of it because a worker that cannot place an operation on a route
+    refuses that operation, so an installation under test has to name its routes the way an
+    owned env file does.
     """
     from hermes_memory.backend import worker_launcher
 
     (tmp_path / "data").mkdir()
-    # A worker that cannot place an operation on a route refuses it, so this installation
-    # has to name the routes the way an owned env file would.
     (tmp_path / "hermes-memory.env").write_text(
         f"HERMES_MEMORY_DATA_DIR={tmp_path / 'data'}\n"
         "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
@@ -488,6 +487,48 @@ def test_the_real_launch_path_composes_the_pinned_construction_end_to_end(tmp_pa
         "HERMES_MEMORY_ROUTE_CREDENTIAL_REFLECT=cred-r\n"
         "HERMES_MEMORY_ROUTE_CREDENTIAL_FOREGROUND=cred-f\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_MEMORY_HOME", str(tmp_path))
+    config = Config()
+    modules = {
+        "hindsight_api": type("M", (), {"__version__": "0.10.1", "MemoryEngine": engine})(),
+        "hindsight_api.config": type("C", (), {
+            "get_config": staticmethod(lambda: config),
+            "DEFAULT_DATABASE_SCHEMA": "public",
+            "load_dotenv_for_entrypoint": staticmethod(lambda: None)})(),
+        "hindsight_api.engine.task_backend": type("T", (),
+                                                  {"WorkerTaskBackend": TaskBackend})(),
+        "hindsight_api.worker.poller": type("P", (), {"WorkerPoller": poller})(),
+    }
+    monkeypatch.setattr(worker_launcher, "_import_backend", lambda: modules)
+    return config
+
+
+def an_engine(cls=Engine):
+    """One fake ``MemoryEngine``, built the way the pinned launcher builds it."""
+    return cls(run_migrations=False, task_backend=None, tenant_extension=None,
+               operation_validator=None)
+
+
+def a_build(engines, *, first=None):
+    """A ``bring_up`` factory that records every engine it makes.
+
+    ``first`` is the class used for the first attempt only, so a test can have one startup
+    fail and the next behave.
+    """
+    def build():
+        engine = an_engine(first if (first and not engines) else Engine)
+        engines.append(engine)
+        return {"memory": engine, "poller_factory": Poller, "poller_arguments": {}}
+    return build
+
+
+def test_the_real_launch_path_composes_the_pinned_construction_end_to_end(tmp_path,
+                                                                         monkeypatch):
+    """``main([])`` with a backend present: engine built, poller started, our wrapper in it.
+
+    This is the only place the whole path is exercised, and it is the path the worker unit
+    runs, so the assertion that matters is that the executor the poller was handed is the
+    one that writes the ledger before the engine is asked for anything.
+    """
     built = {"engine": None, "poller": None}
 
     class RecordingEngine(Engine):
@@ -505,19 +546,8 @@ def test_the_real_launch_path_composes_the_pinned_construction_end_to_end(tmp_pa
             self.ran = True
             await self.arguments["executor"](TASK)
 
-    config = Config()
-    modules = {
-        "hindsight_api": type("M", (), {"__version__": "0.10.1",
-                                        "MemoryEngine": RecordingEngine})(),
-        "hindsight_api.config": type("C", (), {
-            "get_config": staticmethod(lambda: config),
-            "DEFAULT_DATABASE_SCHEMA": "public",
-            "load_dotenv_for_entrypoint": staticmethod(lambda: None)})(),
-        "hindsight_api.engine.task_backend": type("T", (),
-                                                  {"WorkerTaskBackend": TaskBackend})(),
-        "hindsight_api.worker.poller": type("P", (), {"WorkerPoller": RecordingPoller})(),
-    }
-    monkeypatch.setattr(worker_launcher, "_import_backend", lambda: modules)
+    a_worker_installation(tmp_path, monkeypatch, engine=RecordingEngine,
+                          poller=RecordingPoller)
     assert main([]) == 0
     assert built["poller"].arguments["max_slots"] == 1
     assert built["poller"].ran and built["engine"].initialized
@@ -530,11 +560,6 @@ def test_the_real_launch_path_composes_the_pinned_construction_end_to_end(tmp_pa
 def test_a_backend_without_a_worker_poller_refuses_rather_than_running_inline(
         tmp_path, monkeypatch, capsys):
     """The pinned main exits here; running operations in the API process is another thing."""
-    from hermes_memory.backend import worker_launcher
-
-    (tmp_path / "data").mkdir()
-    monkeypatch.setenv("HERMES_MEMORY_HOME", str(tmp_path))
-
     class Standalone(Backend):
         supports_worker_poller = False
 
@@ -543,21 +568,173 @@ def test_a_backend_without_a_worker_poller_refuses_rather_than_running_inline(
             super().__init__(**kwargs)
             self._backend = Standalone()
 
-    config = Config()
-    modules = {
-        "hindsight_api": type("M", (), {"__version__": "0.10.1",
-                                        "MemoryEngine": EngineWithoutPoller})(),
-        "hindsight_api.config": type("C", (), {
-            "get_config": staticmethod(lambda: config),
-            "DEFAULT_DATABASE_SCHEMA": "public"})(),
-        "hindsight_api.engine.task_backend": type("T", (),
-                                                  {"WorkerTaskBackend": TaskBackend})(),
-        "hindsight_api.worker.poller": type("P", (), {"WorkerPoller": Poller})(),
-    }
-    monkeypatch.setattr(worker_launcher, "_import_backend", lambda: modules)
+    a_worker_installation(tmp_path, monkeypatch, engine=EngineWithoutPoller)
     assert main([]) == 2
     printed = json.loads(capsys.readouterr().err)
     assert "no worker poller" in printed["refused"]
+
+
+# -- the operator's hold ------------------------------------------------------
+
+def a_hold(store, *, state="paused", actor="jugaadu"):
+    """The owner's decision, written where every process that spends a model reads it."""
+    store.set_control("global", "inference", state, actor=actor,
+                      reason="the owner stopped the models", policy_version="gate-v1")
+
+
+def a_ticker(store, slept, *, lift_after=None):
+    """A sleep that does not sleep, optionally lifting the hold on the n-th tick."""
+    async def sleep(seconds):
+        slept.append(seconds)
+        if lift_after is not None and len(slept) >= lift_after:
+            a_hold(store, state="active")
+    return sleep
+
+
+def test_the_hold_is_read_from_the_row_the_owner_wrote(ledger):
+    assert inference_hold(ledger.store) is None
+    a_hold(ledger.store)
+    held = inference_hold(ledger.store)
+    assert held["state"] == "paused" and held["actor"] == "jugaadu"
+    a_hold(ledger.store, state="active")
+    assert inference_hold(ledger.store) is None
+
+
+def test_a_held_installation_makes_the_worker_wait_rather_than_exit(ledger):
+    """§10.5: a hold survives a restart on purpose, so the worker has to survive waiting.
+
+    The alternative is the failure this launcher used to have: ``hermes-memory stop`` holds
+    inference, ``start`` does not lift it, the worker's startup probe gets a 503, the unit
+    exits, and its restart limit eventually silences a process nobody will start again —
+    leaving operations pending after the hold lifted, with nothing left to drain them.
+    """
+    a_hold(ledger.store)
+    slept, engines = [], []
+    built = run(bring_up(a_build(engines), ledger.store,
+                         sleep=a_ticker(ledger.store, slept, lift_after=2)))
+    assert slept == [HOLD_POLL_SECONDS, HOLD_POLL_SECONDS]
+    assert len(engines) == 1, "one hold is one wait, not one build per poll"
+    assert built["memory"] is engines[0] and engines[0].initialized is True
+
+
+def test_nothing_is_composed_while_the_owner_holds_inference(ledger):
+    """The wait comes before the build, and that order is the whole point.
+
+    ``compose`` hands the backend a task backend and builds a ``MemoryEngine``, which at the
+    pinned tag is a database connection pool. Asking for either in a machine whose owner
+    wrote "do not dispatch" is what this launcher exists to avoid — and a test that only
+    counted how many engines were made would pass with the two statements swapped.
+    """
+    a_hold(ledger.store)
+    composed_under_hold: list[bool] = []
+
+    def build():
+        composed_under_hold.append(inference_hold(ledger.store) is not None)
+        return {"memory": an_engine(), "poller_factory": Poller, "poller_arguments": {}}
+
+    run(bring_up(build, ledger.store, sleep=a_ticker(ledger.store, [], lift_after=1)))
+    assert composed_under_hold == [False], \
+        "the engine was composed only after the hold lifted, never while it stood"
+
+
+def test_the_wait_is_announced_with_who_is_holding_it(ledger, capsys):
+    """A worker that goes quiet for an hour looks dead; the reason has to be in the journal."""
+    a_hold(ledger.store)
+    slept = []
+    waited = run(wait_for_inference(ledger.store, sleep=a_ticker(ledger.store, slept,
+                                                                 lift_after=1)))
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert waited == HOLD_POLL_SECONDS
+    assert lines[0]["worker"] == "waiting" and lines[0]["actor"] == "jugaadu"
+    assert lines[0]["since"] and lines[-1]["worker"] == "resumed"
+
+
+def test_an_attempt_that_races_a_hold_is_torn_down_and_retried_with_a_fresh_engine(ledger):
+    """The hold may arrive mid-startup; the half-built engine is shut down, not reused.
+
+    Asking one engine to ``initialize()`` twice is not something this launcher will assume
+    is safe, so the attempt is discarded and the composition is performed again.
+    """
+    class HeldDuringStartup(Engine):
+        async def initialize(self):
+            a_hold(ledger.store)  # the owner stops the models during the startup probe
+            raise RuntimeError("503: all inference is paused by the operator")
+
+    engines = []
+    slept = []
+    built = run(bring_up(a_build(engines, first=HeldDuringStartup), ledger.store,
+                         sleep=a_ticker(ledger.store, slept, lift_after=1)))
+    assert len(engines) == 2
+    assert engines[0].shutdown_called is True and engines[0].initialized is False
+    assert built["memory"] is engines[1] and engines[1].initialized is True
+
+
+def test_a_startup_failure_that_is_not_the_hold_still_exits(ledger):
+    """A real misconfiguration stays a real failure: retried forever, it would look healthy."""
+    a_hold(ledger.store, state="active")
+    engines = []
+
+    class Broken(Engine):
+        async def initialize(self):
+            raise RuntimeError("no such table: banks")
+
+    with pytest.raises(RuntimeError, match="no such table"):
+        run(bring_up(a_build(engines, first=Broken), ledger.store,
+                     sleep=a_ticker(ledger.store, [])))
+    assert len(engines) == 1
+    assert engines[0].shutdown_called is False, "nothing was torn down behind a retry loop"
+
+
+def test_an_unclean_teardown_of_a_half_started_engine_is_said_not_swallowed(ledger, capsys):
+    """The hold is the reason to wait, but a shutdown that also failed is a second fact."""
+    class HalfBuilt(Engine):
+        async def initialize(self):
+            a_hold(ledger.store)
+            raise RuntimeError("503: paused")
+
+        async def shutdown(self):
+            raise RuntimeError("connection already closed")
+
+    engines = []
+    run(bring_up(a_build(engines, first=HalfBuilt), ledger.store,
+                 sleep=a_ticker(ledger.store, [], lift_after=1)))
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    torn = [line for line in lines if line.get("worker") == "held during startup"]
+    assert len(torn) == 1
+    assert "paused" in torn[0]["error"]
+    assert "connection already closed" in torn[0]["shutdown_error"]
+
+
+def test_the_unit_waits_out_a_hold_and_drains_when_the_owner_resumes(tmp_path, monkeypatch,
+                                                                    capsys):
+    """The whole unit path, because this is what ``Restart=on-failure`` used to end.
+
+    The hold is in the installation's own admission ledger, where ``hermes-memory pause
+    --scope inference`` put it and where a restart cannot lose it.
+    """
+    real_sleep = asyncio.sleep
+    store = GateStore(tmp_path / "gate.db")
+    a_hold(store)
+    store.close()
+
+    slept = []
+
+    async def waiting_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) >= 2:
+            lifted = GateStore(tmp_path / "gate.db")
+            a_hold(lifted, state="active")
+            lifted.close()
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", waiting_sleep)
+    a_worker_installation(tmp_path, monkeypatch)
+    assert main([]) == 0
+    assert len(slept) >= 1
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+             if line.startswith("{")]
+    assert [line["worker"] for line in lines] == ["waiting", "resumed"]
+    assert lines[0]["actor"] == "jugaadu"
 
 
 # -- the schema it lives in --------------------------------------------------
