@@ -1,5 +1,5 @@
 {
-  "framework_digest": "3d2dd7e88957529f214f85f49893bef4a35e19884984ca34006c35b96c64cb3e",
+  "framework_digest": "75e2eaf17d28f2231f955547b075120cbbf2b29d916dca3414646fd8b3802cc9",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",
@@ -114,7 +114,7 @@
       }
     ]
   },
-  "manifest_version": "compatibility-v1",
+  "manifest_version": "compatibility-v2",
   "not_claimed": [
     "no live Hindsight request was made to build this",
     "no model was called, and no route quality is asserted here",

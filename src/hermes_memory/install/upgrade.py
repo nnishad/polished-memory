@@ -207,8 +207,11 @@ def _plugin_digest(files: list[Path]) -> str | None:
 
 
 def _source_plugin_files() -> list[Path]:
-    root = Path(__file__).resolve().parents[3]
-    return sorted((root / "integrations" / "hermes-memory").glob("*.py"))
+    """The plugin this running code came with, wherever this build is installed from."""
+    from .compatibility import tree_root
+
+    root = tree_root()
+    return sorted((root / "integrations" / "hermes-memory").glob("*.py")) if root else []
 
 
 def _switches(current: Path, target: Path | None, units: dict[str, Any], *,

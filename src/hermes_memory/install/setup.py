@@ -630,7 +630,20 @@ def host_commands(ctx: Context) -> list[tuple[list[str], str]]:
 
 
 def _source_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    """The tree whose plugin the host is being asked to register.
+
+    A checkout answers, and so does the staged release a wheel was installed from — which
+    matters, because the units start the release's binary and the host registers a plugin from
+    whichever directory this names. Counting parents from ``site-packages`` would hand the
+    host a path with no plugin in it.
+    """
+    from .compatibility import tree_root
+
+    root = tree_root()
+    if root is None:
+        raise SetupError("this build carries no tree with its plugin files; run setup from a "
+                         "checkout or from a staged release")
+    return root
 
 
 def _tree_digest() -> str:

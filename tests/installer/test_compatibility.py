@@ -7,6 +7,7 @@ the claim that the manifest itself makes about which code it describes.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,10 @@ import pytest
 from hermes_memory.backend.capabilities import PINNED_VERSION
 from hermes_memory.install import compatibility
 from hermes_memory.storage.migrations import MIGRATIONS
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SHIPPED = REPO_ROOT / "deployment" / "compatibility.json"
+PLUGIN = REPO_ROOT / "integrations" / "hermes-memory"
 
 
 @pytest.fixture()
@@ -272,3 +277,73 @@ def test_a_patched_tree_passes_the_claims_and_fails_only_the_digests(release, do
     assert strict["digests"] == {"agree": False, "framework": "f" * 64,
                                  "shipped": strict["digests"]["shipped"]}
     assert any("framework_digest" in line for line in strict["differences"])
+
+
+# -- an installed tree is a different shape, and used to be a crash ------------
+
+def an_installed_release(tmp_path, monkeypatch):
+    """A release as `hermes-memory release` stages one, and this module read from inside it.
+
+    The checkout lookup is switched off because that is the situation being reproduced: the
+    code is running from ``site-packages``, where the three directories above it are the
+    interpreter's library path and no ``pyproject.toml`` has ever lived.
+    """
+    root = tmp_path / "release"
+    package = root / "lib" / "python3.12" / "site-packages" / "hermes_memory" / "install"
+    package.mkdir(parents=True)
+    (root / "deployment").mkdir(parents=True)
+    (root / "integrations" / "hermes-memory").mkdir(parents=True)
+    shutil.copy(SHIPPED, root / "deployment" / "compatibility.json")
+    for name in ("provider.py", "plugin.yaml"):
+        shutil.copy(PLUGIN / name, root / "integrations" / "hermes-memory" / name)
+    origin = package / "compatibility.py"
+    origin.write_text("# installed copy\n")
+    monkeypatch.setattr(compatibility, "source_checkout", lambda: None)
+    return root, origin
+
+
+def test_an_installed_build_finds_the_release_it_came_from(tmp_path, monkeypatch):
+    root, origin = an_installed_release(tmp_path, monkeypatch)
+    assert compatibility.tree_root(origin=origin) == root
+
+
+def test_a_wheel_installed_on_its_own_says_so_instead_of_reading_past_site_packages(tmp_path,
+                                                                                    monkeypatch):
+    lonely = tmp_path / "venv/lib/python3.12/site-packages/hermes_memory"
+    (lonely / "install").mkdir(parents=True)
+    monkeypatch.setattr(compatibility, "source_checkout", lambda: None)
+    monkeypatch.setattr(compatibility, "PACKAGE_DIR", lonely)
+    assert compatibility.tree_root() is None
+    with pytest.raises(compatibility.CompatibilityUnavailable, match="installed without a tree beside it"):
+        compatibility.facts(root=None)
+
+
+def test_the_package_claim_survives_packaging(tmp_path, monkeypatch):
+    """The same version and Python floor, whether read from pyproject or from metadata.
+
+    An installed release has no ``pyproject.toml`` beside it, so a claim that could only be
+    read from one made the compatibility door answer with a traceback on the one machine it
+    matters — the one running the release rather than the source.
+    """
+    root, origin = an_installed_release(tmp_path, monkeypatch)
+    from_source = compatibility.facts(root=compatibility.REPO)["package"]
+    from_installed = compatibility.facts(root=root)["package"]
+    assert from_installed == from_source
+
+
+def test_the_framework_digest_describes_the_running_code_not_a_source_layout(tmp_path,
+                                                                            monkeypatch):
+    """Two trees holding the same modules agree, whichever one the digest was asked about."""
+    root, origin = an_installed_release(tmp_path, monkeypatch)
+    assert compatibility.facts(root=root)["framework_digest"] == \
+        compatibility.facts(root=compatibility.REPO)["framework_digest"]
+
+
+def test_verifying_a_release_manifest_does_not_walk_up_into_a_stray_directory(tmp_path,
+                                                                             monkeypatch):
+    """A copy of a manifest on its own is not a tree; the check is still about this build."""
+    lonely = tmp_path / "extracted"
+    lonely.mkdir()
+    shutil.copy(SHIPPED, lonely / "compatibility.json")
+    checked = compatibility.verify(path=lonely / "compatibility.json")
+    assert checked["ok"] is True

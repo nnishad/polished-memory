@@ -89,7 +89,14 @@ def template_root(*, environ: dict[str, str] | None = None) -> Path:
     candidates = []
     if release:
         candidates.append(Path(release) / "deployment" / "systemd")
-    candidates.append(Path(__file__).resolve().parents[3] / "deployment" / "systemd")
+    # Then the tree this build actually belongs to, which is the release root for an installed
+    # gate and the checkout for a source run. Counting parents from site-packages finds the
+    # interpreter's own library directory, not a directory holding templates.
+    from .compatibility import tree_root
+
+    root = tree_root()
+    if root is not None:
+        candidates.append(root / "deployment" / "systemd")
     for candidate in candidates:
         if candidate.is_dir():
             return candidate

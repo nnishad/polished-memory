@@ -280,6 +280,22 @@ def main(argv: list[str] | None = None) -> int:
     owner.add_argument("--profile", help="whose memory; required once one is enrolled")
     owner.add_argument("--actor")
 
+    release = sub.add_parser("release",
+                             help="stage the two environments a release is made of. It "
+                                  "plans first and applying needs the digest it printed")
+    release.add_argument("--into", metavar="DIR",
+                         help="where to stage; defaults to <home>/runtime/current")
+    release.add_argument("--source",
+                         help="the checkout whose deployment/ and integrations/ are carried")
+    release.add_argument("--wheel", help="a prebuilt wheel, rather than building one now")
+    release.add_argument("--without-backend", action="store_true",
+                         help="skip the backend environment; setup then refuses to stage "
+                              "while a backend route is configured")
+    release.add_argument("--apply", action="store_true")
+    release.add_argument("--actor")
+    release.add_argument("--review", metavar="DIGEST",
+                         help="the digest of the plan that was actually shown")
+
     upgrade = sub.add_parser("upgrade",
                              help="plan a switch to a staged release. It is read only: "
                                   "there is no flag here that performs one")
@@ -493,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
         return _restore_command(settings, args)
     if args.command == "owner":
         return _owner_command(settings, args)
+    if args.command == "release":
+        return _release_command(settings, args)
     if args.command == "upgrade":
         return _upgrade_command(settings, args)
     if args.command == "uninstall":
@@ -1305,6 +1323,45 @@ def _archive_targets(settings, profile: str | None) -> list:
     finally:
         registry.db.close()
     return enrolled or [settings]
+
+
+def _release_command(settings, args) -> int:
+    """Stage the environments the units name. Plan mode reads like `setup`: nothing moves.
+
+    This is the door §10.3 always assumed existed and never named: without it, every
+    installation stalled at `stage` with a path to fill in by hand, and the hand-filled
+    path was checked by nothing until a unit failed to start.
+    """
+    from pathlib import Path
+
+    from .install.profiles import InstallationError
+    from .install.release import ReleaseError
+    from .install.release import apply as stage, plan
+
+    into = Path(args.into).expanduser() if args.into \
+        else Path(settings.home) / "runtime" / "current"
+    backend = not args.without_backend
+    try:
+        if not args.apply:
+            report = plan(settings=settings, into=into, source=args.source,
+                          wheel=args.wheel, backend=backend)
+            return _emit({**report,
+                          "next": "re-run with --apply --actor <login> --review <the digest "
+                                  "above>. Nothing here moves runtime/current once it exists "
+                                  "— that switch is `upgrade`, and it waits for a quiesced "
+                                  "machine"})
+        if not args.review:
+            raise ReleaseError("staging fetches packages and writes two interpreters; the "
+                               "approval is the digest the plan printed, and none was given")
+        report = stage(settings=settings, into=into, source=args.source, wheel=args.wheel,
+                       actor=args.actor or "", review=args.review, backend=backend)
+    except (ReleaseError, InstallationError, OSError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    if not report.get("complete", True):
+        report["warning"] = ("the tree was staged but does not satisfy what the units ask of "
+                             "it; read `missing` before pointing anything at it")
+    return _emit(report)
 
 
 def _upgrade_command(settings, args) -> int:

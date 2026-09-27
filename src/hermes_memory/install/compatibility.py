@@ -23,14 +23,30 @@ from ..backend.capabilities import CAPABILITIES, PINNED_VERSION
 from ..ids import content_digest
 from ..storage.migrations import MIGRATIONS
 
-__all__ = ["MANIFEST_VERSION", "facts", "manifest_path", "read_shipped", "source_checkout",
-           "verify", "write"]
+__all__ = ["MANIFEST_VERSION", "CompatibilityUnavailable", "facts", "manifest_path",
+           "read_shipped", "source_checkout", "tree_for", "tree_root", "verify", "write"]
 
-MANIFEST_VERSION = "compatibility-v1"
+MANIFEST_VERSION = "compatibility-v2"
+
+
+class CompatibilityUnavailable(ValueError):
+    """This build is installed with no tree beside it, so there is nothing to claim.
+
+    Distinct from a divergence: a divergence is two statements that disagree, and this is the
+    absence of one. A bare wheel install is the ordinary case, and it has to be said plainly
+    rather than raised as a missing file three directories above a site-packages parent.
+    """
+
+
 REPO = Path(__file__).resolve().parents[3]
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
 SHIP_AT = REPO / "deployment" / "compatibility.json"
 PLUGIN_DIR = REPO / "integrations" / "hermes-memory"
 RELATIVE = Path("deployment") / "compatibility.json"
+#: What makes a directory the tree this build belongs to. A source checkout has both, a
+#: staged release carries both beside the ``bin/``, and a bare wheel carries neither — which
+#: is a real answer, not a failure to find the right one.
+TREE_MARKERS = (RELATIVE, Path("integrations") / "hermes-memory" / "provider.py")
 
 _TOP_LEVEL = re.compile(r"^([a-z_]+):\s*(.*)$")
 _NUMBERED = re.compile(r"^([A-Z_]+)\s*=\s*(\d+)\s*$", re.MULTILINE)
@@ -51,20 +67,38 @@ def _scalar(path: Path, key: str) -> Any:
     raise ValueError(f"{path.name} declares no top-level {key!r}")
 
 
-def _package() -> dict[str, Any]:
-    """The framework's own name, version and Python floor, read from pyproject.toml."""
-    text = (REPO / "pyproject.toml").read_text(encoding="utf-8")
-    project = text.split("[project]", 1)[1].split("[", 1)[0]
-    values = dict(re.findall(r'(?m)^(\w[\w-]*)\s*=\s*"([^"]*)"', project))
-    return {"package": values["name"], "version": values["version"],
-            "requires_python": values["requires-python"]}
+def _package(root: Path) -> dict[str, Any]:
+    """The framework's own name, version and Python floor.
+
+    Read from ``pyproject.toml`` in a checkout, where that file is the truth being packaged,
+    and from the installed distribution's metadata otherwise — an installed tree has no
+    ``pyproject.toml`` at all, and the parents of its ``site-packages`` are not a repository.
+    """
+    declaration = root / "pyproject.toml"
+    if declaration.is_file():
+        project = declaration.read_text(encoding="utf-8").split("[project]", 1)[1] \
+            .split("[", 1)[0]
+        values = dict(re.findall(r'(?m)^(\w[\w-]*)\s*=\s*"([^"]*)"', project))
+        return {"package": values["name"], "version": values["version"],
+                "requires_python": values["requires-python"]}
+    from importlib import metadata
+
+    dist = metadata.distribution("hermes-memory")
+    return {"package": dist.metadata["Name"], "version": dist.version,
+            "requires_python": (dist.metadata["Requires-Python"] or "").strip()}
 
 
-def _plugin() -> dict[str, Any]:
-    """What the plugin claims about the host, plus the code that has to keep the claim."""
-    provider = (PLUGIN_DIR / "provider.py").read_text(encoding="utf-8")
+def _plugin(root: Path) -> dict[str, Any]:
+    """What the plugin claims about the host, plus the code that has to keep the claim.
+
+    Read out of the tree this build belongs to, because the half that registers with the host
+    travels beside the half that answers: a release whose ``integrations/`` disagrees with its
+    ``site-packages/`` is the drift this section exists to catch.
+    """
+    directory = root / "integrations" / "hermes-memory"
+    provider = (directory / "provider.py").read_text(encoding="utf-8")
     numbers = dict(_NUMBERED.findall(provider))
-    manifest = PLUGIN_DIR / "plugin.yaml"
+    manifest = directory / "plugin.yaml"
     return {"name": _scalar(manifest, "name"), "version": _scalar(manifest, "version"),
             "kind": _scalar(manifest, "kind"),
             "requires_hermes": _scalar(manifest, "requires_hermes"),
@@ -74,7 +108,7 @@ def _plugin() -> dict[str, Any]:
             # remove.
             "checkpoint_api_version": int(numbers["CHECKPOINT_API_VERSION"]),
             "files": {path.name: content_digest(path.read_bytes())
-                      for path in sorted(PLUGIN_DIR.glob("*.py"))}}
+                      for path in sorted(directory.glob("*.py"))}}
 
 
 def _hindsight() -> dict[str, Any]:
@@ -100,21 +134,48 @@ def _schema() -> dict[str, Any]:
 
 
 def _framework_digest() -> str:
-    """One digest over the framework's own sources, path and content both.
+    """One digest over the framework's own modules, name and content both.
 
-    Two checkouts that share it are the same code, and nothing else about a release has to be
-    believed.
+    Two trees that share it are the same code, and nothing else about a release has to be
+    believed. It is taken from the imported package rather than from ``<root>/src`` so that a
+    checkout and the release built from it answer with the same value: the path each module
+    reports is the path it is imported by, which survives packaging. A digest that only
+    computed in a working tree would make every installed build look like a different one.
     """
-    sources = sorted((REPO / "src" / "hermes_memory").rglob("*.py"))
-    return content_digest(json.dumps([[path.relative_to(REPO).as_posix(),
+    sources = sorted(PACKAGE_DIR.rglob("*.py"))
+    return content_digest(json.dumps([[path.relative_to(PACKAGE_DIR).as_posix(),
                                        content_digest(path.read_bytes())]
                                       for path in sources]).encode())
 
 
-def facts() -> dict[str, Any]:
+def tree_root(*, origin: Path | None = None) -> Path | None:
+    """The tree this build belongs to: a source checkout, or the release that carries it.
+
+    Answered by walking up from the imported module rather than by counting parents, because
+    the depth differs between the two layouts — ``src/hermes_memory/install`` in a checkout and
+    ``lib/python3.12/site-packages/hermes_memory/install`` in a venv — and a hardcoded count is
+    how an installed build ends up reading ``lib/python3.12/pyproject.toml`` and crashing.
+    """
+    checkout = source_checkout()
+    if checkout is not None:
+        return checkout
+    start = (origin or PACKAGE_DIR).resolve()
+    for parent in start.parents:
+        if all((parent / marker).is_file() for marker in TREE_MARKERS):
+            return parent
+    return None
+
+
+def facts(*, root: Path | None = None) -> dict[str, Any]:
     """The manifest's contents, computed from the tree it describes."""
-    return {"manifest_version": MANIFEST_VERSION, "package": _package(),
-            "hindsight": _hindsight(), "schema": _schema(), "plugin": _plugin(),
+    resolved = root if root is not None else tree_root()
+    if resolved is None:
+        raise CompatibilityUnavailable(
+            "this build is installed without a tree beside it: no deployment manifest and no "
+            "plugin files were shipped, so there is nothing here to state compatibility with")
+    return {"manifest_version": MANIFEST_VERSION, "package": _package(resolved),
+            "hindsight": _hindsight(), "schema": _schema(),
+            "plugin": _plugin(resolved),
             "framework_digest": _framework_digest(),
             "not_claimed": ["no live Hindsight request was made to build this",
                             "no model was called, and no route quality is asserted here",
@@ -159,10 +220,34 @@ def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path 
     return checkout / RELATIVE if checkout else None
 
 
-def write(*, path: Path | None = None) -> Path:
-    target = path or SHIP_AT
+def write(*, path: Path | None = None, settings=None,
+          environ: dict[str, str] | None = None) -> Path:
+    """Regenerate the manifest, for packaging.
+
+    The target is chosen by convention, not by which files already exist: writing a manifest
+    is how one comes to exist. ``HERMES_MEMORY_RELEASE`` names the release being packed, the
+    instance home's ``runtime/current`` names it otherwise, and a source run falls to the
+    checkout — which is the only place a manifest may be invented rather than copied.
+    """
+    source = os.environ if environ is None else environ
+    target = path
+    if target is None:
+        release = str(source.get("HERMES_MEMORY_RELEASE") or "")
+        pointer = Path(settings.home) / "runtime" / "current" if settings is not None else None
+        if release:
+            target = Path(release) / RELATIVE
+        elif pointer is not None and (pointer / "deployment").is_dir():
+            target = pointer / RELATIVE
+        else:
+            target = SHIP_AT
+    root = tree_for(target)
+    if root is None:
+        raise CompatibilityUnavailable(
+            "`compatibility --write` needs a tree to describe: this build is installed with "
+            "neither a checkout nor a release carrying its plugin and units")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(facts(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    target.write_text(json.dumps(facts(root=root), indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8")
     return target
 
 
@@ -171,6 +256,22 @@ def read_shipped(*, path: Path | None = None, settings=None) -> dict[str, Any]:
     if target is None or not target.is_file():
         raise ValueError(f"no compatibility manifest at {target}")
     return json.loads(target.read_text(encoding="utf-8"))
+
+
+def tree_for(manifest: Path | None = None) -> Path | None:
+    """Which tree a check is about: the one a named manifest shipped inside, else this build's.
+
+    Two different questions arrive here. A release being verified asks "does the file beside
+    this runtime still describe it", and the answer must come from that file's own tree even
+    when the checking process was started somewhere else. A named path that is not inside any
+    tree — a copy of a manifest on its own — is not a tree, and inventing one from its
+    grandparents would compare a file against a directory that was never a release.
+    """
+    if manifest is not None:
+        beside = Path(manifest).resolve().parent.parent
+        if all((beside / marker).is_file() for marker in TREE_MARKERS):
+            return beside
+    return tree_root()
 
 
 def verify(*, path: Path | None = None, settings=None,
@@ -203,7 +304,15 @@ def verify(*, path: Path | None = None, settings=None,
         return {"ok": False, "checked": str(target),
                 "differences": [f"{target} is not readable JSON: {str(error)[:160]}"],
                 "remedy": remedy, "digests": None}
-    current = facts()
+    try:
+        current = facts(root=tree_for(target))
+    except CompatibilityUnavailable as error:
+        return {"ok": False, "absent": False, "checked": str(target),
+                "differences": [str(error)],
+                "remedy": ("stage the release rather than installing the wheel alone; "
+                           "`hermes-memory release` carries the plugin and the units beside "
+                           "the runtime, which is what makes a claim checkable"),
+                "digests": None}
     compared = (*_CLAIMS, *_DIGESTS) if digests else _CLAIMS
     shipped_plugin = {key: value for key, value in (shipped.get("plugin") or {}).items()
                       if digests or key != "files"}

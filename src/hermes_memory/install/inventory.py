@@ -112,10 +112,14 @@ def _target_shape(target: str | None) -> str:
 
 
 def _release(settings, environment: dict[str, str]) -> dict[str, Any]:
-    tree = Path(__file__).resolve().parents[3]
+    from .compatibility import tree_root
+
+    tree = tree_root()
     return {
         "framework_version": _version("hermes-memory"),
-        "package_source": str(tree),
+        # Named as an absence when there is no tree: an installed build whose plugin is not
+        # beside it is a fact the operator needs, not a path invented from parent directories.
+        "package_source": str(tree) if tree is not None else "no tree beside this install",
         # The units name this path; whether the code answering is the code they start is
         # a question an operator asks at exactly the moment it is expensive to get wrong.
         "release_root": environment.get("HERMES_MEMORY_RELEASE", "not set"),
