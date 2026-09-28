@@ -639,13 +639,18 @@ installation is now recoverable" is false if two of three were copied. Each snap
 verifies on the way in — file digest, SQLite's own integrity pass, foreign-key sweep, and
 the epoch and journal position the manifest recorded.
 
-A restore is gated by a digest of the reading: the snapshot's facts, the notes, and the
-**live epoch**. So a capture that lands while the operator is reading invalidates the
-approval, and the answer is a refusal plus `hermes-memory stop` first, never a rollback of a
-store nobody looked at. What comes back is re-forgotten before it answers a single read:
-evidence forgotten after the snapshot stays forgotten, which is the whole point of keeping
-the erasure ledger outside the rolled-back file. The store that was there is copied aside
-first, so a wrong restore is itself reversible.
+A restore is gated by a digest of the reading: the snapshot's facts, the notes, the **cost**
+and the **live epoch**. The cost is how much is readable now, how much is readable in the
+snapshot, and from those two how many readable records a rollback destroys, how many it
+brings back, and how many of the ones it brings back are already forgotten. An approval that
+did not name the evidence it was about to lose would be an approval of the word `restore`
+rather than of a decision, so `brought_back_and_already_forgotten` is quoted beforehand and
+`reapplied` is the same number afterwards. So a capture that lands while the operator is
+reading invalidates the approval, and the answer is a refusal plus `hermes-memory stop`
+first, never a rollback of a store nobody looked at. What comes back is re-forgotten before
+it answers a single read: evidence forgotten after the snapshot stays forgotten, which is the
+whole point of keeping the erasure ledger outside the rolled-back file. The store that was
+there is copied aside first, so a wrong restore is itself reversible.
 
 ```sh
 hermes-memory uninstall --keep-data --hermes-home ~/.hermes/profiles/work \

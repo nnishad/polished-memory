@@ -1123,10 +1123,11 @@ def _restore_command(settings, args) -> int:
     """Show the snapshot's own facts, then take back the store that was shown.
 
     A restore destroys every record written after the snapshot, so it is the one command
-    here that a digest has to gate: the operator sees which snapshot, what it holds, and
-    how many forgetting decisions the ledger will re-apply, and approves exactly that
-    reading. The carried rows are counted rather than printed — a plan that dumped record
-    IDs would put private evidence in the shell's scrollback.
+    here that a digest has to gate: the operator sees which snapshot, what it holds, what
+    the rollback costs in evidence that will no longer be readable, and how many
+    forgetting decisions the ledger will re-apply, and approves exactly that reading. The
+    carried rows are counted rather than printed — a plan that dumped record IDs would put
+    private evidence in the shell's scrollback.
     """
     from .ids import digest
     from .install.profiles import InstallationError
@@ -1159,11 +1160,13 @@ def _restore_command(settings, args) -> int:
                 print("refused: " + "; ".join(checked["problems"]), file=sys.stderr)
                 return 2
             snapshot = snapshots.resolve(args.snapshot)
-            carried = Recovery(store, snapshots=snapshots,
-                               owner_principal=scoped.owner_principal).carry()
+            recovery = Recovery(store, snapshots=snapshots,
+                                owner_principal=scoped.owner_principal)
+            carried = recovery.carry()
             proposal = {"profile": scoped.profile, "store": str(scoped.db_path),
                         "snapshot": snapshot.as_dict(), "notes": checked["notes"],
                         "live_epoch": store.epoch(),
+                        "cost": recovery.cost(args.snapshot, carried=carried),
                         "decisions_kept": {name: len(rows)
                                            for name, rows in carried.tables.items()}}
             review = digest([RESTORE_PLAN_VERSION, proposal])

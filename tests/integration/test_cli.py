@@ -10,14 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from hermes_memory.cli import main
+from hermes_memory.cli import RESTORE_PLAN_VERSION, main
 from hermes_memory.config import load_settings
 from hermes_memory.install.release import carry
 from hermes_memory.install.profiles import InstallationError, ProfileRegistry
 from hermes_memory.knowledge.assertions import AssertionStore
 from hermes_memory.backend.document_map import VERIFIED, DocumentMap
 from hermes_memory.backend.hindsight_client import HindsightUnavailable
-from hermes_memory.ids import now
+from hermes_memory.ids import digest, now
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
                                                    gate_path, instance_gate)
@@ -1597,8 +1597,96 @@ def test_a_restore_shows_what_it_would_destroy_and_destroys_nothing(home, tmp_pa
     assert all(isinstance(kept, int) for kept in proposal["decisions_kept"].values())
     printed = json.dumps(proposal)
     assert "snap-1" not in printed and "lease" not in printed
+    # The test's own promise: the writes after the snapshot are the whole price, and a
+    # reading that does not say them approves a destruction nobody was shown.
+    cost = proposal["cost"]
+    assert cost["readable_now"] == 2 and cost["readable_in_the_snapshot"] == 1
+    assert cost["destroyed"] == 1, "the plan does not say what the rollback destroys"
+    assert cost["brought_back"] == 0 and \
+        cost["brought_back_and_already_forgotten"] == 0
+    assert all(isinstance(price, int) for price in cost.values())
     with EvidenceStore(load_settings().db_path) as store:
         assert [item.id for item in store.search("written after the snapshot")] == [later]
+
+
+def test_a_restore_names_the_evidence_it_will_erase_again_before_it_is_approved(home):
+    """Evidence forgotten *after* the snapshot comes back inside the copy, and the plan says so.
+
+    §C4's rule is that a restore cannot resurrect the forgotten. Said afterwards, that is a
+    receipt; said beforehand, it is something the owner approves. The two numbers have to
+    agree, or the plan quoted a price the act did not pay.
+    """
+    snapshot_id = _snapshot_of(home, "the figure I withdrew")
+    with EvidenceStore(load_settings().db_path) as store:
+        record = str(store.db.execute("SELECT id FROM records").fetchone()[0])
+        preview = ErasureManager(store, owner_principal=OWNER).preview(
+            record_ids=[record], actor="agent:session-1", actor_kind="agent",
+            reason="withdrawn after the snapshot was taken")
+    code, outcome = run("owner", "--confirm-forgetting", preview["intent_id"],
+                        "--digest", preview["preview_digest"], "--actor", OWNER)
+    assert code == 0
+    _, proposal = run("restore", "--snapshot", snapshot_id)
+    cost = proposal["cost"]
+    assert cost["destroyed"] == 0, "nothing was written after this snapshot"
+    assert cost["brought_back"] == 1 and cost["brought_back_and_already_forgotten"] == 1, \
+        "the forgotten record comes back into the copy unannounced"
+    _, report = run("restore", "--snapshot", snapshot_id,
+                    "--review", proposal["review_digest"], "--actor", OWNER)
+    assert report["restored"] == snapshot_id
+    assert report["reapplied"] == cost["brought_back_and_already_forgotten"], \
+        "the restore did not keep the price the plan quoted"
+    with ReadOnlyStore(load_settings().db_path) as store:
+        assert not store.live_and_visible(record), "a restore resurrected the forgotten"
+
+
+def test_a_record_buried_before_the_snapshot_was_taken_is_not_counted_as_coming_back(home):
+    """`readable` has to mean readable on both sides of the comparison.
+
+    A snapshot taken after a forgetting still holds the row with the tombstone on it. Counting
+    that as evidence the rollback would lose talks the owner out of a restore that costs
+    nothing; counting it as evidence the rollback would bring back is the same mistake turned
+    the other way.
+    """
+    snapshot_id = _snapshot_of(home, "the figure I withdrew")
+    with EvidenceStore(load_settings().db_path) as store:
+        buried = str(store.db.execute("SELECT id FROM records").fetchone()[0])
+        preview = ErasureManager(store, owner_principal=OWNER).preview(
+            record_ids=[buried], actor="agent:session-1", actor_kind="agent",
+            reason="withdrawn before the second snapshot")
+    code, _ = run("owner", "--confirm-forgetting", preview["intent_id"],
+                  "--digest", preview["preview_digest"], "--actor", OWNER)
+    assert code == 0
+    _, second = run("backup", "--reason", "after the forgetting")
+
+    code, proposal = run("restore", "--snapshot", snapshot_id)
+    assert code == 0
+    cost = proposal["cost"]
+    assert cost["readable_now"] == 0 and cost["readable_in_the_snapshot"] == 1
+    assert cost["destroyed"] == 0, "a record that was already buried is not a loss"
+    assert cost["brought_back"] == 1 and cost["brought_back_and_already_forgotten"] == 1, \
+        "the copy that predates the forgetting is not said to resurrect it"
+    _, later = run("restore", "--snapshot", second["backups"][0]["snapshot"]["id"])
+    assert later["cost"]["destroyed"] == 0 and later["cost"]["brought_back"] == 0, \
+        "a tombstone the snapshot already holds is counted as evidence returning"
+
+
+def test_the_digest_approves_everything_the_restore_plan_showed(home):
+    """An approval covers the whole reading, or the plan can print a price it never meant.
+
+    The cost is computed rather than typed, so nothing else in this file would notice it being
+    left out of what the digest seals. This notices.
+    """
+    snapshot_id = _snapshot_of(home, "the lease ends in March")
+    with EvidenceStore(load_settings().db_path) as store:
+        _a_message(store, "written after the snapshot", source_id="later-1")
+        store.bump_epoch(reason="later write", actor=OWNER)
+    code, proposal = run("restore", "--snapshot", snapshot_id)
+    assert code == 0
+    shown = {key: value for key, value in proposal.items()
+             if key not in ("review_digest", "next")}
+    assert proposal["cost"] in shown.values()
+    assert proposal["review_digest"] == digest([RESTORE_PLAN_VERSION, shown]), \
+        "the plan showed something its own approval does not cover"
 
 
 def test_an_approved_restore_takes_the_store_back(home):

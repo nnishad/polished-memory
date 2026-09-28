@@ -845,3 +845,51 @@ def test_a_restore_is_audited_with_the_ledger_it_carried(store, snapshots, recov
         "SELECT object_id, metadata FROM audit WHERE action='restore_complete'").fetchone()
     assert row["object_id"] == made.id
     assert json.loads(row["metadata"])["reapplied"] == 1
+
+
+def test_the_price_of_a_rollback_is_said_before_it_is_paid(store, snapshots, recovery,
+                                                           forget):
+    """`cost` is the reading an approval is given against, and it is checked against the act.
+
+    One record predates the snapshot and was forgotten after it, one was written after it. The
+    first is the price §C4 promises to keep, the second the price the owner pays, and the
+    number quoted beforehand has to be the number reported afterwards.
+    """
+    secret = committed(store, source_id="msg-1", text="A diagnosis nobody else needs.")
+    made = snapshots.create(reason="baseline", actor=OWNER)["snapshot"]
+    forget(secret)
+    later = committed(store, source_id="msg-2", text="Written afterwards.")
+
+    cost = recovery.cost(made.id)
+    assert cost == {"readable_now": 1,
+                    "readable_in_the_snapshot": 1,
+                    "destroyed": 1,
+                    "brought_back": 1,
+                    "brought_back_and_already_forgotten": 1}
+    assert all(isinstance(price, int) for price in cost.values()), \
+        "a plan that lists record ids puts private evidence in the shell's scrollback"
+
+    report = recovery.restore(made.id, actor=OWNER)
+    assert report["reapplied"] == cost["brought_back_and_already_forgotten"], \
+        "the restore did not keep the price the plan quoted"
+    assert store.get(later) is None, "evidence the plan said would go is still readable"
+
+
+def test_a_snapshot_taken_after_a_forgetting_promises_nothing_come_back(store, snapshots,
+                                                                        recovery, forget):
+    """The copy already holds the grave, so restoring it neither loses nor resurrects it.
+
+    `deleted=1` means unreadable on both sides of the comparison. Reading the snapshot's rows
+    without that filter would talk an owner out of a rollback that costs nothing by claiming
+    a buried record is one the restore brings back.
+    """
+    secret = committed(store, source_id="msg-1", text="Withdrawn before the snapshot.")
+    forget(secret)
+    made = snapshots.create(reason="after the forgetting", actor=OWNER)["snapshot"]
+    committed(store, source_id="msg-2", text="Written afterwards.")
+
+    cost = recovery.cost(made.id)
+    assert cost["readable_now"] == 1 and cost["readable_in_the_snapshot"] == 0
+    assert cost["brought_back"] == 0 and cost["brought_back_and_already_forgotten"] == 0, \
+        "a row the snapshot already holds buried is counted as evidence returning"
+    assert cost["destroyed"] == 1, "only the write after the snapshot is a loss"

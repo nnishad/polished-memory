@@ -158,6 +158,30 @@ class Recovery:
 
     # -- rollback ------------------------------------------------------------
 
+    def cost(self, snapshot_id: str, *, carried: Ledger | None = None) -> dict[str, int]:
+        """What taking the store back to *snapshot_id* destroys, brings back and re-erases.
+
+        The whole price of a rollback is the evidence written after its snapshot, so that
+        price has to be on the reading an approval is given against. Counts alone: a plan
+        goes to a terminal and often into a log, so record ids stay out of it. The
+        already-forgotten figure is the promise of §C4 stated before the act rather than
+        after it — and it is the same set `apply()` re-buries, so the approval and the
+        report can be compared.
+        """
+        item = self.snapshots.resolve(snapshot_id)
+        kept = carried if carried is not None else self.carry()
+        forgotten = {str(row["record_id"]) for row in kept.tables.get("tombstones") or []}
+        live = {str(row["id"]) for row in
+                self.db.execute("SELECT id FROM records WHERE deleted=0")}
+        with open_read_only(item.database) as donor:
+            before = {str(row["id"]) for row in
+                      donor.execute("SELECT id FROM records WHERE deleted=0")}
+        return {"readable_now": len(live),
+                "readable_in_the_snapshot": len(before),
+                "destroyed": len(live - before),
+                "brought_back": len(before - live),
+                "brought_back_and_already_forgotten": len((before - live) & forgotten)}
+
     def restore(self, snapshot_id: str, *, actor: str, bank_id: str | None = None) \
             -> dict[str, Any]:
         """Take the store back to a snapshot, keeping every decision made since.
