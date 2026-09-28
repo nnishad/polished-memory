@@ -35,17 +35,28 @@ SEVERITIES = (OK, WARN, FAIL)
 SCAN_RECORDS = 500
 # How old an uncheckpointed WAL may get before it is worth mentioning, in bytes.
 WAL_WARN_BYTES = 64 * 1024 * 1024
-PROBE_TEXT = "Hermes doctor synthetic probe. This sentence is a connectivity test."
+#: What the probe retains. It is an assertion about a synthetic event with a date and an
+#: object in it, and that shape is deliberate: the engine's retain answers before the model
+#: has decided what, if anything, the text is worth, and a self-describing sentence — which is
+#: what this probe used to retain — is the sort of thing an extractor answers "nothing" to. On
+#: this installation that sentence produced no memory unit at all about a third of the time,
+#: so the door reported a working backend as silently broken. A fact-shaped synthetic sentence
+#: produced exactly one unit every time.
+PROBE_TEXT = ("The synthetic probe recorded that gate reservation 118 was settled by "
+              "the operator on 2026-09-02.")
+#: Asked of the same words the document was written with, so a finding of nothing is about
+#: the search path and not about the door's choice of phrasing.
+PROBE_QUERY = "synthetic probe gate reservation 118"
 #: The id the probe retains under. It cannot contain `_` or `~`, because the engine escapes
 #: them when it composes chunk ids and an escaped chunk cannot be traced back to a document —
 #: and this framework refuses such an id rather than sending it, so a name written with an
 #: underscore here fails the probe before it ever reaches the backend.
 PROBE_DOCUMENT_ID = "doctor-probe"
-#: How many times, and how far apart, the round trip looks for what it just retained. The
-#: engine answers a retain before the derived units are searchable, so one immediate read
-#: reports a healthy backend as broken — and an operator who has just been told their
-#: retrieval is silently empty does not trust the next finding either. Bounded, and the
-#: window it spent is in the evidence, so a real fault is still named after the wait.
+#: How many times, and how far apart, the door looks for the units its retain should have
+#: caused. Derivation is a model call, so it may lag the write; waiting for it is what keeps a
+#: slow answer from being reported as a missing one. Measured on the live engine the units were
+#: there immediately every time, so this window is the bound, not the expected path — and the
+#: time it did spend is in the evidence, so an operator can tell the two apart.
 PROBE_SETTLE_READS = 4
 PROBE_SETTLE_WAIT_S = 10.0
 
@@ -530,14 +541,16 @@ class Doctor:
                                      sleeper: Callable[[float], None] = time.sleep) -> Finding:
         """One bounded, synthetic write and read, in a bank of its own.
 
-        The text is a fixed sentence and the bank is named for the probe, so nothing
-        private is sent and nothing of the owner's is overwritten. This is the only
-        doctor action that talks to a model or stores anything outside the canonical
-        record set, and it happens only when it was asked for by name.
+        The text is a fixed sentence and the bank is named for the probe, so nothing private is
+        sent and nothing of the owner's is overwritten. This is the only doctor action that
+        talks to a model or stores anything outside the canonical record set, and it happens
+        only when it was asked for by name.
 
-        The read is repeated inside a bounded window, because a synchronous retain is
-        answered before the engine has anything searchable derived from it: one immediate
-        read calls a working backend broken. Running out of the window is still the failure.
+        Three readings, because three parts can be broken and they need different remedies: the
+        write was accepted, the backend derived a memory unit from it, and the search finds that
+        unit when asked in its own words. The derivation is read back by document id rather than
+        inferred from recall, because a recall that answers nothing looks exactly like one that
+        was never searchable, and the two mean different things about a different component.
         """
         client = self.client()
         if client is None:
@@ -545,6 +558,7 @@ class Doctor:
                            "configure a route first")
         attempts = max(1, int(reads))
         waited = 0.0
+        units = 0
         returned = 0
         failed = None
         left_behind = None
@@ -552,12 +566,14 @@ class Doctor:
             client.retain(document_id=PROBE_DOCUMENT_ID, content=PROBE_TEXT,
                           metadata={"probe": "doctor"})
             for attempt in range(1, attempts + 1):
-                found = client.recall("doctor synthetic probe", max_tokens=64)
-                returned = len(found.results)
-                if returned or attempt == attempts:
+                state = client.document_state(PROBE_DOCUMENT_ID)
+                units = int(state.get("count") or 0)
+                if units or attempt == attempts:
                     break
                 sleeper(wait_s)
                 waited += wait_s
+            if units:
+                returned = len(client.recall(PROBE_QUERY, max_tokens=64).results)
         except Exception as error:
             failed = str(error)[:300]
         finally:
@@ -570,8 +586,8 @@ class Doctor:
                 # document stays in the probe bank, and a report that swallowed this would
                 # leave a stranger's probe text sitting there with nobody to say so.
                 left_behind = str(error)[:200]
-        evidence = {"returned": returned, "bank": self.probe_bank, "reads": attempts,
-                    "waited_seconds": waited}
+        evidence = {"units": units, "returned": returned, "bank": self.probe_bank,
+                    "reads": attempts, "waited_seconds": waited}
         if left_behind is not None:
             evidence["not_deleted"] = left_behind
         if failed is not None:
@@ -580,16 +596,26 @@ class Doctor:
                            "check the backend's own logs; the framework wrote nothing "
                            "about this to the canonical store",
                            evidence)
+        settling = f" ({waited:g}s spent waiting for it)" if waited else ""
+        if not units:
+            return Finding("synthetic-probe", FAIL,
+                           f"the backend took the text and derived no memory unit from "
+                           f"it{settling}",
+                           "a retain that produces nothing is the model behind extraction, not "
+                           "the index: ask which route the backend's retains are served by. "
+                           "Nothing was derived, so recall has nothing to find",
+                           evidence)
         if not returned:
             return Finding("synthetic-probe", FAIL,
-                           f"the backend took the text and still could not find it after "
-                           f"{waited:g}s of settling",
-                           "a backend that retains without indexing makes recall silently "
-                           "empty; re-check after its index settles",
+                           f"the backend derived {units} unit(s) from the text and cannot "
+                           f"find any of them{settling}",
+                           "the write path answers and the search path does not, which points "
+                           "at the embeddings model the bank is indexed with rather than at "
+                           "the retain",
                            evidence)
         return Finding("synthetic-probe", OK,
-                       "a synthetic document survived retain and recall"
-                       + ("" if not waited else f", after {waited:g}s of settling"),
+                       "a synthetic document survived retain, derivation and recall"
+                       + ("" if not waited else f", after {waited:g}s of waiting"),
                        evidence=evidence)
 
 

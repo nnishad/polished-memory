@@ -18,8 +18,9 @@ import pytest
 from hermes_memory.backend.hindsight_client import HindsightError
 from hermes_memory.config import load_settings
 from hermes_memory.ids import document_id_is_ambiguous
-from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, PROBE_SETTLE_READS,
-                                            PROBE_SETTLE_WAIT_S, WARN, Doctor, Finding)
+from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, PROBE_QUERY,
+                                            PROBE_SETTLE_READS, PROBE_SETTLE_WAIT_S,
+                                            PROBE_TEXT, WARN, Doctor, Finding)
 from hermes_memory.storage.evidence import EvidenceStore
 
 APPROVED_LAN = "192.168.68.65"
@@ -48,16 +49,20 @@ class FakeBackend:
 
     It obeys what it is asked rather than answering one fixed thing: a probe whose fake
     returns results whatever the door did would let the door stop looking entirely and
-    still report a healthy backend.
+    still report a healthy backend. Causality is part of that — nothing is findable before
+    anything has been derived — because the fault the door has to tell apart is exactly
+    between those two stages.
     """
 
     def __init__(self, *, bank_id="probe-bank", healthy=True, results=(1, 2),
-                 fail_on=None, empty_reads=0):
+                 fail_on=None, units_after=0, findable=True):
         self.bank_id = bank_id
         self.healthy = healthy
         self.results = tuple(results)
         self.fail_on = set(fail_on or ())
-        self.empty_reads = empty_reads
+        self.units_after = units_after      # state reads that still report nothing derived
+        self.findable = findable
+        self.derived = False
         self.calls: list[str] = []
 
     def health(self):
@@ -74,20 +79,32 @@ class FakeBackend:
         # id at all let the probe keep a name that could never work outside these tests.
         if document_id_is_ambiguous(kwargs["document_id"]):
             raise HindsightError(f"ambiguous document id {kwargs['document_id']!r}")
+        self.derived = False
         return {"document_id": kwargs["document_id"]}
+
+    def document_state(self, document_id):
+        """The deterministic reading: does the backend have a unit for this document yet."""
+        self.calls.append("state")
+        if "state" in self.fail_on:
+            raise RuntimeError("the list endpoint is not answering")
+        self.derived = self.calls.count("state") > self.units_after
+        return {"document_id": document_id,
+                "state": "present" if self.derived else "absent",
+                "count": 1 if self.derived else 0}
 
     def recall(self, query, **kwargs):
         self.calls.append("recall")
         if "recall" in self.fail_on:
             raise RuntimeError("no index yet")
-        if self.calls.count("recall") <= self.empty_reads:
-            return SimpleNamespace(results=())     # retained, not searchable yet
+        if not self.derived or not self.findable:
+            return SimpleNamespace(results=())   # nothing derived, or nothing searchable
         return SimpleNamespace(results=self.results)
 
     def delete_document(self, document_id):
         self.calls.append("delete")
         if "delete" in self.fail_on:
             raise RuntimeError("the bank is read-only")
+        self.derived = False
         return {"deleted": True}
 
 
@@ -585,7 +602,21 @@ def test_a_round_trip_probe_cleans_up_after_itself(store):
     backend = FakeBackend(results=(1,))
     finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip()
     assert finding.severity == OK
-    assert backend.calls == ["retain", "recall", "delete"]
+    assert backend.calls == ["retain", "state", "recall", "delete"]
+    assert finding.as_dict()["units"] == 1 and finding.as_dict()["returned"] == 1
+
+
+def test_the_probe_asks_recall_in_the_words_it_just_wrote():
+    """A query unrelated to what was retained cannot tell a broken search from a fair question.
+
+    The other half of the sentence's shape is that it asserts something with a date and an
+    object in it: the boilerplate this probe used to retain — a sentence about being a probe —
+    is the kind of text an extraction model answers "nothing" to, and on this installation it
+    did so about a third of the time, which the door then reported as an empty index.
+    """
+    asked = set(PROBE_QUERY.lower().split())
+    written = {word.strip(".") for word in PROBE_TEXT.lower().split()}
+    assert {"synthetic", "probe", "reservation", "118"} <= asked & written
 
 
 def test_the_probe_retains_under_a_name_the_client_will_accept():
@@ -629,40 +660,71 @@ def test_a_probe_that_fails_and_cannot_clean_up_reports_both_facts(store):
     assert evidence["not_deleted"] == "the bank is read-only"
 
 
-def test_a_backend_that_retains_without_indexing_is_the_failure_itself(store):
-    finding = Doctor(store, backend=lambda: FakeBackend(results=())
-                     ).backend_synthetic_round_trip(reads=1)
-    assert finding.severity == FAIL
-    assert "silently empty" in finding.remedy
+def test_a_retain_that_takes_a_moment_to_derive_is_not_called_broken(store):
+    """The engine answers a retain before it has decided what the text was worth.
 
-
-def test_a_retain_that_takes_a_moment_to_be_searchable_is_not_called_broken(store):
-    """A synchronous retain is answered before the engine has anything to recall.
-
-    Read once, immediately, that is indistinguishable from a backend which stores without
-    indexing — which is exactly how the live probe reported a backend that answered the same
-    query a few seconds later. The window is the door's own, bounded, and counted.
+    How long it is given is the door's own bounded window, counted and reported: this is the
+    wait that separates a derivation still in flight from a backend that stores without
+    ever indexing.
     """
     slept: list[float] = []
-    backend = FakeBackend(results=(1,), empty_reads=2)
+    backend = FakeBackend(results=(1,), units_after=2)
     finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip(
         reads=4, wait_s=7.5, sleeper=slept.append)
     assert finding.severity == OK
     assert slept == [7.5, 7.5], "the door waits on its own clock, not the backend's"
-    assert backend.calls.count("recall") == 3
+    assert backend.calls.count("state") == 3
+    assert backend.calls.count("recall") == 1, "the search is asked once the units exist"
     assert finding.as_dict()["waited_seconds"] == 15.0
-    assert "after 15s of settling" in finding.detail
+    assert "after 15s of waiting" in finding.detail
 
 
-def test_a_backend_still_empty_after_the_window_keeps_failing(store):
+def test_units_that_never_arrive_are_a_failure_after_the_wait(store):
+    """Running out of the window is still the failure; the wait only makes it honest."""
     slept: list[float] = []
-    finding = Doctor(store, backend=lambda: FakeBackend(results=())
+    finding = Doctor(store, backend=lambda: FakeBackend(units_after=9)
                      ).backend_synthetic_round_trip(reads=3, wait_s=5.0,
                                                     sleeper=slept.append)
     assert finding.severity == FAIL
     assert slept == [5.0, 5.0], "the last read is not followed by a wait nobody will act on"
-    assert "after 10s of settling" in finding.detail
-    assert finding.as_dict()["returned"] == 0
+    assert "(10s spent waiting for it)" in finding.detail
+    assert finding.as_dict()["units"] == 0
+
+
+def test_a_backend_that_derives_nothing_names_the_model_rather_than_the_index(store):
+    """The live fault, and the live lie about it.
+
+    A retain answered success, cost 2035 tokens, and left no memory unit behind — the
+    extraction model had simply found nothing in the sentence. Reported as an empty index, it
+    sent the operator to the wrong component while the finding swore retrieval was silently
+    broken.
+    """
+    backend = FakeBackend(units_after=3)
+    finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip(reads=2)
+    assert finding.severity == FAIL
+    assert "derived no memory unit" in finding.detail
+    assert "extraction" in finding.remedy
+    assert "delete" in backend.calls, "a failed derivation still gets its document back"
+    assert "recall" not in backend.calls, (
+        "nothing was derived, so asking the search path costs a model call for no answer")
+
+
+def test_a_window_of_no_reads_still_looks_once(store):
+    """The bound is a floor as well as a ceiling: zero reads is not a reading."""
+    backend = FakeBackend(results=(1,))
+    finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip(reads=0)
+    assert finding.severity == OK
+    assert backend.calls.count("state") == 1
+
+
+def test_units_that_cannot_be_found_are_the_search_paths_fault_not_the_writes(store):
+    """Derived, stored, and still not findable: a different part, and a different remedy."""
+    finding = Doctor(store, backend=lambda: FakeBackend(results=(), findable=False)
+                     ).backend_synthetic_round_trip(reads=1)
+    assert finding.severity == FAIL
+    assert "cannot find any of them" in finding.detail
+    assert "embeddings" in finding.remedy
+    assert finding.as_dict()["units"] == 1, "the write is proved even as the read fails"
 
 
 def test_a_probe_that_cannot_clean_up_after_itself_says_so(store):
