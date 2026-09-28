@@ -1810,12 +1810,16 @@ def _summarize_command(settings, args) -> int:
                                           "with --review <digest> and an --actor; a summary "
                                           "costs tokens and is attributed to whoever asked"})
     try:
-        return _emit(summarize_apply(settings, scope=args.scope, kind=args.kind,
-                                     review=args.review, actor=actor, limit=limit,
-                                     since=args.since, title=args.title))
+        report = summarize_apply(settings, scope=args.scope, kind=args.kind,
+                                 review=args.review, actor=actor, limit=limit,
+                                 since=args.since, title=args.title)
     except SummarizeError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
+    # A summary that was approved, spent a device slot on, and then did not happen has to
+    # leave a non-zero code behind: the reason is in the body for a person, and the code is
+    # for the timer that ran it. `maintain` and `cancel` already answer this way.
+    return _emit(report, 2 if report.get("ok") is False else 0)
 
 
 def _evaluate_command(settings, args) -> int:

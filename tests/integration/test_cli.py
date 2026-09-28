@@ -2030,6 +2030,37 @@ def test_an_import_of_rows_is_not_an_import_of_a_summary(home, samples):
     assert run("measure", "--what", "weight")[1]["samples"] == 4
 
 
+def test_an_approved_summary_that_did_not_happen_leaves_a_failing_code(home, monkeypatch):
+    """The body carries the reason for a person; the exit code is for the timer that ran it.
+
+    `maintain` and `cancel` already answer this way. A door that was approved, took a device
+    slot and then wrote nothing must not exit 0, or whatever called it files a summary that
+    does not exist.
+    """
+    proposal = {"review_digest": "0" * 64, "scope": "project:survey", "kind": "day",
+                "records": 1, "selected": [], "window": [None, None],
+                "per_call_tokens": 100, "blocking": [], "coverage": "full",
+                "processor_fingerprint": "fp"}
+    monkeypatch.setattr("hermes_memory.processing.summarization.summarize_plan",
+                        lambda *a, **k: proposal)
+    refused = {"ok": False, "refused": "remote-9b is occupied; nothing was sent",
+               "scope": "project:survey", "kind": "day", "refreshes_settled": 0}
+    monkeypatch.setattr("hermes_memory.processing.summarization.summarize_apply",
+                        lambda *a, **k: refused)
+    code, report = run("summarize", "--scope", "project:survey", "--actor", OWNER,
+                       "--review", "0" * 64)
+    assert code == 2, "an approved action that did not happen reported success"
+    assert report == refused
+
+    written = {"ok": True, "scope": "project:survey", "kind": "day",
+               "summary_id": "sum_1", "revision": 1}
+    monkeypatch.setattr("hermes_memory.processing.summarization.summarize_apply",
+                        lambda *a, **k: written)
+    code, report = run("summarize", "--scope", "project:survey", "--actor", OWNER,
+                       "--review", "0" * 64)
+    assert code == 0 and report == written, "the summary that was written is not a failure"
+
+
 def test_keeping_a_sample_export_as_rows_demands_the_choice(home, samples):
     run("init")
     code, message = errors("import", "--source", "structured", "--path", str(samples))
