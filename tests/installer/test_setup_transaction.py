@@ -1294,3 +1294,44 @@ def test_the_shipped_backend_environment_satisfies_the_checks_it_will_be_read_by
     for key, value in values.items():
         if key.endswith("_BASE_URL") and value.strip():
             assert endpoint_is_private(value.strip()), f"{template}: {key}={value}"
+
+
+def test_a_step_with_nothing_to_install_does_not_need_a_checkout_to_exist(installation,
+                                                                          monkeypatch):
+    """The crash was `None / "integrations"`, on a re-run of a healthy installation.
+
+    A release installed into a venv has no source checkout beside it, and the host already
+    registers this very commit, so there is no plugin to install — which made the digest
+    comparison the step's *second* branch ask a question about a checkout it had just been
+    told does not exist. `setup` exited with a TypeError instead of reporting that everything
+    was already done.
+    """
+    from hermes_memory.install import setup as door
+
+    monkeypatch.setattr(door, "_registration_source", lambda: None)
+    settings, environ = installation
+    revision = "e" * 40
+    activity = registered_host(Path(settings.home).parent, revision)
+    runner = Heremes(activity / "config.yaml")
+
+    proposal = plan(settings, hermes_home=activity, environ=environ, ref=revision,
+                    runner=runner)
+    said = [step for step in proposal["steps"] if step["step"] == "register-plugin"]
+    assert said and said[0]["blocking"] == [], said
+    assert any("already registers hermes-memory" in line for line in said[0]["actions"]), said
+
+
+def test_a_plugin_that_has_to_be_installed_and_has_no_checkout_says_so_twice(installation,
+                                                                            monkeypatch):
+    """The same absence, when there *is* an install to run, is two real blockers — not a crash."""
+    from hermes_memory.install import setup as door
+
+    monkeypatch.setattr(door, "_registration_source", lambda: None)
+    settings, environ = installation
+    activity = registered_host(Path(settings.home).parent, "c" * 40)
+    proposal = plan(settings, hermes_home=activity, environ=environ, ref="d" * 40,
+                    runner=lambda argv: (0, ""))
+    said = [step for step in proposal["steps"] if step["step"] == "register-plugin"]
+    assert len(said[0]["blocking"]) == 2, said[0]["blocking"]
+    assert any("no checkout carrying" in line for line in said[0]["blocking"])
+    assert any("registers hermes-memory at" in line for line in said[0]["blocking"])

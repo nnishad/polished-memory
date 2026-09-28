@@ -588,11 +588,13 @@ def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
                         "checkout carrying integrations/hermes-memory is reachable from "
                         "here; run setup from the release's source checkout, or publish it "
                         "and register from the remote")
-    elif (_plugin_digest(registration / "integrations" / "hermes-memory")
-          != _tree_digest(ctx)):
+    elif commands and (_plugin_digest(registration / "integrations" / "hermes-memory")
+                       != _tree_digest(ctx)):
         # The runtime comes from the release and the host's copy comes from the checkout, so
         # an agreement between them is the whole of §10.3's pairing. Without it the plugin
-        # would keep calling a contract the installed code no longer has.
+        # would keep calling a contract the installed code no longer has. Asked only when
+        # there is a command to run: a checkout that differs from a release is nobody's
+        # problem when the host already registers that release and nothing will be installed.
         blocking.append("the plugin in the checkout does not match the one this release "
                         "carries; registering it would pair a new runtime with an old host "
                         "half of the same contract")
