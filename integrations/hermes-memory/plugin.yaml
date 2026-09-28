@@ -38,18 +38,18 @@ provides_tools:
 # left as a durable artifact for cron to collect.
 provides_hooks: []
 
-# Maps to plugins.entries.hermes-memory.settings. Distinct from the provider's
-# own get_config_schema(), which drives `hermes memory setup`.
+# Maps to plugins.entries.hermes-memory.settings. The host parses this as a flat mapping of
+# setting name -> spec ({type: str, description: …}), *not* as JSON Schema: writing it as
+# `{type: object, properties: {…}, additionalProperties: false}` made the host skip `type`
+# and `additionalProperties` as non-mappings and register a setting literally named
+# `properties`, so none of the three settings below were reachable from the host at all.
 config_schema:
-  type: object
-  properties:
-    data_dir:
-      type: string
-      description: Canonical memory data directory.
-    hindsight_url:
-      type: string
-      description: Private Hindsight API endpoint (loopback or LAN literal only).
-    foreground_deadline_s:
-      type: number
-      description: Ceiling for a foreground context packet, in seconds.
-  additionalProperties: false
+  data_dir:
+    type: str
+    description: Canonical memory data directory.
+  hindsight_url:
+    type: str
+    description: Private Hindsight API endpoint (loopback or LAN literal only).
+  foreground_deadline_s:
+    type: float
+    description: Ceiling for a foreground context packet, in seconds.

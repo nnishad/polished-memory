@@ -1266,3 +1266,38 @@ def test_the_manifest_claims_exactly_what_the_provider_registers(provider):
         (f"the manifest declares {sorted(listed('provides_tools') or [])} but the provider "
          f"registers {registered}")
 
+
+def test_the_config_schema_is_the_shape_the_host_parses():
+    """The host reads `config_schema` as name -> spec, not as JSON Schema.
+
+    Written as `{type: object, properties: {…}}`, the host skipped `type` and
+    `additionalProperties` as non-mappings and registered a setting literally called
+    `properties` — so every real setting was unreachable, with only a warning line in the
+    agent log to show for it.
+    """
+    lines = (PLUGIN / "plugin.yaml").read_text(encoding="utf-8").splitlines()
+    head = next(i for i, line in enumerate(lines) if line.startswith("config_schema:"))
+    children = {}
+    current = None
+    for line in lines[head + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith("  "):
+            break
+        indent = len(line) - len(line.lstrip())
+        key, _, value = line.strip().partition(":")
+        if indent == 2:
+            current = key
+            children[current] = {}
+        elif indent >= 4 and current is not None and value.strip():
+            children[current][key] = value.strip().strip('"\'')
+
+    accepted = {"str", "string", "int", "integer", "float", "number", "bool", "boolean",
+                "list", "array", "dict", "object", "secret"}
+    assert set(children) == {"data_dir", "hindsight_url", "foreground_deadline_s"}, \
+        "the host's parser registers each top-level key here as a setting of that name"
+    for name, spec in children.items():
+        assert spec, f"{name} declares no spec, so the host would skip it"
+        assert str(spec.get("type", "")).lower() in accepted, \
+            f"{name} declares type {spec.get('type')!r}, which the host cannot type-check"
+
