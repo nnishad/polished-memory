@@ -689,13 +689,18 @@ def _inventory_command(settings, args) -> int:
     can see but whether any of it should stop an install, and a script that gates on it
     should not have to re-derive the answer from a 60-key report.
     """
-    from .install.inventory import conflicts, survey
+    from .install.inventory import blocking, conflicts, survey
 
     report = survey(settings, hermes_home=args.hermes_home)
     if args.conflicts:
-        blocking = conflicts(report)
-        print(json.dumps(blocking, indent=2, sort_keys=True))
-        return 1 if blocking else 0
+        # Only the reasons that stop a run, and only those decide the exit status. The rest of
+        # what `conflicts()` finds is worth reading before a setup and is not a reason to skip
+        # one — a port this installation already holds is replaced by the run, not collided
+        # with — and reporting them as failures made a healthy running installation look
+        # blocked to the one command written to answer that question.
+        stopping = blocking(report)
+        print(json.dumps(stopping, indent=2, sort_keys=True))
+        return 1 if stopping else 0
     return _emit({**report, "conflicts": conflicts(report)})
 
 

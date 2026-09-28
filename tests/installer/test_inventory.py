@@ -14,8 +14,9 @@ from pathlib import Path
 import pytest
 
 from hermes_memory.install import inventory as inventory_module
-from hermes_memory.install.inventory import (conflicts, listening_ports,
-                                            provider_selection, survey)
+from hermes_memory.install.inventory import (BLOCKING_MARKERS, blocking, blocks_setup,
+                                            conflicts, listening_ports, provider_selection,
+                                            survey)
 from hermes_memory.storage.evidence import EvidenceStore
 
 OWNER = "jugaadu"
@@ -417,6 +418,8 @@ def test_a_port_held_by_this_installation_s_own_process_is_not_a_collision(insta
     assert any("4242" in line and "replaces" in line for line in said), said
     assert not any("already listening" in line for line in said), \
         "this installation's own listener must not carry the blocking sentence"
+    assert blocking(report) == [], \
+        "the sentences worth saying before a run are not the ones that stop it"
 
 
 def test_a_process_whose_descriptors_cannot_be_read_does_not_end_the_search(installation,
@@ -437,6 +440,47 @@ def test_a_process_whose_descriptors_cannot_be_read_does_not_end_the_search(inst
     assert report["endpoints"]["unattributed"] == []
 
 
+def test_the_gate_closes_on_collisions_and_on_nothing_else(installation, tmp_path, monkeypatch):
+    """Seven reasons to say something, of which exactly four are reasons to stop.
+
+    This is the whole content of `inventory --conflicts`'s exit status. A stranger on a wanted
+    port, a second capture owner, no hermes to register against and no principal who can
+    confirm a forgetting each mean a run here would act on something that is not this
+    installation's to act on. A loose permission, a credential left at rest and a delivery
+    switch with no destination are this installation's own business, worth fixing and no
+    reason to refuse the run. Count the partition rather than spot-checking it: a sentence
+    that quietly moved from one side to the other is the difference between a healthy
+    installation reading as blocked and a broken one reading as fine (§10.4).
+    """
+    home, _ = installation
+    (home / "hermes-memory.env").write_text(
+        config(home, HINDSIGHT_URL="http://127.0.0.1:8080",
+               HINDSIGHT_API_KEY="a-secret-left-in-a-config-file",
+               DELIVERY_ENABLED="true", DELIVERY_TARGET="nobody-has-agreed-to-this"), encoding="utf-8")
+    (home / "hermes-memory.env").chmod(0o644)
+    (home / "data" / "live").mkdir(parents=True)
+    (home / "data" / "live" / "canonical.db").write_text("", encoding="utf-8")
+    (home / "data" / "stray").mkdir(parents=True)
+    (home / "data" / "stray" / "canonical.db").write_text("", encoding="utf-8")
+    monkeypatch.setattr(inventory_module, "shutil", FakePath({}))
+
+    from hermes_memory.config import load_settings
+
+    report = survey(load_settings(), hermes_home=tmp_path, environ={},
+                    proc=a_port_8080_in_use(tmp_path))
+    said = conflicts(report)
+    assert len(said) == 7, said
+
+    stopping = blocking(report)
+    assert len(stopping) == 4, stopping
+    assert all(blocks_setup(line) for line in stopping)
+    for marker in BLOCKING_MARKERS:
+        assert any(marker in line for line in stopping), marker
+    assert not any("readable beyond its owner" in line for line in stopping)
+    assert not any("holds a credential value" in line for line in stopping)
+    assert not any("no usable destination" in line for line in stopping)
+
+
 def test_a_port_held_by_a_stranger_on_another_stack_is_still_a_collision(installation,
                                                                         tmp_path):
     """This installation's own v4 listener does not speak for whoever holds the v6 socket.
@@ -452,6 +496,8 @@ def test_a_port_held_by_a_stranger_on_another_stack_is_still_a_collision(install
         tmp_path, owner=home, other_stack=("7777", tmp_path / "other-installation")))
     assert shared["endpoints"]["held_by_ours"] == {}
     assert any("already listening" in line for line in conflicts(shared)), conflicts(shared)
+    assert any("already listening" in line for line in blocking(shared)), \
+        "somebody else's listener is the case that does stop the run"
 
     both = survey(settings, hermes_home=tmp_path, environ={}, proc=a_port_8080_in_use(
         tmp_path / "ours", owner=home, other_stack=("7777", home)))

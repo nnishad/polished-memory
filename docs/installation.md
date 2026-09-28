@@ -145,6 +145,19 @@ expire an approval that was about something else. A backup copy of a store, take
 profile's own `snapshots/` directory, is read as one copy of one owner rather than as a second
 capture owner.
 
+The same split is what a script is allowed to ask about:
+
+```sh
+hermes-memory inventory --conflicts    # prints the collisions, exits 1 if there is one
+```
+
+It prints the JSON array of the sentences that would stop a setup run and takes exit status 1
+if that array is non-empty and 0 if it is not, so a healthy installation that is up and
+serving — whose own listeners are the most interesting fact about it — is reported as not
+blocked. Plain `hermes-memory inventory` is the door for everything worth reading before a
+run, advisories included, and its exit status never carries an opinion about whether to
+proceed: the advice half of the split is for a human, and only the collision half gates.
+
 `--start` and `hermes-memory start` are the only ways anything gets started, and starting
 is a separate decision from installing the units. Autostart is a third decision:
 

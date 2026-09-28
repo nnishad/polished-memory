@@ -23,7 +23,8 @@ from urllib.parse import urlparse
 
 from ..config import DEFAULT_ENV_FILENAME, env_file_values
 
-__all__ = ["survey", "listening_ports", "provider_selection", "conflicts"]
+__all__ = ["survey", "listening_ports", "provider_selection", "conflicts", "blocking",
+           "blocks_setup", "BLOCKING_MARKERS"]
 
 ENV_PREFIX = "HERMES_MEMORY_"
 _HEX_PORT = re.compile(r"^[0-9A-Fa-f]{4}$")
@@ -462,3 +463,27 @@ def conflicts(report: dict[str, Any]) -> list[str]:
             and report["installation"]["delivery_target"] in ("unset", "malformed")):
         say.append("delivery is switched on with no usable destination to send to")
     return say
+
+
+#: Which of the sentences `conflicts()` produces describe a collision with something real.
+#: Everything else it can say is worth telling the operator and does not make this
+#: installation wrong: a loose permission, a credential at rest, a port this installation
+#: already holds and would simply replace (§10.4).
+BLOCKING_MARKERS = ("already listening", "capture owner", "no hermes executable",
+                    "no owner principal")
+
+
+def blocks_setup(line: str) -> bool:
+    """Would this sentence stop a setup run, or is it advice about the same machine?"""
+    return any(marker in line for marker in BLOCKING_MARKERS)
+
+
+def blocking(report: dict[str, Any]) -> list[str]:
+    """The reasons a setup run would be a bad idea, which is a smaller set than the reasons
+    worth saying before one.
+
+    This lives beside the sentences rather than beside either caller because both the setup
+    plan and `inventory --conflicts` have to answer it, and the second time round the phrasing
+    of a sentence changed in one file and silently stopped matching the other.
+    """
+    return [line for line in conflicts(report) if blocks_setup(line)]

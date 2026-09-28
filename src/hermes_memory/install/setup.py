@@ -23,7 +23,7 @@ from typing import Any, Callable, Sequence
 
 from ..config import DEFAULT_ENV_FILENAME, endpoint_is_private, env_file_values
 from ..ids import content_digest, digest, now
-from .inventory import conflicts, provider_selection, survey
+from .inventory import blocks_setup, conflicts, provider_selection, survey
 from .profiles import InstallationError, ProfileRegistry, STATE_FILENAME
 from .services import plan as service_plan
 from .uninstall import record_provider_selection
@@ -174,7 +174,7 @@ def _inventory(ctx: Context, *, apply: bool) -> dict[str, Any]:
     report = survey(ctx.settings, hermes_home=ctx.hermes_home, environ=ctx.environ,
                     proc=ctx.proc)
     said = conflicts(report)
-    blocking = [line for line in said if _collides(line)]
+    blocking = [line for line in said if blocks_setup(line)]
     wanted = report["endpoints"]["wanted"]
     held = sorted(name for name, point in wanted.items() if point["in_use"])
     return {
@@ -199,17 +199,6 @@ def _inventory(ctx: Context, *, apply: bool) -> dict[str, Any]:
                    # changed digest every second would make an approval meaningless.
                    "disk_readable": report["disk"]["free_bytes"] is not None},
     }
-
-
-def _collides(line: str) -> bool:
-    """A collision with something real stops the run; a messiness in the file does not.
-
-    A held port and a second capture owner mean two installations want one thing. A
-    loose permission or a credential at rest is the owner's to fix and does not make
-    this installation wrong, so it is said out loud and does not stop anything.
-    """
-    return any(marker in line for marker in ("already listening", "capture owner",
-                                             "no hermes executable", "no owner principal"))
 
 
 def _plan_step(ctx: Context, *, apply: bool) -> dict[str, Any]:

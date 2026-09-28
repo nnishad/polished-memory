@@ -518,12 +518,34 @@ def test_inventory_reports_the_installation_without_changing_it(home):
     assert not (home / "installation.db").exists()
 
 
-def test_the_conflicts_view_is_the_one_a_script_gates_on(home):
+def test_advice_about_an_installation_does_not_gate_a_script(home, capsys):
+    """`--conflicts` is the exit status a script gates on, so it may only carry blockers.
+
+    This fixture has something worth saying about itself and nothing that stops a setup run,
+    and the flag used to fail on exactly that — a healthy installation reporting itself
+    blocked to the one command written to answer the question.
+    """
     code, report = run("inventory")
-    assert code == 0 and report["conflicts"]
+    assert code == 0 and report["conflicts"], "there is advice to be had here"
+    assert _capture_exit(["inventory", "--conflicts"], _capture_stderr()) == 0, \
+        "advice is not a reason not to run setup"
+
+
+def test_a_blocking_fact_is_the_only_kind_that_moves_that_exit_status(home, capsys,
+                                                                     monkeypatch):
+    """The mapping from the two kinds of sentence to the flag's output and status."""
+    from hermes_memory.install import inventory
+
+    monkeypatch.setattr(inventory, "conflicts", lambda report: [
+        "the hindsight endpoint wants port 8080, which something is already listening on",
+        f"{home / 'hermes-memory.env'} is readable beyond its owner and holds the route "
+        "configuration"])
     errors = _capture_stderr()
     assert _capture_exit(["inventory", "--conflicts"], errors) == 1, \
         "a blocking fact must be visible in the exit status"
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == ["the hindsight endpoint wants port 8080, which something is already "
+                       "listening on"], "the flag prints only the reasons a run is a bad idea"
 
 
 def test_a_clean_installation_reports_no_conflicts(home):
