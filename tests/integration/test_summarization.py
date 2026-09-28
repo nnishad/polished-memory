@@ -340,6 +340,22 @@ def test_an_answer_with_no_words_in_it_leaves_the_scope_unsummarized(installatio
         assert store.db.execute("SELECT count(*) FROM summaries").fetchone()[0] == 0
 
 
+def test_a_reflection_gets_a_deadline_a_generation_can_meet(installation):
+    """The transport's read timeout sizes a lookup; a page of prose is not one.
+
+    Answering after a lookup's deadline is reported as an unconfirmed submission, which
+    quarantines a device slot and sends the operator to reconcile a call that was only slow
+    — as two live reflects on a 9B over the LAN did, one of which had already failed in 12.7s.
+    """
+    from hermes_memory.backend.hindsight_client import DEFAULT_TIMEOUT_S
+    from hermes_memory.processing.summarization import REFLECT_TIMEOUT_S, client_for
+
+    client = client_for(installation)
+    assert client.timeout == REFLECT_TIMEOUT_S
+    assert client.timeout > DEFAULT_TIMEOUT_S, \
+        "a generation is still expected to answer within a lookup's deadline"
+
+
 @pytest.mark.parametrize("error", [HindsightError("reflect failed: HTTP 400 — bad request"),
                                    HindsightUnavailable("connection reset mid-request")])
 def test_a_refused_refusal_is_recorded_as_a_failed_refresh_not_as_silence(installation, error):

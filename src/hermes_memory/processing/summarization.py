@@ -45,6 +45,13 @@ MAX_BATCH = MAX_CITATIONS_PER_SUMMARY
 # A day's summary is a claim about 24 hours of evidence; the ceiling is what stops it
 # from becoming a claim about the archive.
 _MAX_BODY_TOKENS = 1200
+#: A reflection is a generation, not a lookup. The transport's read timeout is sized for
+#: calls that answer in seconds — a health check, a submit that returns an operation id —
+#: and a small model asked to write a page over the LAN is neither: one failing reflect
+#: here took 12.7s before it answered at all, and a successful one is minutes of decoding.
+#: Waiting past the short deadline reads as "the backend may still be running it", which
+#: sends an operator to reconcile a slot for what is only a slow answer.
+REFLECT_TIMEOUT_S = 180.0
 
 SCOPE_FIELDS = ("project", "thread", "account", "source", "day", "week")
 _KIND_OF = {"project": "project", "thread": "thread", "account": "day",
@@ -356,7 +363,8 @@ def client_for(settings) -> Any:
     if not settings.hindsight_url:
         raise SummarizeError("no backend endpoint is configured")
     return HindsightClient(base_url=settings.hindsight_url, bank_id=settings.bank_id,
-                           api_key=scoped_secret(settings, settings.hindsight_api_key_env))
+                           api_key=scoped_secret(settings, settings.hindsight_api_key_env),
+                           timeout=REFLECT_TIMEOUT_S)
 
 
 # -- internals ---------------------------------------------------------------

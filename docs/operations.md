@@ -450,6 +450,14 @@ records than `--limit` allows: narrowing is the operator's call, not a prefix th
 presented as the whole. A `mental_model` reaches past the evidence, so only the owner
 principal may write one.
 
+A reflection is a generation rather than a lookup, so the backend call is given a
+generation's deadline: answering after a lookup's would be reported as an unconfirmed
+submission, which quarantines the device slot over a call that was merely slow. And
+whatever the reason — a timeout, a paused gate, a busy device, an exhausted budget, a
+backend that answers HTTP 500 because the configured model will not make the tool call
+`reflect` needs — a summary that was approved and did not happen exits non-zero with the
+reason in its body. The code is for the timer that ran it; the JSON is for the person.
+
 **Reading them** happens in every context packet. The broker takes the scopes the
 authorized evidence already belongs to and quotes the current reading of each — labelled
 as a reading, with a caveat saying it is not a second sighting of the evidence. A summary
