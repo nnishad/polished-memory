@@ -16,6 +16,11 @@ without an analyst or a broker, so there is no model to reach even by mistake. A
 delivered in the owner's own words with inference off — the engine deliberately works that
 way, so switching memory inference off must not switch proactivity off as a side effect — and
 every other section is either a local durable write or a read that ends in a report.
+
+One section does reach outside the process, and it is the exception rather than a hole in the
+rule: a confirmed forgetting owed the derived backend a deletion, and the owner's confirmation
+is the authorization for that call. It asks for no model, takes no slot and charges no budget —
+it is a cleanup call made because somebody already agreed to the consequence.
 """
 from __future__ import annotations
 
@@ -38,7 +43,8 @@ class Maintenance:
     """One bounded pass over the durable bookkeeping, safe to call on a timer."""
 
     def __init__(self, store, *, owner_principal: str | None = None, sync=None,
-                 gate=None, clock: Callable[[], float] = time.time):
+                 gate=None, clock: Callable[[], float] = time.time,
+                 backend=None, backend_unavailable: str = ""):
         from ..backend.provenance import ProvenanceLedger
         from ..knowledge.summaries import SummaryStore
         from ..processing.jobs import JobQueue
@@ -55,6 +61,11 @@ class Maintenance:
         self.owner_principal = owner_principal
         self.clock = clock
         self.gate = gate
+        # The backend this pass may settle a debt with. It is handed in rather than built here
+        # because the credential and the endpoint belong to the installation's configuration,
+        # and a pass that could not reach one says why instead of pretending it had nothing owed.
+        self.backend = backend
+        self.backend_unavailable = backend_unavailable
         self.jobs = JobQueue(store, clock=clock)
         self.summaries = SummaryStore(store, ledger=ProvenanceLedger(store),
                                      owner_principal=owner_principal)
@@ -242,12 +253,24 @@ class Maintenance:
         from ..lifecycle.erasure import ErasureManager
 
         manager = ErasureManager(self.store, owner_principal=self.owner_principal)
-        pending = manager.pending(limit=limit)
+        owed_before = manager.pending(limit=limit)
         awaiting = manager.awaiting(limit=limit)
-        return {"backend_owed": len(pending), "waiting_for_owner": len(awaiting),
-                "oldest_owed": pending[0]["requested_at"] if pending else None,
-                "note": "reported, not retried: an obligation to a backend nobody is "
-                        "authorized to call stays owed and says so"}
+        if self.backend is None:
+            return {"backend_owed": len(owed_before), "dispatched": 0, "cleared": 0,
+                    "waiting_for_owner": len(awaiting),
+                    "oldest_owed": owed_before[0]["requested_at"] if owed_before else None,
+                    "note": self.backend_unavailable or (
+                        "no backend client was handed to this pass, so a debt to the derived "
+                        "copy is reported rather than paid")}
+        outcome = manager.discharge(client=self.backend, limit=limit)
+        owed_after = manager.pending(limit=limit)
+        return {"backend_owed": len(owed_after), "dispatched": outcome["attempted"],
+                "cleared": len(outcome["settled"]), "waiting_for_owner": len(awaiting),
+                "oldest_owed": owed_after[0]["requested_at"] if owed_after else None,
+                "still_owed": outcome["owed"][:5],
+                "note": (f"{len(outcome['settled'])} obligation(s) dispatched and read back as "
+                         f"gone, {len(outcome['owed'])} still answered for"
+                         if outcome["attempted"] else "nothing was owed to the backend")}
 
     # -- internals -----------------------------------------------------------
 
@@ -357,9 +380,11 @@ def run(settings, *, limit: int = DEFAULT_LIMIT, at: str | None = None,
     # admission ledger, and a read-only connection would raise partway through — losing
     # the heartbeat and making a live-but-failing scheduler look dead.
     gate = writable_gate(settings)
+    backend, unavailable = _backend_for(settings)
     try:
         report = Maintenance(opened, owner_principal=settings.owner_principal,
-                             sync=SyncController(opened), gate=gate).pass_now(
+                             sync=SyncController(opened), gate=gate, backend=backend,
+                             backend_unavailable=unavailable).pass_now(
                                  at=at, limit=limit, sections=sections)
     finally:
         if store is None:
@@ -367,6 +392,23 @@ def run(settings, *, limit: int = DEFAULT_LIMIT, at: str | None = None,
     report["ok"] = True
     report["profile"] = getattr(settings, "profile", None)
     return report
+
+
+def _backend_for(settings) -> tuple[Any, str]:
+    """The client a pass may settle erasure debts with, or the reason it has none.
+
+    An installation with no derived backend is the ordinary case rather than a fault, so this
+    is a pair and not an exception: the report says which situation it is in.
+    """
+    from ..processing.formation import backend_client
+
+    if not getattr(settings, "hindsight_url", ""):
+        return None, "no derived backend is configured for this installation"
+    try:
+        return backend_client(settings), ""
+    except Exception as error:
+        return None, (f"the configured backend could not be addressed: "
+                      f"{type(error).__name__}: {str(error)[:200]}")
 
 
 def _bounded(value: int) -> int:

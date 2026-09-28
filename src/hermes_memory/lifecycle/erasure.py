@@ -366,6 +366,81 @@ class ErasureManager:
             raise
         return outcome
 
+    def discharge(self, *, client, limit: int = 20) -> dict[str, Any]:
+        """Pay the backend what a confirmed forgetting said it would clear.
+
+        A delete's own answer is not taken as proof: the same 404 means "already gone" to one
+        backend and "never looked up" to another, and this ledger exists so that an owner's
+        confirmation can be checked afterwards rather than trusted. Each obligation is
+        dispatched and then read back — a document clears when the backend lists no memory for
+        it, and a bank's derived obligation clears only when every document this intent named
+        reads back empty.
+
+        Nothing here waits on an operator's pause on the models. The local fence is already set
+        and the derived copy is exactly what the confirmation was about; a hold on inference
+        does not un-forget a person's text.
+        """
+        rows = self.pending(limit=_bounded(limit))
+        settled, owed = [], []
+        for row in rows:
+            intent, kind, reference = (str(row["intent_id"]), str(row["kind"]),
+                                       str(row["reference"]))
+            try:
+                cleared, detail = self._cleared(client, kind, reference, intent)
+            except Exception as error:
+                cleared, detail = False, f"{type(error).__name__}: {str(error)[:300]}"
+            if cleared:
+                self.store._audit("erasure_dispatched", intent,
+                                  {"kind": kind, "reference": reference})
+                settled.append({"kind": kind, "reference": reference,
+                                **self.verify(intent_id=intent, kind=kind,
+                                              reference=reference)})
+            else:
+                self.fail(intent_id=intent, kind=kind, reference=reference,
+                          error=detail or "the backend still answers for this reference")
+                owed.append({"kind": kind, "reference": reference, "error": detail})
+        return {"attempted": len(settled) + len(owed), "settled": settled, "owed": owed}
+
+    def _cleared(self, client, kind: str, reference: str, intent_id: str) -> tuple[bool, str]:
+        if kind == "backend_document":
+            document = self._document_of(reference)
+            if not document:
+                raise EvidenceError(f"obligation {reference!r} names no document")
+            client.delete_document(document)
+            return self._absent(client, document)
+        if kind == "backend_derived":
+            owed = self.db.execute(
+                "SELECT count(*) FROM erasure_targets WHERE intent_id=? "
+                "AND kind='backend_document' AND state!='verified'", (intent_id,)).fetchone()[0]
+            if owed:
+                # The bank's own clearing is proved through its documents, so it cannot be
+                # verified while one of them is still owed: the read-back would be a snapshot
+                # of a deletion that has not been shown to have happened.
+                return False, f"{owed} document obligation(s) of this intent are still owed"
+            named = [self._document_of(str(row["reference"])) for row in self.db.execute(
+                "SELECT reference FROM erasure_targets WHERE intent_id=? "
+                "AND kind='backend_document'", (intent_id,))]
+            still = [document for document in named
+                     if document and not self._absent(client, document)[0]]
+            if still:
+                return False, (f"{len(still)} of {len(named)} document(s) still answer at "
+                               f"{reference}")
+            return True, ""
+        raise EvidenceError(f"unknown erasure obligation kind {kind!r}")
+
+    def _absent(self, client, document_id: str) -> tuple[bool, str]:
+        state = client.document_state(document_id)
+        if str(state.get("state") or "") == "absent":
+            return True, ""
+        return False, f"the backend reads document {document_id} as {state.get('state')!r}"
+
+    @staticmethod
+    def _document_of(reference: str) -> str:
+        """The document out of a `backend:bank:document` address."""
+        _backend, _sep, rest = reference.partition(":")
+        _bank, _sep, document = rest.partition(":")
+        return document
+
     def _retire(self, intent_id: str) -> dict[str, Any]:
         """Recompute the intent's state. Settling one debt never fails for another's sake."""
         outstanding = self.db.execute(
@@ -386,7 +461,7 @@ class ErasureManager:
         if intent is None:
             raise EvidenceError(f"unknown erasure intent {intent_id!r}")
         targets = self.db.execute(
-            "SELECT kind, reference, state, attempts FROM erasure_targets "
+            "SELECT kind, reference, state, attempts, error FROM erasure_targets "
             "WHERE intent_id=? ORDER BY rowid", (intent_id,)).fetchall()
         return {**dict(intent), "obligations": [dict(row) for row in targets]}
 

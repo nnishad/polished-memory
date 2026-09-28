@@ -282,8 +282,11 @@ def serve(settings, *, store_factory: Callable[[], Any] | None = None,
         if store is not None and hasattr(store, "close"):
             store.close()
     # The background pass runs in the process that owns proactive state, per §4, and not
-    # in a unit of its own. It spends nothing — no model, no slot, no budget — which is
-    # what makes it safe to start here rather than to wait for somebody to approve a run.
+    # in a unit of its own. It spends no model, no device slot and no budget, which is what
+    # makes it safe to start here rather than to wait for somebody to approve a run. The one
+    # backend traffic it may generate is an erasure obligation the owner already confirmed:
+    # deleting a derived copy is not inference, and leaving it to wait for a model pass would
+    # mean a forgetting that quietly never happened.
     ticker = maintenance or Ticker(runner=lambda: maintenance_run(settings),
                                    interval_s=getattr(settings, "maintenance_interval_s", 0))
     ticker.start()

@@ -53,6 +53,29 @@ def text_of(store, match):
     return [item.text for item in store.search(match)]
 
 
+class ABackend:
+    """The two readings a discharge needs: put the document away, then ask what is left."""
+
+    def __init__(self, *, still_there=(), fail_with=None):
+        self.calls: list[str] = []
+        self.deleted: list[str] = []
+        self.still_there = set(still_there)
+        self.fail_with = fail_with
+
+    def delete_document(self, document_id):
+        self.calls.append("delete")
+        if self.fail_with:
+            raise RuntimeError(self.fail_with)
+        self.deleted.append(document_id)
+        return {"deleted": True, "document_id": document_id}
+
+    def document_state(self, document_id):
+        self.calls.append("state")
+        if document_id in self.still_there:
+            return {"document_id": document_id, "state": "present", "count": 2}
+        return {"document_id": document_id, "state": "absent", "count": 0}
+
+
 # -- the bytes an attachment holds -------------------------------------------
 
 def test_a_preview_counts_the_attachment_bytes_it_would_destroy(store, forget):
@@ -280,6 +303,142 @@ def test_a_failed_cleanup_attempt_counts_up_and_stays_pending(store, forget, pro
                if row["reference"] == item["reference"]]
     assert matched[0]["attempts"] == 1 and matched[0]["state"] == "pending"
     assert forget.pending() != []
+
+
+def test_a_confirmed_forgetting_is_paid_in_full_and_read_back(store, forget, projected):
+    """§C4: the derived copies are erased and *verified*, or the intent is not complete.
+
+    A delete's own answer is not proof — the same 404 means "already gone" to one backend and
+    "never looked up" to another — so every obligation is dispatched and then asked about.
+    """
+    record = committed(store, source_id="msg-1")
+    projected(record, "1")
+    document = store.db.execute("SELECT document_id FROM backend_documents").fetchone()[0]
+    preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+
+    backend = ABackend()
+    outcome = forget.discharge(client=backend)
+
+    assert backend.calls[:2] == ["delete", "state"], "the bank is asked after the delete"
+    assert backend.deleted == [document]
+    assert outcome["attempted"] == 2 and len(outcome["settled"]) == 2, outcome
+    assert forget.pending() == []
+    assert forget.status(preview["intent_id"])["state"] == COMPLETE
+    assert store.db.execute("SELECT state FROM backend_documents").fetchone()[0] == "absent"
+    audited = [json.loads(row["metadata"]) for row in store.db.execute(
+        "SELECT metadata FROM audit WHERE action='erasure_dispatched'")]
+    assert len(audited) == 2 and {item["kind"] for item in audited} == {
+        "backend_document", "backend_derived"}
+
+
+def test_a_delete_the_backend_refuses_leaves_the_debt_owed(store, forget, projected):
+    record = committed(store, source_id="msg-1")
+    projected(record, "1")
+    preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+
+    outcome = forget.discharge(client=ABackend(fail_with="connection refused"))
+
+    assert outcome["settled"] == [] and len(outcome["owed"]) == 2, outcome
+    assert "connection refused" in outcome["owed"][0]["error"]
+    assert forget.status(preview["intent_id"])["state"] == PENDING
+    obligations = forget.status(preview["intent_id"])["obligations"]
+    assert {item["attempts"] for item in obligations} == {1}, \
+        "an attempt is counted, not lost"
+    assert all(item["state"] == "pending" for item in obligations)
+    recorded = {item["kind"]: item["error"] for item in obligations}
+    assert "connection refused" in recorded["backend_document"], \
+        "why the debt is still owed belongs in the ledger, not only in the return value"
+    assert recorded["backend_derived"], "an obligation that could not be paid says so"
+
+
+def test_a_document_the_backend_still_answers_for_is_not_verified(store, forget, projected):
+    """The delete returned, and the index still lists memories for it: that is not cleared."""
+    record = committed(store, source_id="msg-1")
+    projected(record, "1")
+    document = store.db.execute("SELECT document_id FROM backend_documents").fetchone()[0]
+    preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+
+    outcome = forget.discharge(client=ABackend(still_there=[document]))
+
+    assert outcome["settled"] == []
+    assert {item["reference"] for item in outcome["owed"]} == {
+        f"hindsight:hermes:{document}", "hindsight:hermes"}
+    assert "reads document" in outcome["owed"][0]["error"], outcome["owed"][0]
+    assert "still owed" in outcome["owed"][1]["error"], outcome["owed"][1]
+
+
+def test_a_bank_is_asked_again_even_after_its_documents_were_verified(store, forget,
+                                                                     projected):
+    """"Verified" in an earlier pass is not the same as gone: the reading is what counts."""
+    record = committed(store, source_id="msg-1")
+    projected(record, "1")
+    document = store.db.execute("SELECT document_id FROM backend_documents").fetchone()[0]
+    preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+    item = [entry for entry in forget.pending() if entry["kind"] == "backend_document"][0]
+    forget.verify(intent_id=item["intent_id"], kind=item["kind"], reference=item["reference"])
+
+    outcome = forget.discharge(client=ABackend(still_there=[document]))
+
+    assert outcome["settled"] == []
+    assert "still answer" in outcome["owed"][0]["error"], outcome["owed"][0]
+
+
+def test_the_bank_s_obligation_waits_for_every_document_of_its_intent(store, forget, projected):
+    """Two documents, one bank: the bank cannot be proved gone while a document is still owed."""
+    first = committed(store, source_id="msg-1")
+    second = committed(store, source_id="msg-2")
+    projected(first, "1")
+    projected(second, "1")
+    documents = [row[0] for row in store.db.execute(
+        "SELECT document_id FROM backend_documents ORDER BY document_id")]
+    preview = forget.preview(record_ids=[first, second], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+
+    outcome = forget.discharge(client=ABackend(still_there=[documents[0]]))
+
+    settled = {item["kind"] for item in outcome["settled"]}
+    assert settled == {"backend_document"}, \
+        "the document that did go is verified; the bank is not, while a sibling still answers"
+    assert len(outcome["owed"]) == 2
+    assert forget.status(preview["intent_id"])["state"] == PENDING
+
+
+def test_an_obligation_kind_nothing_can_discharge_is_said_not_silently_dropped(
+        store, forget):
+    record = committed(store, source_id="msg-1")
+    preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+    store.db.execute("BEGIN IMMEDIATE")
+    store.db.execute("INSERT INTO erasure_targets(intent_id, kind, reference, state) "
+                     "VALUES(?,?,?, 'pending')",
+                     (preview["intent_id"], "carrier_pigeon", "pigeon:loft"))
+    store.db.execute("COMMIT")
+
+    outcome = forget.discharge(client=ABackend())
+
+    assert outcome["settled"] == []
+    assert "unknown erasure obligation kind" in outcome["owed"][0]["error"]
+
+
+def test_a_preview_nobody_confirmed_dispatches_nothing(store, forget):
+    """An intent is a question until the owner signs the digest; a backend call would answer it."""
+    record = committed(store, source_id="msg-1")
+    forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+
+    outcome = forget.discharge(client=ABackend())
+
+    assert outcome["attempted"] == 0
+    assert forget.pending() == []
 
 
 def test_confirming_twice_does_not_re_run_the_erasure(store, forget):

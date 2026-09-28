@@ -18,7 +18,7 @@ import pytest
 from conftest import envelope
 from hermes_memory.backend.provenance import ProvenanceLedger
 from hermes_memory.knowledge.summaries import SummaryStore
-from hermes_memory.lifecycle.erasure import PENDING, ErasureManager
+from hermes_memory.lifecycle.erasure import COMPLETE, PENDING, ErasureManager
 from hermes_memory.processing.jobs import QUARANTINED, RETRY_WAIT, JobQueue
 from hermes_memory.backend.document_map import DocumentMap
 from hermes_memory.processing.maintenance import (DEFAULT_LIMIT, MAX_LIMIT, SECTIONS,
@@ -440,6 +440,72 @@ def test_an_unconfirmed_erasure_is_counted_without_being_quoted(store, loop):
     assert "private matter" not in str(report)
 
 
+class ABackend:
+    """A derived backend the pass can pay: a delete, and an honest reading afterwards."""
+
+    def __init__(self, *, answers="absent"):
+        self.calls: list[str] = []
+        self.answers = answers
+
+    def delete_document(self, document_id):
+        self.calls.append(f"delete:{document_id}")
+        return {"deleted": True, "document_id": document_id}
+
+    def document_state(self, document_id):
+        self.calls.append(f"state:{document_id}")
+        return {"document_id": document_id, "state": self.answers,
+                "count": 0 if self.answers == "absent" else 3}
+
+
+def owed_erasure(store):
+    """A forgetting the owner confirmed, with the backend still holding its copy."""
+    record = store.commit(envelope(source_id="msg-1", text="Mentioned in error."))["id"]
+    DocumentMap(store).begin(record, "1")
+    document = store.db.execute("SELECT document_id FROM backend_documents").fetchone()[0]
+    forget = ErasureManager(store, owner_principal=OWNER)
+    preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+    forget.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                   actor=OWNER)
+    return forget, preview["intent_id"], document
+
+
+def test_the_pass_pays_the_backend_it_was_handed(store, loop):
+    """A confirmed forgetting *is* the authorization to call the backend; the pass is the when."""
+    forget, intent, document = owed_erasure(store)
+
+    backend = ABackend()
+    report = loop(backend=backend).pass_now(at=MORNING)
+
+    assert report["erasure"]["cleared"] == 2, report["erasure"]
+    assert report["erasure"]["backend_owed"] == 0
+    assert backend.calls == [f"delete:{document}", f"state:{document}", f"state:{document}"], \
+        "the document goes first, and the bank is proved from the reading afterwards"
+    assert forget.status(intent)["state"] == COMPLETE
+    assert forget.pending() == []
+
+
+def test_the_pass_names_the_reason_it_could_not_pay(store, loop):
+    forget, intent, _document = owed_erasure(store)
+
+    report = loop(backend=None,
+                  backend_unavailable="no derived backend is configured").pass_now(at=MORNING)
+
+    assert report["erasure"]["note"] == "no derived backend is configured"
+    assert report["erasure"]["dispatched"] == 0
+    assert forget.status(intent)["state"] == PENDING, "an unpaid debt is still a debt"
+
+
+def test_a_debt_the_backend_still_answers_for_is_counted_again(store, loop):
+    forget, intent, _document = owed_erasure(store)
+
+    report = loop(backend=ABackend(answers="present")).pass_now(at=MORNING)
+
+    assert report["erasure"]["cleared"] == 0
+    assert report["erasure"]["backend_owed"] == 2
+    assert report["erasure"]["still_owed"][0]["error"], "the report says what went wrong"
+    assert forget.status(intent)["state"] == PENDING
+
+
 # -- the pass as a whole -------------------------------------------------------
 
 def test_every_section_runs_and_reports(store, loop):
@@ -570,6 +636,25 @@ def test_the_door_runs_the_pass_over_the_installation_it_names(tmp_path):
     assert report["sections"] == list(SECTIONS)
     assert report["proactive"]["deferred"] == 1, "shadow mode is still the default here"
     assert run(settings, at=MORNING, sections=("queue",))["sections"] == ["queue"]
+
+
+def test_the_door_reports_a_backend_it_was_never_given(tmp_path):
+    """An installation with no derived backend is not a pass that failed to reach one."""
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    settings = Settings(tmp_path)
+    with EvidenceStore(settings.db_path) as store:
+        record = store.commit(envelope(source_id="msg-1", text="Mentioned in error."))["id"]
+        DocumentMap(store).begin(record, "1")
+        forget = ErasureManager(store, owner_principal=OWNER)
+        preview = forget.preview(record_ids=[record], actor=OWNER, reason="withdrawn")
+        forget.confirm(intent_id=preview["intent_id"],
+                       preview_digest=preview["preview_digest"], actor=OWNER)
+
+    report = run(settings, at=MORNING, sections=("erasure",))
+
+    assert report["erasure"]["note"] == "no derived backend is configured for this installation"
+    assert report["erasure"]["dispatched"] == 0 and report["erasure"]["backend_owed"] == 2
 
 
 # -- the ledger the pass writes to ----------------------------------------------

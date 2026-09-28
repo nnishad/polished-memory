@@ -365,10 +365,23 @@ Six things were built and had no caller: the host's capture spool was written an
 opened, due reminders were never taken, a summary that a correction invalidated was reported
 as stale but never queued for the refresh that would clear it, an identity candidate citing
 forgotten evidence stayed pending forever, a job waiting out a backoff was listed while being
-unclaimable, and nobody counted what an erasure still owes a backend. `maintain` is the pass
+unclaimable, and what an erasure owed the derived backend was counted but never paid.
+`maintain` is the pass
 that runs them, and the runtime unit runs it on a period
 (`HERMES_MEMORY_MAINTENANCE_INTERVAL_S`, 900 seconds by default, `0` to hand the timer back to
 you).
+
+The `erasure` section is the one that reaches outside the process, and it does so only on an
+owner's already-given instruction: a confirmed forgetting *is* the authorization to delete the
+derived copy. Each pending obligation is dispatched and then read back — a document clears when
+the backend lists no memory for it, and a bank's derived obligation clears only once every
+document of that intent has been verified and reads back empty — because a delete's own answer
+is not proof: the same 404 means "already gone" to one backend and "never looked up" to
+another. A failure is recorded on the obligation with its reason and an attempt count, and the
+intent stays `erasure_pending`, which is the honest state: the local copy is gone, the derived
+one is not. It asks for no model, takes no device slot and charges no budget, so an operator's
+pause on inference does not stall a forgetting; the two readings a pass performs are the ones
+the pinned backend serves without a model call.
 
 The first of those six is the one that decides whether this installation has any evidence at
 all. The plugin appends every turn it is allowed to keep to `capture-spool.db` beside the
@@ -391,7 +404,9 @@ is fine.
 the digest of a list somebody read and the name of who approved it — or a standing grant the
 owner issued with a cap and an expiry on it, which is the same decision taken once in advance.
 This takes none of those, and its engine is built without a model client at all, so there is
-nothing to reach by mistake. A reminder is kept in the owner's own words — which is why turning
+nothing to reach by mistake — the one outside call it may make is the erasure dispatch above,
+which is a cleanup the owner already signed for and not a request to a model. A reminder is
+kept in the owner's own words — which is why turning
 inference off does not turn proactivity off as a side effect.
 
 Because it runs by itself, it must not be able to destroy anything by itself either. A
