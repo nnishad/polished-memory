@@ -506,6 +506,22 @@ def test_a_debt_the_backend_still_answers_for_is_counted_again(store, loop):
     assert forget.status(intent)["state"] == PENDING
 
 
+def test_a_pause_on_inference_does_not_un_forget_what_the_owner_already_forgot(store, loop):
+    """The fence is already local; only the derived copy is left, and a model hold is not a
+    reason to keep answering for a person's text."""
+    forget, intent, document = owed_erasure(store)
+    gate = ResourceGate(store)
+    gate.pause(actor=OWNER, reason="a hold for the test")
+    backend = ABackend()
+
+    report = Maintenance(store, owner_principal=OWNER, gate=gate, backend=backend,
+                         clock=lambda: CLOCK).pass_now(at=MORNING, sections=("erasure",))
+
+    assert report["erasure"]["cleared"] == 2, report["erasure"]
+    assert backend.calls == [f"delete:{document}", f"state:{document}", f"state:{document}"]
+    assert forget.status(intent)["state"] == COMPLETE
+
+
 # -- the pass as a whole -------------------------------------------------------
 
 def test_every_section_runs_and_reports(store, loop):
