@@ -80,6 +80,15 @@ _WRITING_TOOLS = frozenset({"memory_remember", "memory_identity_candidate",
 _PREFETCH_TOKENS = 1200
 _MAX_ITEMS = 20
 
+
+def _account_field() -> dict[str, Any]:
+    """The two shapes a proposal takes an account in, declared as loudly as it is handled."""
+    return {"type": ["string", "object"],
+            "description": ("The account itself: a bare address such as priya@example.com or "
+                            "+14155551234, or the pair {namespace, address}. Not a display "
+                            "name, and not an object written out as text.")}
+
+
 _TOOLS = [
     {
         "name": "memory_recall",
@@ -138,8 +147,8 @@ _TOOLS = [
             "type": "object",
             "required": ["account_a", "account_b", "rule", "basis", "evidence"],
             "properties": {
-                "account_a": {"type": "string"},
-                "account_b": {"type": "string"},
+                "account_a": _account_field(),
+                "account_b": _account_field(),
                 "rule": {"type": "string", "enum": [
                     "email-thread-participant", "email-normalized-equal", "phone-e164-equal",
                     "explicit-alias-declared", "source-account-self"]},
@@ -409,20 +418,25 @@ class HermesMemoryProvider(_MemoryProvider):
 
     def _identity_candidate(self, args: dict[str, Any]) -> dict[str, Any]:
         """Queue a proposal. Confirmation is owner-only and unreachable here."""
-        from hermes_memory.storage.identity import IdentityStore
+        from hermes_memory.storage.identity import IdentityStore, parse_account
 
-        account_a = str(args.get("account_a", "")).strip()
-        account_b = str(args.get("account_b", "")).strip()
-        if not account_a or not account_b:
-            raise ValueError("account_a and account_b must not be empty")
         evidence = args.get("evidence") or []
         if not isinstance(evidence, list) or not evidence:
             raise ValueError("evidence must be a nonempty list of canonical record ids")
         settings = self._bound().settings
         with self._open_store() as store:
             identity = IdentityStore(store, owner_principal=settings.owner_principal)
-            first = identity.account(_namespace_of(account_a), account_a)
-            second = identity.account(_namespace_of(account_b), account_b)
+
+            def register(name: str) -> str:
+                # Every complaint about an account says which of the two it is about: a
+                # caller correcting its own call has nothing else to go on.
+                try:
+                    return identity.account(*parse_account(args.get(name)))
+                except ValueError as error:
+                    raise ValueError(f"{name}: {error}") from error
+
+            first = register("account_a")
+            second = register("account_b")
             outcome = identity.propose(
                 account_a=first, account_b=second,
                 rule=str(args.get("rule", "")).strip(),
@@ -997,15 +1011,6 @@ def _utc_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
-
-
-def _namespace_of(value: str) -> str:
-    """Classify an account string. Guessing a namespace would merge account kinds."""
-    if "@" in value:
-        return "email"
-    if value.startswith("+") and any(char.isdigit() for char in value):
-        return "phone"
-    return "handle"
 
 
 def _lesson_task(value: Any, platform: str = "") -> dict[str, str]:

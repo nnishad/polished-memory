@@ -7,7 +7,7 @@ import pytest
 
 from hermes_memory.storage.evidence import EvidenceError
 from hermes_memory.storage.identity import (CONFIRMED, PENDING, REJECTED, STALE, IdentityStore,
-                                            RULES, normalize_account)
+                                            RULES, normalize_account, parse_account)
 
 from conftest import envelope
 
@@ -63,6 +63,66 @@ def test_an_unknown_namespace_or_malformed_address_is_refused(identity):
         identity.account("smoke-signal", "x")
     with pytest.raises(EvidenceError, match="not an email"):
         identity.account("email", "not-an-address")
+
+
+# -- the shape an account arrives in -----------------------------------------
+
+def test_an_account_written_as_a_blob_is_refused_rather_than_kept_as_an_address(identity):
+    """Every one of these is a *description* of an account, not the account.
+
+    They used to be stored anyway: the plugin stringified what a caller handed it, so an
+    address column ended up holding `{"namespace": "email", ...}` and the person behind it
+    could never be joined to the same address written plainly.
+    """
+    for value in ('{"namespace": "email", "address": "priya@example.com"}',
+                  '{"namespace":"email","address":"priya@example.com"}',
+                  "{'namespace': 'email', "
+                  "'address': 'priya@example.com'}",
+                  '["email", "priya@example.com"]',
+                  '["email","priya@example.com"]',
+                  "Priya <priya@example.com>",
+                  "priya at example.com"):
+        with pytest.raises(EvidenceError, match="not an account address"):
+            identity.account("email", value)
+    assert identity.db.execute("SELECT COUNT(*) AS n FROM identity_accounts").fetchone()["n"] == 0
+
+
+def test_a_phone_written_with_its_readable_separators_is_still_one_account(identity):
+    """The one-token rule is about blobs, not about how people type numbers."""
+    assert (identity.account(*parse_account("+1 (415) 555-1234"))
+            == identity.account("phone", "+14155551234"))
+
+
+def test_an_account_object_and_the_address_it_carries_are_one_account(identity):
+    """The pair form is what a record's participants carry, so quoting it back must land
+    on the same account the plain address does — otherwise a normalized-equal rule could
+    never fire on the two shapes of one person."""
+    plain = identity.account(*parse_account("priya@example.com"))
+    shaped = identity.account(*parse_account({"namespace": "email",
+                                              "address": "priya@EXAMPLE.com"}))
+    assert plain == shaped
+
+
+@pytest.mark.parametrize(("given", "expected"), (
+    ("priya@example.com", ("email", "priya@example.com")),
+    ("+41555123456", ("phone", "+41555123456")),
+    ("priya", ("handle", "priya")),
+    ({"namespace": "profile", "address": "https://work.example/priya"},
+     ("profile", "https://work.example/priya")),
+))
+def test_parse_account_reads_the_two_admissible_shapes(given, expected):
+    assert parse_account(given) == expected
+
+
+@pytest.mark.parametrize("given", (
+    None, "", "   ", 7, ["email", "priya@example.com"], {"namespace": "email"},
+    {"address": "priya@example.com"}, {"namespace": "smoke-signal",
+                                       "address": "priya@example.com"},
+    {"namespace": "email", "address": "priya@example.com", "person": "Priya"},
+))
+def test_any_other_shape_is_refused_by_name(given):
+    with pytest.raises(EvidenceError):
+        parse_account(given)
 
 
 # -- candidates --------------------------------------------------------------

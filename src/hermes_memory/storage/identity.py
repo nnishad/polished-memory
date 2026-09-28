@@ -17,8 +17,8 @@ from ..ids import digest, intervals_overlap, now, record_pk, timestamp
 from .evidence import EvidenceError
 
 __all__ = ["IdentityStore", "evidence_accounts", "in_scope",
-           "citations_in_scope", "PENDING",
-           "CONFIRMED", "REJECTED", "STALE", "RULES"]
+           "citations_in_scope", "namespace_of", "normalize_account", "parse_account",
+           "PENDING", "CONFIRMED", "REJECTED", "STALE", "RULES"]
 
 PENDING = "pending"
 CONFIRMED = "confirmed"
@@ -47,6 +47,9 @@ _REFUSED_RULES = {
 
 _EMAIL = re.compile(r"^(?P<local>[^@]+)@(?P<domain>[^@]+)$")
 _PHONE_ALLOWED = re.compile(r"^[+\d][\d\s\-().]*$")
+#: Marks a value that is somebody's serialization of an account rather than an address —
+#: a JSON object, a Python repr, a display form. No real address contains any of these.
+_SERIALIZED = re.compile(r"[{}[\]<>\"'\\]")
 
 
 class IdentityStore:
@@ -464,6 +467,10 @@ def normalize_account(namespace: str, identifier: str) -> tuple[str, str]:
     if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 500:
         raise EvidenceError("identifier must be nonempty text of at most 500 characters")
     value = identifier.strip()
+    if _SERIALIZED.search(value) or (namespace != "phone" and re.search(r"\s", value)):
+        raise EvidenceError(
+            f"{value!r} is not an account address; pass the address itself — one unbroken "
+            "token like priya@example.com, not a display name, an object or a serialized blob")
     if namespace == "email":
         match = _EMAIL.match(value)
         if not match:
@@ -479,6 +486,54 @@ def normalize_account(namespace: str, identifier: str) -> tuple[str, str]:
                 "code would merge accounts across countries")
         return value, digits
     return value, value.lower()
+
+
+def parse_account(value: Any) -> tuple[str, str]:
+    """Take (namespace, address) out of whatever a caller handed over.
+
+    Two shapes are admissible because they are the two this system already speaks: a
+    bare address, and the namespace-and-address pair a record's participants carry —
+    which is the form a model quotes back when it proposes an identity from something
+    it recalled. Anything else is refused here rather than stringified: a serialized
+    object used to be stored as an account's address, so the same person proposed in
+    two shapes never joined and a normalized-equal rule could not fire on them.
+    """
+    if isinstance(value, dict):
+        keys = {str(key) for key in value}
+        unknown = sorted(keys - {"namespace", "address"})
+        if unknown:
+            raise EvidenceError(
+                f"unknown account field(s) {unknown}; an account object carries a namespace "
+                "and an address")
+        missing = sorted(key for key in ("namespace", "address")
+                         if not str(value.get(key) or "").strip())
+        if missing:
+            raise EvidenceError(
+                f"an account object is missing {missing}; say which namespace the address is "
+                "in rather than leaving it out")
+        return _check_namespace(str(value["namespace"])), str(value["address"]).strip()
+    if not isinstance(value, str):
+        raise EvidenceError(
+            f"an account is a bare address or a namespace-and-address pair, not "
+            f"{type(value).__name__}")
+    text = value.strip()
+    if not text:
+        raise EvidenceError("an account address must not be empty")
+    return namespace_of(text), text
+
+
+def namespace_of(value: str) -> str:
+    """Classify an address written on its own.
+
+    A wrong guess merges account kinds — a handle holding an `@` becoming an email — so
+    a caller that knows the namespace says so in the account object and this is only the
+    fallback for one that does not.
+    """
+    if "@" in value:
+        return "email"
+    if value.startswith("+") and any(char.isdigit() for char in value):
+        return "phone"
+    return "handle"
 
 
 def _check_namespace(value: str) -> str:

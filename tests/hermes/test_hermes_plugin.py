@@ -284,6 +284,51 @@ def test_identity_candidate_needs_retrievable_evidence(provider):
     assert "live evidence" in payload["error"]
 
 
+def test_the_identity_tool_takes_the_account_object_a_recall_hands_back(provider):
+    """A proposal is made from what memory said, and memory says participants as
+    namespace-and-address pairs — a caller quoting that shape reaches the same account."""
+    recorded = json.loads(provider.handle_tool_call(
+        "memory_remember", {"content": "Priya writes from two domains."}))
+    payload = json.loads(provider.handle_tool_call("memory_identity_candidate", {
+        "account_a": {"namespace": "email", "address": "priya@example.com"},
+        "account_b": {"namespace": "email", "address": "priya@work.example"},
+        "rule": "email-normalized-equal", "basis": "one local part, two domains",
+        "evidence": [recorded["id"]]}))
+    assert payload["ok"] is True, payload
+    with provider._open_store() as store:
+        written = sorted(row["identifier"] for row in
+                         store.db.execute("SELECT identifier FROM identity_accounts"))
+    assert written == ["priya@example.com", "priya@work.example"], \
+        "the address is what is stored, not a description of it"
+
+
+def test_a_blob_handed_over_as_an_account_is_named_not_stored(provider):
+    """The old path stringified whatever arrived and kept it, so one person written in two
+    shapes was two accounts that no rule could ever join."""
+    recorded = json.loads(provider.handle_tool_call(
+        "memory_remember", {"content": "Priya writes from two domains."}))
+    for value in ('{"namespace": "email", "address": "priya@example.com"}',
+                  ["email", "priya@example.com"], 7):
+        payload = json.loads(provider.handle_tool_call("memory_identity_candidate", {
+            "account_a": value, "account_b": "priya@work.example",
+            "rule": "email-thread-participant", "basis": "one thread, two participants",
+            "evidence": [recorded["id"]]}))
+        assert payload["ok"] is False, value
+        assert payload["error"].startswith("account_a:"), payload["error"]
+    with provider._open_store() as store:
+        assert store.db.execute(
+            "SELECT COUNT(*) AS n FROM identity_accounts").fetchone()["n"] == 0, \
+            "a refused proposal registers nothing"
+
+
+def test_the_identity_schema_declares_both_account_shapes(provider):
+    properties = next(tool for tool in provider.get_tool_schemas()
+                      if tool["name"] == "memory_identity_candidate")["parameters"]["properties"]
+    for field in ("account_a", "account_b"):
+        assert properties[field]["type"] == ["string", "object"], field
+        assert "namespace" in properties[field]["description"], field
+
+
 def test_a_goal_proposal_is_a_candidate_and_reminds_for_nothing(provider):
     """The tool can propose; only the owner's door makes it an obligation."""
     recorded = json.loads(provider.handle_tool_call(
