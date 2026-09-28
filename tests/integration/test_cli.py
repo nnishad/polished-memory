@@ -23,6 +23,7 @@ from hermes_memory.processing.instance_gate import (GATE_FILENAME, GateStore,
                                                    gate_path, instance_gate)
 from hermes_memory.processing.jobs import JobQueue
 from hermes_memory.processing.routes import Route
+from hermes_memory.proactive.policy import AttentionPolicy
 from hermes_memory.sources.sync import SyncController
 from hermes_memory.storage.evidence import EvidenceStore, ReadOnlyStore
 from hermes_memory.storage.identity import IdentityStore
@@ -1355,6 +1356,51 @@ def test_an_agent_s_opened_forgetting_is_closed_by_the_owner_alone(home):
     _, after = run("owner", "--list")
     assert after["awaiting"][0]["awaiting_forgetting"] == [], \
         "a forgetting that has already happened is still asking for a decision"
+
+
+def test_switching_delivery_on_is_the_owner_s_act_and_names_its_clock(home):
+    """The one decision that turns a quiet archive into something that speaks.
+
+    Shadow mode is the default, and nothing but this door ends it: a live installation with
+    an overdue reminder and no way to deliver it was reporting the deferral honestly while the
+    switch it pointed at was reachable only from a test fixture.
+    """
+    assert run("init")[0] == 0
+    code, message = errors("owner", "--switch-delivery", "on", "--actor", OWNER,
+                           "--reason", "I want to be told when something is due")
+    assert code == 2 and "--timezone" in message, \
+        "quiet hours counted in the wrong clock interrupt at the wrong hours"
+
+    code, outcome = run("owner", "--switch-delivery", "on", "--timezone", "Europe/Amsterdam",
+                        "--max-per-day", "4", "--cooldown-minutes", "30",
+                        "--actor", OWNER, "--reason", "I want to be told")
+    assert code == 0 and outcome["delivering"] is True
+    with EvidenceStore(load_settings().db_path) as store:
+        settings = AttentionPolicy(store, owner_principal=OWNER).settings("general")
+    assert settings["shadow"] is False and settings["timezone"] == "Europe/Amsterdam"
+    assert (settings["max_immediate_per_day"], settings["cooldown_minutes"]) == (4, 30)
+
+    code, message = errors("owner", "--switch-delivery", "off", "--actor", "agent:session-1",
+                           "--reason", "an agent closing its own audience")
+    assert code == 2 and "owner principal" in message
+    code, outcome = run("owner", "--switch-delivery", "off", "--actor", OWNER,
+                        "--reason", "not today")
+    assert code == 0 and outcome["delivering"] is False, \
+        "withdrawing agreement needs no clock, because nothing is being timed"
+
+
+def test_the_delivery_stage_names_the_door_that_ends_the_quiet(home):
+    assert run("init")[0] == 0
+    code, report = run("status")
+    delivery = [stage for stage in report["stages"]["stages"] if stage["name"] == "delivery"][0]
+    assert delivery["shadow"] is True
+    assert "--switch-delivery" in delivery["detail"], \
+        "an empty outbox with no door named is a report that leaves nobody able to act"
+    run("owner", "--switch-delivery", "on", "--timezone", "UTC", "--actor", OWNER,
+        "--reason", "I want to be told")
+    _, after = run("status")
+    stage = [s for s in after["stages"]["stages"] if s["name"] == "delivery"][0]
+    assert stage["shadow"] is False and "--switch-delivery" not in stage["detail"]
 
 
 def test_a_candidate_claim_is_confirmed_and_retracted_by_the_owner_only(home):

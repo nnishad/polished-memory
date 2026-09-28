@@ -286,6 +286,24 @@ def main(argv: list[str] | None = None) -> int:
     owner.add_argument("--contradict-lesson", metavar="LESSON",
                        help="report, as the owner, that this lesson was wrong in a case "
                             "you checked")
+    owner.add_argument("--switch-delivery", choices=("on", "off"), metavar="{on,off}",
+                       help="agree, or withdraw agreement, to be interrupted: while this is "
+                            "off every due reminder is kept and deferred, and nothing reaches "
+                            "the transport however urgent it is")
+    owner.add_argument("--timezone", metavar="NAME",
+                       help="with --switch-delivery, which clock the quiet hours and the "
+                            "daily cap are counted in")
+    owner.add_argument("--max-per-day", type=int, metavar="N",
+                       help="with --switch-delivery, how many immediate interruptions a day "
+                            "may hold (0-10)")
+    owner.add_argument("--cooldown-minutes", type=int, metavar="MINUTES",
+                       help="with --switch-delivery, the quiet span between two "
+                            "interruptions")
+    owner.add_argument("--quiet-from", metavar="HH:MM",
+                       help="with --switch-delivery, when the day stops admitting "
+                            "interruptions")
+    owner.add_argument("--quiet-until", metavar="HH:MM",
+                       help="with --switch-delivery, when it starts again")
     owner.add_argument("--grant-allowance", action="store_true",
                        help="let bounded formation passes run under a standing grant instead "
                             "of a fresh read, until the caps named here or the expiry — not "
@@ -1299,6 +1317,41 @@ def _allowance_ledger(settings) -> dict[str, Any]:
             "note": "an expired grant authorizes nothing even while its row is still here"}
 
 
+def _owner_delivery(settings, *, scoped, actor: str, args) -> int:
+    """The owner's act of agreeing to be interrupted, and of withdrawing it.
+
+    Nothing else in the system can take this decision: while the policy is in shadow mode a
+    due reminder is kept and deferred forever, and the pass says so rather than spending a
+    model call on a message nobody agreed to receive. Switching it on is the one decision that
+    turns a quiet archive into something that speaks, so it is refused without a clock — the
+    quiet hours and the daily cap are counted in somebody's local day, and defaulting that to
+    UTC would deliver at hours the owner never chose.
+    """
+    from .install.profiles import InstallationError
+    from .proactive.policy import AttentionPolicy
+
+    on = args.switch_delivery == "on"
+    if on and not (args.timezone or "").strip():
+        print("refused: switching delivery on needs --timezone, because the quiet hours and "
+              "the daily cap are counted in a local day and a reminder delivered at the wrong "
+              "hour is the harm this switch is supposed to authorize once, carefully",
+              file=sys.stderr)
+        return 2
+    try:
+        with EvidenceStore(scoped.db_path) as store:
+            policy = AttentionPolicy(store, owner_principal=scoped.owner_principal)
+            outcome = policy.configure(
+                actor=actor, shadow=not on, timezone_name=args.timezone,
+                max_immediate_per_day=args.max_per_day,
+                cooldown_minutes=args.cooldown_minutes,
+                quiet_from=args.quiet_from, quiet_until=args.quiet_until)
+    except (EvidenceError, InstallationError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "decision": "delivery", "profile": scoped.profile,
+                  "actor": actor, "delivering": on, **outcome})
+
+
 def _owner_command(settings, args) -> int:
     """The decisions that are not an agent's to make, reachable by the owner.
 
@@ -1326,6 +1379,7 @@ def _owner_command(settings, args) -> int:
                  "lesson-retraction": args.retract_lesson,
                  "lesson-confirmation": args.confirm_lesson,
                  "lesson-contradiction": args.contradict_lesson,
+                 "delivery": args.switch_delivery,
                  "allowance": args.grant_allowance,
                  "allowance-revocation": args.revoke_allowance}
     chosen = [name for name, value in decisions.items() if value]
@@ -1382,6 +1436,8 @@ def _owner_command(settings, args) -> int:
         print("refused: a decision that changes what the archive stands behind has to say "
               "why, because it outlives this conversation", file=sys.stderr)
         return 2
+    if name == "delivery":
+        return _owner_delivery(settings, scoped=scoped, actor=actor, args=args)
     chosen_id = {"forgetting": args.confirm_forgetting, "identity": args.confirm_identity,
                  "identity-rejection": args.reject_identity,
                  "edge-revocation": args.revoke_edge,

@@ -433,15 +433,36 @@ class StatusReporter:
         state = (DEGRADED if unproven or overdue else
                  PAUSED if held or self._all_stopped("proactivity", paused) else
                  OPERATIONAL if in_flight or counts.get("confirmed") else UNCONFIGURED)
+        shadowed = self._shadowed()
+        # An empty outbox does not say *why* it is empty, and "unconfigured" sent people to the
+        # model config to look for a switch that lives in the attention policy. The state stays
+        # as it was — nothing was configured into a working pipeline — but the reason is said
+        # where it is read, next to the reminder the pass is deferring for exactly this.
+        quiet = (state == UNCONFIGURED and shadowed)
         return StageReport(
             "delivery", state,
             f"{in_flight} artifact(s) waiting on the transport, {unproven} without a "
             f"delivery proof, {counts.get('confirmed', 0)} confirmed"
+            + ("; the owner has not switched delivery on yet, so a due reminder is kept and "
+               "deferred (`hermes-memory owner --switch-delivery on --timezone …`)"
+               if quiet else "")
             + (_hold_note(hold, "delivery", self.release_staged_at()) if held else ""),
             {"by_state": dict(counts), "in_flight": in_flight, "unproven": unproven,
              "past_expiry": overdue, "paused_sources": sorted(paused),
+             "shadow": shadowed,
              "instance_hold": held, "instance_hold_by": (hold or {}).get("actor"),
              "owner_principal": getattr(self.settings, "owner_principal", None)})
+
+    def _shadowed(self) -> bool:
+        """Whether the owner has yet agreed to be interrupted at all."""
+        from ..proactive.policy import AttentionPolicy
+
+        try:
+            return bool(AttentionPolicy(self.store).settings("general")["shadow"])
+        except Exception:
+            # A reading that cannot be taken is not a decision about delivery; the stage says
+            # what it knows from the outbox instead of guessing at the policy.
+            return False
 
     def backend(self) -> StageReport:
         """Derived backend: what the projection ledger says, never what we hope."""

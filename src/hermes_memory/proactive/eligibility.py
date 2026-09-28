@@ -190,7 +190,9 @@ class Eligibility:
             # consuming its owner's reminders to prove a point nobody has tested yet is
             # data loss, not caution.
             return Verdict(False, "shadow", "shadow mode spends no model call on an "
-                                            "undeliverable message")
+                                            "undeliverable message; `hermes-memory owner "
+                                            "--switch-delivery on --timezone …` is the "
+                                            "owner's act of ending it")
         budget = self.model_budget()
         if not budget.eligible:
             return budget

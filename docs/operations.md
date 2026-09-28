@@ -164,7 +164,16 @@ rather than echoed from the command that was just run. The inference hold comes 
 `inference_hold` — actor, reason, policy version and the moment it was written — because a
 hold that stops every profile on the machine is the one decision a second operator needs
 to be able to attribute, and `instance_hold_by`/`instance_hold_reason` say the same thing
-in the status stage itself. A release record also carries the instant it was staged, so a hold
+in the status stage itself. A hold is not the same decision as the switch, and the two are
+easy to confuse when nothing is arriving: delivery is quiet until the owner says otherwise,
+and the door that ends that quiet is `hermes-memory owner --switch-delivery on --timezone
+Europe/Amsterdam --actor "$USER" --reason "…"` — the timezone is required because the quiet
+hours and the daily cap are counted in a local day, and a reminder that arrives at the wrong
+hour is the harm this switch exists to authorize once, carefully. `--switch-delivery off`
+puts it back and asks for no clock, because nothing is being timed. `status` reports the
+stage `unconfigured` while the switch is off and names this command beside it, so an empty
+outbox says which of the two silences it is. A release record also carries the instant it was
+staged, so a hold
 written before that instant is reported as possibly a decision about the machine this release
 replaced — a reason is free text, and it outlives the tree it described; a release that
 records no instant is left silent rather than dated anyway. Starting a service never lifts one,
