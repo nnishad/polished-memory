@@ -12,7 +12,8 @@ import json
 import pytest
 
 from connector_script import AT, OTHER, SOURCE, Scripted, notes
-from hermes_memory.sources.base import Skipped
+from conftest import envelope
+from hermes_memory.sources.base import Page, Skipped
 from hermes_memory.sources.runtime import (COMPLETE, CONTENDED, CURSOR_EXPIRED, EXHAUSTED,
                                            PAUSED, STALE, STALLED, UNREACHABLE,
                                            ConnectorRuntime, Run)
@@ -384,6 +385,28 @@ def test_a_gap_closes_when_the_thing_arrives_and_reopens_if_it_goes_missing(
     runtime.run(Scripted([notes(1, start=9, next_cursor=None,
                                 skipped=[Skipped("att-1", "still too big")])]))
     assert [gap["ref"] for gap in sync.gaps(SOURCE)] == ["att-1"]
+
+
+def test_a_gap_on_the_container_closes_when_a_part_of_it_arrives(store, sync, runtime):
+    """One event reported as a whole, later delivered as its two sides.
+
+    Matching only the bare id would leave this debt open forever: the container is never handed
+    over as one envelope, because it was never one thing to the reader of the source. Every
+    adapter that names a part `whole#part` — a turn's two speakers, a row of a file, a message
+    of a session — would otherwise report a gap it had already filled.
+    """
+    runtime.run(Scripted([notes(1, next_cursor="0",
+                                skipped=[Skipped("att-1", "unsupported shape")])]))
+    assert [gap["ref"] for gap in sync.gaps(SOURCE)] == ["att-1"]
+
+    runtime.run(Scripted([Page(envelopes=(
+        envelope(source=SOURCE, source_id="att-1#user", text="Asked.", observed_at=AT),
+        envelope(source=SOURCE, source_id="att-1#assistant", text="Answered.",
+                 observed_at=AT)), next_cursor=None)]))
+
+    assert sync.gaps(SOURCE) == []
+    history = sync.gaps(SOURCE, include_cleared=True)
+    assert len(history) == 1 and history[0]["cleared_at"]
 
 
 def test_a_reconfigured_connector_starts_a_clean_gap_ledger(store, sync, runtime):

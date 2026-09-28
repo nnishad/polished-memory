@@ -6,7 +6,7 @@ import json
 import pytest
 
 from hermes_memory.sources.base import (REDACTED, Page, normalize_text,
-                      normalize_time, revocation)
+                                        normalize_time, part_container, revocation)
 from hermes_memory.sources.files import FileSource
 from hermes_memory.storage.evidence import EvidenceError
 
@@ -269,3 +269,20 @@ def test_a_source_saying_the_grant_is_gone_is_a_different_answer():
     assert revocation("invalid_grant") == {"coverage_state": "revoked"}
     assert revocation("connection reset by peer") == {}
     assert revocation(None) == {}
+
+
+# -- naming a part of a thing ------------------------------------------------
+
+def test_an_id_naming_a_part_reports_the_whole_it_belonged_to():
+    assert part_container("att-1#user") == "att-1"
+    assert part_container("chat.txt#7") == "chat.txt"
+    assert part_container("session-end:e1:c2f5#0") == "session-end:e1:c2f5"
+    # One suffix, stripped once: an adapter appends to the id it was handed, so the parent of
+    # `thread#42#att-3` is the attachment's own message, not the mailbox `thread` names.
+    assert part_container("thread#42#att-3") == "thread#42"
+
+
+def test_an_id_that_names_a_whole_has_no_container_above_it():
+    assert part_container("att-1") is None
+    assert part_container("#0") is None, "a leading separator invents no parent"
+    assert part_container("") is None

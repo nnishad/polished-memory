@@ -8,7 +8,7 @@ from typing import Any, Callable, Sequence
 
 from ..ids import digest, now
 from ..storage.evidence import EvidenceError, prepare_envelope
-from .base import Skipped
+from .base import Skipped, part_container
 
 __all__ = ["Fence", "StaleFence", "SyncController", "STAGES", "DOWNSTREAM_STAGES",
            "COVERAGE_STATES"]
@@ -329,15 +329,23 @@ class SyncController:
 
         Matched by source id rather than by position, because the point of a gap is
         "this thing is missing", and the thing arriving later is the only evidence
-        that would ever close it.
+        that would ever close it. A part counts as its container arriving: an adapter
+        that reported one event and could not read it, then learned to read it and
+        delivered its two sides, has closed that debt — matching only the bare id would
+        leave a gap open forever against an id no envelope can ever carry.
         """
         if not source_ids:
             return 0
-        placeholders = ",".join("?" * len(source_ids))
+        names = set(source_ids)
+        for source_id in source_ids:
+            container = part_container(source_id)
+            if container:
+                names.add(container)
+        placeholders = ",".join("?" * len(names))
         return int(self.db.execute(
             "UPDATE source_gaps SET cleared_at=? WHERE source=? AND generation=? AND "
             f"cleared_at IS NULL AND ref IN ({placeholders})",
-            [now(), fence.source, fence.generation, *source_ids]).rowcount or 0)
+            [now(), fence.source, fence.generation, *sorted(names)]).rowcount or 0)
 
     def _cursor(self, source: str) -> str | None:
         row = self.db.execute("SELECT cursor FROM connectors WHERE source=?", (source,)).fetchone()

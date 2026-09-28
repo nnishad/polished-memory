@@ -9,8 +9,25 @@ from typing import Any
 from ..ids import timestamp
 from ..storage.evidence import EvidenceError
 
-__all__ = ["Capabilities", "CursorExpired", "Page", "REDACTED", "Skipped", "SourceAdapter",
-           "normalize_text", "normalize_time", "redact_secrets", "revocation"]
+__all__ = ["Capabilities", "CursorExpired", "Page", "PART_SEPARATOR", "REDACTED", "Skipped",
+           "SourceAdapter", "normalize_text", "normalize_time", "redact_secrets", "revocation",
+           "part_container"]
+
+# How an adapter names something *inside* one thing it reported as a whole: the two sides of a
+# turn, one row of a file, one message of a session. The source's own id stays the container,
+# so a gap on the container and a part that arrives later are the same event's two reports.
+PART_SEPARATOR = "#"
+
+
+def part_container(source_id: str) -> str | None:
+    """The id of the thing ``source_id`` is a part of, or None when it names a whole.
+
+    Only the suffix is stripped, once, and only at the separator: an id that contains one
+    inside its own name still has exactly one container, and guessing further would invent a
+    parent the source never reported.
+    """
+    head, _, tail = str(source_id).rpartition(PART_SEPARATOR)
+    return head if tail and head else None
 
 
 class CursorExpired(EvidenceError):

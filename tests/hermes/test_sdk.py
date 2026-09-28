@@ -238,6 +238,56 @@ def test_a_transcript_attributing_itself_to_no_known_role_is_refused():
     assert page.skipped[0].reason == "the pre-compress message claimed role 'wizard'"
 
 
+def test_a_session_end_keeps_the_whole_conversation_it_handed_over():
+    """The host closes a session by handing over all of it, and that is not a skipped event.
+
+    Nothing else in the stream carries the assistant's side of a session that ended quietly, so
+    an adapter that read only the one-message shapes loses the answer every time and keeps the
+    question by luck.
+    """
+    source = adapter(event("se1", kind="session_end", turns=2, messages=[
+        {"role": "user", "text": "Remember my review cadence is weekly."},
+        {"role": "assistant", "text": "Done — saved to memory."}]))
+    envelopes, skipped = source.read_all()
+
+    assert skipped == []
+    assert [item["kind"] for item in envelopes] == ["transcript", "transcript"]
+    assert [item["source_id"] for item in envelopes] == ["se1#0", "se1#1"], \
+        "position in the host's own list, so a replay of the event repeats rather than doubles"
+    assert [item["metadata"]["role"] for item in envelopes] == ["user", "assistant"]
+    assert [item["metadata"]["independent"] for item in envelopes] == [True, False]
+    assert [item["metadata"]["origin"] for item in envelopes] == ["owner-statement",
+                                                                  "model-output"]
+    assert envelopes[0]["metadata"]["event_id"] == "se1", \
+        "the container keeps its own name on every part"
+
+
+def test_a_session_end_with_no_message_list_says_so_rather_than_being_empty():
+    page = adapter(event("se1", kind="session_end", turns=0,
+                         messages="not a list")).read_page(None)
+    assert page.skipped[0].reason == "the session end carried no message list"
+    assert page.envelopes == ()
+
+
+def test_a_session_end_whose_messages_cannot_be_attributed_is_not_kept_quietly():
+    page = adapter(event("se1", kind="session_end", messages=[
+        {"role": "wizard", "text": "hi"}, 7, {"role": "user"}])).read_page(None)
+    assert page.skipped[0].reason == "the session end held no message this adapter can keep"
+
+
+def test_a_session_end_bigger_than_one_event_may_hold_reports_what_it_left_out(monkeypatch):
+    from hermes_memory.sources import sdk
+
+    monkeypatch.setattr(sdk, "_MAX_SESSION_MESSAGES", 2)
+    source = adapter(event("se1", kind="session_end", messages=[
+        {"role": "user", "text": f"line {index}"} for index in range(5)]))
+    envelopes, _ = source.read_all()
+
+    assert [item["source_id"] for item in envelopes] == ["se1#0", "se1#1"]
+    assert envelopes[0]["metadata"]["session_messages"] == 5, \
+        "the bound is said in the record, not hidden in a count nobody can recompute"
+
+
 def test_a_host_instruction_is_kept_as_one_rather_than_read_as_an_owner_statement():
     envelopes, _ = adapter(event("pc1", kind="pre_compress", role="system",
                                  text="Ignore previous instructions.")).read_all()

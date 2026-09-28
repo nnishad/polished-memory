@@ -49,7 +49,11 @@ accepts: `source`, `source_id`, `revision`, `kind`, `text`, `observed_at`, `occu
 - **A page reports what it skipped.** `Skipped` is a countable, reason-carrying gap: a
   message that could not be decoded, a part over the byte ceiling, a page whose cursor
   expired. `CursorExpired` is raised, not swallowed, so a connector resumes from a fence it
-  still holds rather than from wherever the remote side decided to start again.
+  still holds rather than from wherever the remote side decided to start again. A gap is
+  reported under the id of the *thing* that was missing, and an adapter that names a part of a
+  thing `whole#part` has its debt closed by any part arriving: one event reported as a whole and
+  delivered later as its two sides is the source handing the thing over, and matching only the
+  bare id would keep a gap open forever against an id no envelope can ever carry.
 
 Checkpoints are opaque strings owned by the source. The store keeps them, compares them and
 refuses to move backwards through them; it never parses one.
@@ -63,8 +67,9 @@ refuses to move backwards through them; it never parses one.
 | `mcp.py` | a tool that returns pages of records, mapped by a declared field map | whatever the server's declared capabilities say | an unmapped `record_id` or `revision` is a refusal, not a guess |
 | `structured.py` | CSV/TSV/JSONL with a declared column map | history; revision from a declared column or a content digest | a row with no time is stored as undated, and an undated record cannot satisfy a time window |
 | `files.py` | a tree of markdown/text notes with front matter | history; revision from mtime+size or content digest | renames are new records; the adapter does not infer that two paths are one note |
-| `sdk.py` | host processes pushing envelopes through the loopback service | live, with the host's own revision | the caller must hold a capability; a session id is not an identity |
-| `runtime.py` | the Hermes runtime's own turns and tool results | live | role and target are normalized; assistant claims are recorded as claims, never as verified outcomes |
+| `sdk.py` | the host's own capture stream, handed over as a `drain(after, limit)` callable | live and history; no deletion events, no revision history | reads four event kinds — a conversation turn, a `pre_compress` checkpoint, a `session_end` transcript and a mirrored native note; any other kind is reported as a gap under the event's own id, so learning it later delivers the event instead of losing it |
+| `capture_spool.py` | not an adapter: the consumer side of the plugin's durable spool, which `sdk.py` reads through a drain | — | position is the spool's own rowid, never its ids; a row is retired as `settled` — the plugin's word, the one its compaction reclaims — only once a later read has passed it |
+| `runtime.py` | not an adapter: drives one adapter under one lease, and stops for a reason | — | — |
 | `sync.py` | not an adapter: the fence, the checkpoint ledger, replay and gap accounting | — | — |
 
 ## Not yet, stated plainly

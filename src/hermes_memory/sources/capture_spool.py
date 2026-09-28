@@ -17,9 +17,8 @@ forever and report a state no component understands.
 A row is retired only once a *later* drain has been called past it, because the connector
 advances its cursor after committing and a cursor that never moved must still be able to re-read
 the rows. Only rows the plugin is still holding are touched: a row another worker has claimed is
-left alone, and a read with no position at all takes the un-retired tail, which is also what
-makes ``check()`` report the age of what is *waiting* rather than the age of the first row in the
-file.
+left alone. A read with no position at all starts at the beginning of the file, retired rows
+included — the connector clearing a cursor is it saying it does not want anything skipped.
 """
 from __future__ import annotations
 
@@ -127,9 +126,14 @@ def spool_drain(path: Path | str, *, limit_default: int = 200) -> Callable[..., 
                     "SELECT event_id, session_id, payload, created_at FROM spool "
                     "WHERE rowid > ? ORDER BY rowid LIMIT ?", (anchor["r"], limit)).fetchall()
             else:
+                # No position means the connector has none to keep: a first read, or a
+                # reconfigure that cleared one on purpose. Both are answered from the start of
+                # the file, retired rows included, because `reconfigure` promises that a stale
+                # cursor will not silently skip evidence and the store's dedupe makes re-reading
+                # what is already there cost nothing but a page.
                 rows = db.execute(
                     "SELECT event_id, session_id, payload, created_at FROM spool "
-                    "WHERE state=? ORDER BY rowid LIMIT ?", (_PENDING, limit)).fetchall()
+                    "ORDER BY rowid LIMIT ?", (limit,)).fetchall()
             db.commit()
         finally:
             db.close()

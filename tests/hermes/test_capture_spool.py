@@ -128,13 +128,13 @@ def test_a_position_the_spool_no_longer_holds_is_said_out_loud(tmp_path):
         spool_drain(path)("event-from-a-compacted-spool", 10)
 
 
-def test_a_read_with_no_position_offers_what_waits_not_what_was_already_retired(tmp_path):
-    """A new connector generation resumes at the un-retired tail, and that is not a skip.
+def test_a_read_with_no_position_starts_at_the_beginning_of_the_file(tmp_path):
+    """A cleared cursor means "do not skip anything", which is what it is for.
 
-    Only a row whose commit happened is ever retired, so what a cleared cursor leaves behind is
-    already evidence in the record set. The other half of the reason matters more to the
-    reading: `check()` asks this branch for the age of the pipe, and serving retired rows
-    would report last week's conversation as something still waiting.
+    `reconfigure` clears a cursor precisely because the old position no longer describes the
+    same stream, and a reader that answered that read with only the un-retired tail would
+    silently skip every row the previous generation had already retired. Re-offering them is
+    cheap: the store keys on the event id, so the replay repeats rather than duplicates.
     """
     path = write_spool(tmp_path / SPOOL_RELATIVE,
                        turn("e1", user="a", assistant="b"),
@@ -143,8 +143,8 @@ def test_a_read_with_no_position_offers_what_waits_not_what_was_already_retired(
     drain = spool_drain(path)
     assert [item["event_id"] for item in drain(None, 2)] == ["e1", "e2"]
     assert [item["event_id"] for item in drain("e2", 2)] == ["e3"]
-    assert [item["event_id"] for item in drain(None, 5)] == ["e3"], \
-        "e1 and e2 are retired; the unpositioned read says what is left"
+    assert [item["event_id"] for item in drain(None, 5)] == ["e1", "e2", "e3"], \
+        "an unpositioned read is the whole spool, retired rows and all"
 
 
 def test_a_missing_spool_is_an_absence_and_never_a_file_we_created(tmp_path):

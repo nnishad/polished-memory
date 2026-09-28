@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from ..ids import digest, now
 from ..storage.evidence import EvidenceError
-from .base import (Capabilities, CursorExpired, Page, Skipped, SourceAdapter,
+from .base import (PART_SEPARATOR, Capabilities, CursorExpired, Page, Skipped, SourceAdapter,
                    normalize_text, normalize_time, redact_secrets)
 
 __all__ = ["HermesEvents", "MAX_EVENT_CHARS"]
@@ -32,6 +32,10 @@ _MAX_METADATA_FIELDS = 10
 _MAX_METADATA_CHARS = 200
 _NATIVE_ACTIONS = frozenset({"add", "replace", "remove"})
 _ROLES = frozenset({"user", "assistant", "system", "tool"})
+# One session's transcript is one event, and a host that logs everything would otherwise put an
+# unbounded list inside a single page. The bound is stated rather than discovered: past it the
+# adapter says so in the record's own metadata.
+_MAX_SESSION_MESSAGES = 200
 # Only what a participant said can corroborate anything. Everything else here is a
 # report about the conversation, and reporting it twice must not look like agreement.
 _INDEPENDENT_ROLES = frozenset({"user"})
@@ -245,7 +249,7 @@ def _turn(adapter: HermesEvents, event: Mapping, payload: Mapping,
         if body is None:
             continue
         produced.append(adapter._stamp(frame, role=role, text=body, kind="conversation_turn",
-                                       event_id=f"{event_id}#{role}"))
+                                       event_id=f"{event_id}{PART_SEPARATOR}{role}"))
     if not produced:
         return "the turn carried no text on either side"
     return produced
@@ -262,6 +266,37 @@ def _transcript(adapter: HermesEvents, event: Mapping, payload: Mapping,
         return "the pre-compress message had no text that could be decoded"
     return [adapter._stamp(adapter._frame(event, payload, event_id), role=role, text=body,
                            kind="transcript", event_id=event_id)]
+
+
+def _session_end(adapter: HermesEvents, event: Mapping, payload: Mapping,
+                 event_id: str) -> list[dict[str, Any]] | str:
+    """The whole conversation, as the host gave it up on closing.
+
+    ``session_end`` is the last honest copy of a session the host is about to close or compact,
+    and it arrives as a list rather than one message. Reading only the one-message shapes would
+    lose every session that ends quietly — which is all of them, until somebody notices the
+    transcripts are missing — so each message is kept under its own position in the event, and
+    the event stays the thing that was or was not delivered.
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return "the session end carried no message list"
+    frame = adapter._frame(event, payload, event_id)
+    produced = []
+    for position, item in enumerate(messages[:_MAX_SESSION_MESSAGES]):
+        if not isinstance(item, Mapping):
+            continue
+        role = normalize_text(item.get("role"))
+        body = normalize_text(item.get("text"))
+        if role not in _ROLES or body is None:
+            continue
+        produced.append(adapter._stamp(
+            frame, role=role, text=body, kind="transcript",
+            event_id=f"{event_id}{PART_SEPARATOR}{position}",
+            extra={"session_position": position, "session_messages": len(messages)}))
+    if not produced:
+        return "the session end held no message this adapter can keep"
+    return produced
 
 
 def _native_note(adapter: HermesEvents, event: Mapping, payload: Mapping,
@@ -285,7 +320,7 @@ def _native_note(adapter: HermesEvents, event: Mapping, payload: Mapping,
 
 
 _HANDLERS = {"conversation_turn": _turn, "pre_compress": _transcript,
-             "native_memory_write": _native_note}
+             "session_end": _session_end, "native_memory_write": _native_note}
 
 
 # -- normalization helpers ---------------------------------------------------
