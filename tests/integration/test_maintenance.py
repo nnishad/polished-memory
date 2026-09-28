@@ -30,7 +30,7 @@ from hermes_memory.proactive.policy import POLICY_VERSION, AttentionPolicy
 from hermes_memory.prospective.due_events import DueEventLog
 from hermes_memory.prospective.goals import GoalStore
 from hermes_memory.sources.sync import SyncController
-from hermes_memory.storage.evidence import EvidenceError
+from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
 from hermes_memory.storage.identity import STALE, IdentityStore
 
 OWNER = "owner-principal"
@@ -766,3 +766,83 @@ def test_a_refused_pass_is_reported_as_refused_rather_than_succeeded():
     ticker = Ticker(interval_s=60, runner=lambda: {"ok": False, "refused": "no store"})
     assert ticker.tick() == {"ok": False, "at": None, "prepared": None, "deferred": None,
                              "suppressed": None}
+
+
+# -- the standing grant over the shared models --------------------------------
+
+def a_grant(ledger, *, clock, hours=1.0, reason="overnight", resource="*"):
+    """One bounded permission, issued on a clock the test then moves."""
+    from hermes_memory.processing.allowance import Allowances
+
+    return Allowances(ledger, owner_principal=OWNER,
+                      clock=lambda: clock["now"]).grant(
+        actor=OWNER, reason=reason, records=4, tokens=4000, duration_s=hours,
+        resource=resource)
+
+
+def a_pass(store, ledger, clock):
+    """The background pass over the archive and the instance ledger, on one clock.
+
+    The gate is the ledger, not the archive: a standing grant governs the physical models, and
+    a pass that retired rows in the wrong file would be tidying the wrong ledger.
+    """
+    from hermes_memory.processing.resource_gate import ResourceGate
+
+    return Maintenance(store, owner_principal=OWNER, sync=None,
+                       gate=ResourceGate(ledger, clock=lambda: clock["now"]),
+                       clock=lambda: clock["now"])
+
+
+def test_the_pass_closes_a_grant_whose_clock_has_passed(tmp_path):
+    """A permission that expired while nobody was watching is a row that lies about the machine.
+
+    The readings answer it as no permission and must not write, so without this the ledger
+    fills with `active` grants that authorize nothing — and the one place a reader looks to
+    see what the machine may spend on its own stops being readable.
+    """
+    from hermes_memory.processing.instance_gate import GateStore, gate_path
+
+    settings = Settings(tmp_path)
+    clock = {"now": CLOCK}
+    with EvidenceStore(settings.db_path) as store, GateStore(gate_path(settings)) as ledger:
+        store.commit(envelope(source_id="m-1", text="a note"))
+        created = a_grant(ledger, clock=clock)
+        subject = a_pass(store, ledger, clock)
+        clock["now"] += 7200
+
+        assert subject.pass_now(at=LATER, sections=("queue",))["queue"]["grants_expired"] == \
+            [created["id"]]
+        assert subject.pass_now(at=LATER, sections=("queue",))["queue"]["grants_expired"] == []
+        assert ledger.db.execute("SELECT state FROM allowances WHERE id=?",
+                                 (created["id"],)).fetchone()[0] == "expired"
+
+
+def test_a_grant_that_still_has_time_is_left_alone_by_the_pass(tmp_path):
+    """Retiring is a claim about the clock, not a habit of clearing the table."""
+    from hermes_memory.processing.instance_gate import GateStore, gate_path
+
+    settings = Settings(tmp_path)
+    clock = {"now": CLOCK}
+    with EvidenceStore(settings.db_path) as store, GateStore(gate_path(settings)) as ledger:
+        store.commit(envelope(source_id="m-1", text="a note"))
+        created = a_grant(ledger, clock=clock, hours=24.0)
+        subject = a_pass(store, ledger, clock)
+        clock["now"] += 3600
+
+        assert subject.pass_now(at=MORNING, sections=("queue",))["queue"]["grants_expired"] == []
+        assert ledger.db.execute("SELECT state FROM allowances WHERE id=?",
+                                 (created["id"],)).fetchone()[0] == "active"
+
+
+def test_the_pass_that_retires_grants_opens_no_model_socket(tmp_path):
+    """The module's one rule, restated for the new table: housekeeping spends nothing."""
+    from hermes_memory.processing.instance_gate import GateStore, gate_path
+
+    settings = Settings(tmp_path)
+    clock = {"now": CLOCK}
+    with EvidenceStore(settings.db_path) as store, GateStore(gate_path(settings)) as ledger:
+        store.commit(envelope(source_id="m-1", text="a note"))
+        a_grant(ledger, clock=clock)
+        report = a_pass(store, ledger, clock).pass_now(at=MORNING)
+        assert list(report["sections"]) == list(SECTIONS)
+        assert "grants_expired" in report["queue"]

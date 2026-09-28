@@ -104,7 +104,8 @@ class Doctor:
         backend is not something to attempt against a backend that is down.
         """
         checks = [self.layout, self.database, self.schema, self.configuration,
-                  self.coverage, self.queue, self.background, self.provenance, self.lineage,
+                  self.coverage, self.queue, self.standing, self.background,
+                  self.provenance, self.lineage,
                   self.erasure, self.delivery, self.gate, self.inference_outcomes,
                   self.credentials_in_records,
                   self.leases, self.backend_ledger, self.release]
@@ -269,20 +270,47 @@ class Doctor:
                            {"queue": counts, "age": age, "operator_needed": True})
         if observations.evidence.get("formation_owed"):
             unprojected = observations.evidence.get("unprojected")
+            grant = observations.evidence.get("allowance")
             # The queue holds no live work, and that is exactly the finding: formation is an
             # approved act, so nothing queues itself, and records can sit captured and unasked
             # forever while a queue of finished jobs looks worked off.
             return Finding("queue", WARN,
                            f"{unprojected} live record(s) have no backend projection and "
                            "nothing is queued to form them",
-                           "`hermes-memory form` shows the list and prices it; the pass itself "
-                           "is the owner's to approve with --review, because it spends a device "
-                           "and a model call",
+                           ("`hermes-memory form --under-allowance "
+                            f"{grant['id']}` performs this pass under the grant the owner "
+                            "already issued" if grant else
+                            "`hermes-memory form` shows the list and prices it; the pass itself "
+                            "is the owner's to approve with --review, because it spends a device "
+                            "and a model call"),
                            {"unprojected": unprojected, "queue": counts, "age": age,
                             "state": observations.state})
         return Finding("queue", _severity_for(observations.state), observations.detail,
                        evidence={"queue": counts, "age": age,
                                  "state": observations.state})
+
+    def standing(self) -> Finding:
+        """Whether formation can be performed without somebody reading the list first.
+
+        The default answer is the safe one and reports as such: no grant, so every spend of a
+        shared device names a person who saw the work. A live grant is not a fault — the owner
+        issued it deliberately — but it is a standing permission to spend the machine, and a
+        report that let it pass silently is how it outlives the reason it was given.
+        """
+        grant = self.status.observations().evidence.get("allowance")
+        if grant is None:
+            return Finding("standing", OK,
+                           "no standing grant: every formation pass is approved against a "
+                           "list somebody read",
+                           evidence={"allowance": None})
+        return Finding("standing", WARN,
+                       f"allowance {grant['id']} (by {grant['actor']}) lets formation spend "
+                       f"{grant['resource']} unattended until {grant['expires_at']}",
+                       "`hermes-memory owner --revoke-allowance "
+                       f"{grant['id']} --reason …` withdraws it; the caps left are "
+                       f"{grant['records']['left']} record(s) and {grant['tokens']['left']:,} "
+                       "token(s), and the daily budget still binds",
+                       {"allowance": grant})
 
     def background(self) -> Finding:
         """The zero-inference pass: is it scheduled, and is it actually running?

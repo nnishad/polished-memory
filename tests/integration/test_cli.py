@@ -3064,3 +3064,165 @@ def test_a_backup_can_be_told_how_many_snapshots_to_retain(home):
     _, after = run("backup", "--list")
     kept = after["profiles"][0]["snapshots"]
     assert len(kept) == 1, "the newest stays; retention removes the older copies"
+
+
+# -- a standing grant over the shared models ---------------------------------
+
+GRANT = ["--grant-allowance", "--records", "5", "--tokens", "50000", "--hours", "6",
+         "--reason", "form while I sleep"]
+
+
+def test_a_standing_grant_is_the_owner_s_alone(home):
+    assert refused(*(["owner"] + GRANT + ["--actor", "agent:one"])) == 2
+    code, message = errors(*(["owner"] + GRANT + ["--actor", "agent:one"]))
+    assert "only the owner" in message
+    code, report = run("owner", *GRANT, "--actor", OWNER)
+    assert code == 0 and report["allowance"]["records"]["cap"] == 5
+    assert report["allowance"]["actor"] == OWNER
+    assert "--under-allowance" in report["next"]
+
+
+def test_a_grant_that_does_not_bound_itself_is_refused(home):
+    for argv, needle in ((["--records", "5", "--hours", "6"], "both caps"),
+                         (["--tokens", "500", "--hours", "6"], "both caps"),
+                         (["--records", "5", "--tokens", "500"], "a grant ends")):
+        code, message = errors("owner", "--grant-allowance", "--reason", "because", *argv,
+                               "--actor", OWNER)
+        assert code == 2 and needle in message, f"{' '.join(argv)}: {message}"
+    code, message = errors("owner", "--grant-allowance", "--records", "5", "--tokens", "500",
+                           "--hours", "6", "--until", "2027-01-01T00:00:00+00:00",
+                           "--reason", "two clocks", "--actor", OWNER)
+    assert code == 2 and "a grant ends" in message
+
+
+def test_a_grant_needs_a_reason_and_an_owner_in_the_room(home):
+    code, message = errors("owner", "--grant-allowance", "--records", "5", "--tokens", "500",
+                           "--hours", "6", "--actor", OWNER)
+    assert code == 2 and "has to say why" in message
+    env_file = home / "hermes-memory.env"
+    env_file.write_text("".join(
+        line + "\n" for line in env_file.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("HERMES_MEMORY_OWNER_PRINCIPAL")), encoding="utf-8")
+    code, message = errors("owner", *GRANT)
+    assert code == 2 and "no owner principal is configured" in message
+
+
+def test_the_grants_this_machine_holds_are_readable(home):
+    code, report = run("owner", "--allowances")
+    assert code == 0 and report["ledger"] == "absent" and report["allowances"] == []
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    _, listing = run("owner", "--allowances")
+    assert listing["active"] == granted["id"]
+    assert [item["id"] for item in listing["allowances"]] == [granted["id"]]
+    assert listing["allowances"][0]["reason"] == "form while I sleep"
+    code, message = errors("owner", "--allowances", "--list")
+    assert code == 2 and "reads the instance ledger" in message
+
+
+def test_a_grant_is_revoked_by_name_and_its_spine_stays_in_the_ledger(home):
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    code, message = errors("owner", "--revoke-allowance", granted["id"], "--actor",
+                           "agent:one", "--reason", "not theirs")
+    assert code == 2 and "only the owner" in message
+    code, report = run("owner", "--revoke-allowance", granted["id"], "--actor", OWNER,
+                       "--reason", "awake again")
+    assert code == 0 and report["allowance"]["state"] == "revoked"
+    _, listing = run("owner", "--allowances")
+    assert listing["active"] is None
+    assert [item["state"] for item in listing["allowances"]] == ["revoked"], \
+        "a withdrawn permission is history, not an absence"
+
+
+def test_one_command_does_not_make_two_owner_decisions(home):
+    run("init")
+    code, message = errors("owner", "--confirm-identity", "idc_1", "--revoke-edge", "ide_1",
+                           "--actor", OWNER, "--reason", "both at once")
+    assert code == 2 and "separate decisions" in message
+    code, message = errors("owner", *GRANT, "--revoke-allowance", "alw_x", "--actor", OWNER)
+    assert code == 2 and "separate decisions" in message
+
+
+def test_form_performs_the_pass_a_grant_covers(forming, stubbed):
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    code, receipt = run("form", "--under-allowance", granted["id"])
+    assert code == 0 and len(stubbed.retain_calls) == 3
+    assert receipt["allowance"]["records"] == {"used": 3, "cap": 5, "left": 2}
+    assert receipt["allowance"]["tokens"]["used"] == 963
+    assert "allowance" in " ".join(receipt["performed"])
+    with EvidenceStore(forming.db_path) as store:
+        line = store.db.execute("SELECT metadata FROM audit WHERE "
+                                "action='formation_under_allowance'").fetchone()
+    assert line is not None
+
+
+def test_a_grant_is_found_without_its_id_by_the_door_that_runs_on_a_timer(forming, stubbed):
+    run("owner", *GRANT, "--actor", OWNER)
+    assert run("form", "--under-allowance")[0] == 0
+    assert len(stubbed.retain_calls) == 3
+
+
+def test_the_two_doors_are_one_at_a_time_at_the_shell_too(forming):
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    digest_value = run("form")[1]["review_digest"]
+    code, message = errors("form", "--review", digest_value, "--under-allowance",
+                           granted["id"], "--actor", OWNER)
+    assert code == 2 and "one of two ways" in message
+    code, message = errors("form", "--reconcile", "--under-allowance", granted["id"])
+    assert code == 2 and "nothing to authorise" in message
+
+
+def test_a_grant_that_does_not_cover_the_pass_leaves_the_queue_alone(forming, stubbed):
+    run("owner", "--grant-allowance", "--records", "2", "--tokens", "50000", "--hours", "6",
+        "--reason", "two only", "--actor", OWNER)
+    code, message = errors("form", "--under-allowance", "*")
+    assert code == 2 and "record(s) left" in message
+    assert stubbed.retain_calls == []
+    with EvidenceStore(forming.db_path) as store:
+        assert store.db.execute("SELECT count(*) FROM processing_jobs").fetchone()[0] == 0
+
+
+def test_status_says_whether_a_pass_would_need_a_reading(forming):
+    report = run("status")[1]
+    stage = next(item for item in report["stages"]["stages"]
+                 if item["name"] == "observations")
+    assert stage["formation_unattended"] is False and stage["allowance"] is None
+    assert report["capabilities"]["formation_unattended"] is False
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    report = run("status")[1]
+    stage = next(item for item in report["stages"]["stages"]
+                 if item["name"] == "observations")
+    assert stage["formation_unattended"] is True
+    assert report["capabilities"]["formation_unattended"] is True, \
+        "the capability list is the sentence an operator reads first; a hard-coded false here " \
+        "would say the machine cannot form anything unattended while it can"
+    assert stage["allowance"]["id"] == granted["id"]
+    assert granted["id"] in stage["detail"]
+
+
+def test_reading_the_grants_writes_no_admission_ledger(home):
+    assert run("owner", "--allowances")[0] == 0
+    assert not (home / GATE_FILENAME).exists(), \
+        "a listing that created the file would make every reading the first writer"
+
+
+def test_the_doctor_reports_a_live_grant_and_the_default_without_one(forming):
+    checks = {item["check"]: item for item in run("doctor")[1]["findings"]}
+    assert checks["standing"]["severity"] == "ok"
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    checks = {item["check"]: item for item in run("doctor")[1]["findings"]}
+    assert checks["standing"]["severity"] == "warn", \
+        "a standing permission to spend the machine is not a fault, and is not nothing"
+    assert granted["id"] in checks["standing"]["detail"]
+    assert "--revoke-allowance" in checks["standing"]["remedy"]
+
+
+def test_a_grant_changes_the_remedy_the_queue_offers(forming):
+    findings = {item["check"]: item for item in run("doctor")[1]["findings"]}
+    assert findings["queue"]["remedy"].startswith("`hermes-memory form` shows the list")
+    granted = run("owner", *GRANT, "--actor", OWNER)[1]["allowance"]
+    findings = {item["check"]: item for item in run("doctor")[1]["findings"]}
+    assert granted["id"] in findings["queue"]["remedy"]
+    assert findings["queue"]["remedy"] == (
+        f"`hermes-memory form --under-allowance {granted['id']}` performs this pass under "
+        "the grant the owner already issued"), \
+        "a remedy that names the id but not whose decision it was invites a second grant"

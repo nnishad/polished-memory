@@ -38,9 +38,10 @@ The report also carries four things an operator reads next:
 - `awaiting_owner` — the identity candidates, candidate assertions and erasure intents that
   only a human may decide. When any exist, a note names the command that can decide them.
 - `queue` — the age of the oldest waiting job against the allowance, with
-  `"formation_unattended": false` beside it. A queue that is not being drained by anything
-  is said as that: *only `hermes-memory form` works this queue — nothing drains it by
-  itself*.
+  `"formation_unattended"` beside it: `false` while every pass needs a reading, `true` when the
+  owner has a standing grant live, and `allowance` naming which one and what it has left. A
+  queue that is not being drained by anything is said as that: *only `hermes-memory form` works
+  this queue — nothing drains it by itself*.
 - `background_pass` — whether the zero-inference pass is scheduled at all, when it last
   wrote down that it ran, and whether reminders are waiting behind a loop that is not
   running. It reads the pass's own record rather than trusting that a thread in another
@@ -99,6 +100,10 @@ hermes-memory owner --confirm-lesson chase-invoice@3 --reason "it worked on two 
     --evidence rec_2f9…
 hermes-memory owner --contradict-lesson chase-invoice@3 --reason "it cost the client" \
     --evidence rec_8b1…
+hermes-memory owner --grant-allowance --records 50 --tokens 200000 --hours 12 \
+    --reason "catch up the backlog before the trip"
+hermes-memory owner --allowances
+hermes-memory owner --revoke-allowance alw_6c1… --reason "awake again"
 ```
 
 A proposed habit (`lesson`) is the fourth kind of thing an archive must not approve for
@@ -107,6 +112,12 @@ store refuses a run whose runner is the account that filed the candidate. `--ver
 `name@N`) is required for everything except a retraction, because the versions of one lesson
 disagree with each other by construction, and withdrawing the newest is a different act from
 withdrawing the one that was being taught.
+
+The last three commands are the one kind of owner decision that is not about one person's
+archive: a standing grant governs the models every profile shares, so it is answered from the
+instance admission ledger and needs no `--profile`. It is still bounded, attributed and
+revocable — see *Letting a pass run without a fresh reading* below. One command makes one
+decision: asking for two is refused rather than running the first and reporting both.
 
 A lesson is retrieved into a turn only while it still holds up: forgotten evidence, a
 withdrawn evaluation or more checked failures than successes retire it on the next read, not
@@ -212,6 +223,8 @@ hermes-memory form                       # the bounded list, and nothing else
 hermes-memory form --limit 40 --max-jobs 5
 hermes-memory form --actor "$USER" --review <digest the list printed>
 hermes-memory form --hermes-home ~/.hermes/profiles/work --review <digest>
+hermes-memory form --under-allowance <id>       # or `--under-allowance` alone: whichever
+                                                # grant is live
 hermes-memory form --reconcile           # ask the backend about submissions we stopped
                                          # being able to answer for
 ```
@@ -221,7 +234,45 @@ this store's current epoch, charges the instance's shared daily budget, and disp
 exactly the approved list — one job per record, keyed on that record's own revision. It is
 run when an operator runs it. There is no daemon, no cron entry and no service that does
 this by itself, and `status`, `doctor` and `capabilities` all say so
-(`formation_unattended: false`) rather than letting an empty queue look like a settled one.
+(`formation_unattended: false` while no grant is live) rather than letting an empty queue
+look like a settled one.
+
+### Letting a pass run without a fresh reading
+
+The one exception is a decision the owner makes explicitly and can take back:
+
+```sh
+hermes-memory owner --grant-allowance --records 50 --tokens 200000 --hours 12 \
+    --reason "catch up the backlog before the trip" --actor "$USER"
+hermes-memory owner --allowances
+hermes-memory owner --revoke-allowance <id> --reason "awake again" --actor "$USER"
+```
+
+A grant is a standing permission to perform bounded formation passes on this machine: a
+record cap, a token cap, an expiry — all three mandatory, an expiry by `--hours` or
+`--until` and by exactly one of them — and at most one live grant per device. `form
+--under-allowance <id>` skips the re-read and nothing else: every refusal the plan would have
+reported still refuses, the daily budget still binds and outranks the grant, and the drain is
+clamped to the records the grant has left, so a permission for five never becomes the fifty
+jobs a queue happens to be holding. What is charged back is what the backend *reported*, not
+what was estimated, and the pass writes an audit line naming the grant that paid for it.
+
+Two things it is not. It is not reachable by an agent-role credential: granting and
+revoking require the owner principal, the same check identity and erasure require, and an
+installation with no owner configured grants nothing at all. And it is not open-ended — an
+allowance that has passed its expiry authorizes nothing, the background pass moves the row to
+`expired`, and the ceiling is seven days because a longer permission is a configuration change
+that should be re-read as one.
+
+`doctor` reports the default as `standing: ok` and a live grant as a warning naming its id,
+its author and its expiry, because a permission to spend the machine silently is the failure
+this door exists to avoid.
+
+Nothing ships that performs a pass on a timer. The archive is never drained automatically by
+an installer, a unit or a background thread — that boundary is the plan's, and a grant does
+not move it. An owner who wants nightly formation adds the timer themselves, and `form
+--under-allowance` with no id is written once and survives the id of the grant changing
+underneath it.
 
 A dispatch is submitted asynchronously and then *followed*: the submission's own answer says
 only that the engine accepted the work, and the projection is confirmed when the operation
@@ -336,11 +387,12 @@ which is how a full spool and a green pipeline now disagree instead of agreeing 
 is fine.
 
 **The pass never spends a model call.** That single rule is why it can run unattended while
-`form` cannot: `form` costs tokens, a device slot and a unit of the daily budget, so it
-needs the digest of a list somebody read and the name of who approved it. This takes none of
-those, and its engine is built without a model client at all, so there is nothing to reach
-by mistake. A reminder is kept in the owner's own words — which is why turning inference off
-does not turn proactivity off as a side effect.
+`form` cannot: `form` costs tokens, a device slot and a unit of the daily budget, so it needs
+the digest of a list somebody read and the name of who approved it — or a standing grant the
+owner issued with a cap and an expiry on it, which is the same decision taken once in advance.
+This takes none of those, and its engine is built without a model client at all, so there is
+nothing to reach by mistake. A reminder is kept in the owner's own words — which is why turning
+inference off does not turn proactivity off as a side effect.
 
 Because it runs by itself, it must not be able to destroy anything by itself either. A
 refusal that means *not now* — shadow mode, an operator pause, a spent budget, a snooze —
@@ -784,10 +836,12 @@ is in the stores and the broker, not in whichever transport reaches them.
 ## What this build does not claim
 
 - **Nothing drains the queue unattended.** Formation is `form`; the worker unit runs the
-  backend's own poller for work already queued. `formation_unattended: false`. The
-  background pass is the opposite kind of thing, and the distinction is the point: it runs
-  by itself precisely because it dispatches no inference — it reports the queue's age and
-  what is ready to retry, and claims none of it.
+  backend's own poller for work already queued. `formation_unattended: false`, unless the owner
+  has a standing grant live, in which case it is `true` and `allowance` names the grant, its
+  caps and its expiry — the pass is still nobody's background job, and the door that performs
+  it is still `form`. The background pass is the opposite kind of thing, and the distinction is
+  the point: it runs by itself precisely because it dispatches no inference — it reports the
+  queue's age and what is ready to retry, and claims none of it.
 - **The background pass does not deliver anything.** It prepares artifacts into the outbox.
   A transport claiming them is the host's decision, and the queue sitting unread is a normal
   state, reported as one.

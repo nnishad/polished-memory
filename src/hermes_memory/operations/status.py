@@ -14,12 +14,14 @@ different moments, and asking for status costs a running system nothing.
 """
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
 from ..backend.worker_launcher import OperationLedger
 from ..ids import now, timestamp
+from ..processing.allowance import Allowances
 from ..processing.instance_gate import instance_gate, status_gate
 from ..processing.resource_gate import UNCERTAIN, WAITING, ResourceGate
 from ..sources.capture_spool import (
@@ -28,7 +30,7 @@ from ..sources.sync import COVERAGE_STATES
 from ..storage.evidence import EvidenceError
 
 __all__ = ["StatusReporter", "StageReport", "STATUS_STATES", "REPORTED_STAGES",
-           "snapshot"]
+           "formation_unattended", "snapshot"]
 
 CONFIGURED = "configured"
 OPERATIONAL = "operational"
@@ -289,6 +291,7 @@ class StatusReporter:
         # form. Measuring only the confirmed rows called a working pipeline unconfigured on a
         # machine with five verified documents and seven records nobody has offered yet.
         unprojected = self._unprojected()
+        standing = self._standing()
         state = (DEGRADED if stuck else
                  PAUSED if held or self._all_stopped("formation", paused) else
                  OPERATIONAL if running else
@@ -301,6 +304,13 @@ class StatusReporter:
             detail += (f"; {unprojected} live record(s) have no backend projection and nothing "
                        "is queued to form them — `hermes-memory form` shows the list and prices "
                        "the approval, which is the part nothing does for itself")
+        if standing is not None:
+            # Said even when there is no debt: a permission the machine is holding is a fact
+            # about what will happen next, and the owner needs it named to remember it exists.
+            detail += (f"; a standing grant by {standing['actor']} ({standing['id']}) covers "
+                       f"{standing['resource']} until {standing['expires_at']} with "
+                       f"{standing['records']['left']} record(s) and "
+                       f"{standing['tokens']['left']:,} token(s) left")
         if held:
             detail += _hold_note(hold, "inference", self.release_staged_at())
         elif waiting:
@@ -316,7 +326,11 @@ class StatusReporter:
              "paused_sources": sorted(paused), "instance_hold": held,
              "instance_hold_by": (hold or {}).get("actor"),
              "instance_hold_reason": (hold or {}).get("reason"),
-             "formation_unattended": False, "draining": running,
+             # Whether a pass could run without anybody reading this list first — a live
+             # grant, not a wish. The resource it names is shown so a reader can see whether
+             # it covers the device the route currently points at.
+             "formation_unattended": standing is not None, "allowance": standing,
+             "draining": running,
              "journal": self._journal()})
 
     def summaries(self) -> StageReport:
@@ -654,7 +668,8 @@ class StatusReporter:
         None when this installation has no backend to project to — a reading that invented a
         debt against an absent endpoint would be worse than one that says nothing. Counted here
         because this is the stage that has to say whether formation is acting, and formation
-        itself will not answer without a plan somebody reviewed.
+        answers either to a digest somebody read or to a standing grant the owner issued,
+        neither of which a reading can give itself.
         """
         from ..processing.formation import count_unprojected
 
@@ -662,6 +677,15 @@ class StatusReporter:
         if not bank_id or not getattr(self.settings, "hindsight_url", None):
             return None
         return count_unprojected(self.store, bank_id=bank_id)
+
+    def _standing(self) -> dict[str, Any] | None:
+        """A live standing grant over the shared models, or None.
+
+        Read from the instance ledger on the read-only gate this reporter already holds, and
+        never retired here: a report that had to mark a grant expired would have to create or
+        write the file it promised only to read.
+        """
+        return _live_grant(self.gate)
 
     def _spool(self) -> dict[str, Any]:
         """What the host's capture spool holds beside this store — counts, never text.
@@ -746,6 +770,36 @@ def snapshot(db):
 
 def _clock() -> float:
     return datetime.now(timezone.utc).timestamp()
+
+
+def _live_grant(reading) -> dict[str, Any] | None:
+    """The owner's live standing grant, from an admission ledger that may not be open.
+
+    Read-only and write-free by construction: the callers are readings. A ledger from before
+    standing grants existed answers as what it is — no permission — rather than failing the
+    report that only went looking.
+    """
+    if reading is None:
+        return None
+    try:
+        return Allowances(reading.store).current()
+    except sqlite3.OperationalError:
+        return None
+
+
+def formation_unattended(settings) -> bool:
+    """Whether a bounded pass could be performed here without somebody reading the list first.
+
+    A capability of the *installation*, so it is answered without opening anybody's archive:
+    the admission ledger is the whole of what it asks.
+    """
+    reading = status_gate(settings)
+    if reading is None:
+        return False
+    try:
+        return _live_grant(reading) is not None
+    finally:
+        reading.close()
 
 
 def _age_since(at: Any) -> float:

@@ -168,7 +168,7 @@ def test_a_bare_store_is_described_rather_than_condemned(store):
     tripwire = Tripwire()
     report = Doctor(store, backend=tripwire).examine()
     assert [item["check"] for item in report["findings"]] == [
-        "layout", "database", "schema", "configuration", "coverage", "queue",
+        "layout", "database", "schema", "configuration", "coverage", "queue", "standing",
         "background", "provenance", "lineage", "erasure", "delivery", "gate", "inference",
         "credentials", "leases", "backend", "release"]
     assert report["probes"] == {"connectivity": False, "synthetic": False}

@@ -45,16 +45,20 @@ def _capabilities(settings, store_present: bool) -> dict[str, bool]:
     A store that only captures is working, and one whose formation is switched off is
     not broken; a single readiness flag made both of those look like failures.
     """
+    from .operations.status import formation_unattended
+
+    unattended = formation_unattended(settings)
     return {
         "capture": store_present,
         "local_recall": store_present,
         "formation": store_present and not settings.capture_only,
         # Nothing in this installation drains the queue on its own. Formation is a
         # bounded pass an operator runs (`hermes-memory form`), so a store that *can*
-        # form observations still forms none until somebody asks and approves the list.
-        # §8.2 keeps the always-on worker behind that decision rather than pretending it
-        # is already running.
-        "formation_unattended": False,
+        # form observations still forms none until somebody asks and approves the list —
+        # unless the owner has a standing grant live, which is the same decision made once
+        # with a cap and an expiry on it. §8.2 keeps the always-on worker behind that
+        # decision rather than pretending it is already running.
+        "formation_unattended": unattended,
         "forgetting": store_present and bool(settings.owner_principal),
         # Delivery is not a capability an installation has merely because somebody is
         # named: it needs an owner, an explicit switch and one concrete destination.
@@ -282,6 +286,26 @@ def main(argv: list[str] | None = None) -> int:
     owner.add_argument("--contradict-lesson", metavar="LESSON",
                        help="report, as the owner, that this lesson was wrong in a case "
                             "you checked")
+    owner.add_argument("--grant-allowance", action="store_true",
+                       help="let bounded formation passes run under a standing grant instead "
+                            "of a fresh read, until the caps named here or the expiry — not "
+                            "unbounded, and not for another device than --resource covers")
+    owner.add_argument("--revoke-allowance", metavar="ALLOWANCE",
+                       help="withdraw a standing grant; what it already spent stays spent")
+    owner.add_argument("--allowances", action="store_true",
+                       help="the standing grants this machine has, and what they have cost")
+    owner.add_argument("--records", type=int, default=None,
+                       help="how many records a grant may form under it")
+    owner.add_argument("--tokens", type=int, default=None,
+                       help="how many tokens a grant may spend under it")
+    owner.add_argument("--hours", type=float, default=None,
+                       help="how long a grant runs, in hours; exactly one of --hours and "
+                            "--until")
+    owner.add_argument("--until", metavar="INSTANT",
+                       help="when a grant ends, as an instant with a timezone")
+    owner.add_argument("--resource", default="*",
+                       help="which device the grant covers; '*' means whatever the retain "
+                            "route points at now")
     owner.add_argument("--version", type=int, metavar="N",
                        help="which version of a lesson the decision is about; the id may "
                             "also carry it as name@N")
@@ -377,6 +401,12 @@ def main(argv: list[str] | None = None) -> int:
                       help="form the memory enrolled for this Hermes profile home")
     form.add_argument("--review", metavar="DIGEST",
                       help="the digest of the list that was actually shown")
+    form.add_argument("--under-allowance", metavar="ALLOWANCE", nargs="?", const="*",
+                      default=None,
+                      help="perform the pass under a standing grant the owner issued "
+                           "(`owner --grant-allowance`) instead of a fresh read of this "
+                           "list; the grant's own caps bound the pass, and naming '*' or "
+                           "nothing at all means whichever grant is live")
     form.add_argument("--reconcile", action="store_true",
                       help="ask the backend what became of submissions we cannot account "
                            "for; this sends no model request and spends no budget")
@@ -1189,6 +1219,86 @@ def _restore_command(settings, args) -> int:
     return _emit({"ok": True, "profile": scoped.profile, **report})
 
 
+INSTANCE_DECISIONS = ("allowance", "allowance-revocation")
+# The admission ledger is one file for the installation, so a permission over it is not a
+# decision about one person's archive and cannot be scoped to a profile.
+
+
+def _owner_allowance(settings, *, name: str, args) -> int:
+    """Grant or withdraw the owner's standing permission to spend the shared models."""
+    from .processing.allowance import AllowanceError, Allowances
+    from .processing.instance_gate import GateError, instance_gate
+
+    actor = args.actor or settings.owner_principal
+    if not actor:
+        print("refused: no owner principal is configured, so a standing permission could not "
+              "be attributed to anybody; set HERMES_MEMORY_OWNER_PRINCIPAL", file=sys.stderr)
+        return 2
+    if not (args.reason or "").strip():
+        print("refused: a permission that outlives this command has to say why it was given",
+              file=sys.stderr)
+        return 2
+    identifier = None if name == "allowance" else args.revoke_allowance
+    if name == "allowance" and identifier is None:
+        if args.records is None or args.tokens is None:
+            print("refused: a grant states both caps — --records and --tokens — because one "
+                  "without the other is bounded by nothing that can be read off it",
+                  file=sys.stderr)
+            return 2
+        if (args.hours is None) == (args.until is None):
+            print("refused: a grant ends, by --hours or by --until and by exactly one of them; "
+                  "a standing permission with no expiry is a configuration nobody re-reads",
+                  file=sys.stderr)
+            return 2
+    try:
+        with instance_gate(settings) as gate:
+            grants = Allowances(gate.store, owner_principal=settings.owner_principal)
+            if name == "allowance":
+                outcome = grants.grant(actor=actor, reason=args.reason, records=args.records,
+                                       tokens=args.tokens, duration_s=args.hours,
+                                       expires_at=args.until, resource=args.resource)
+            else:
+                outcome = grants.revoke(identifier, actor=actor, reason=args.reason)
+    except (AllowanceError, GateError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "decision": name, "scope": "instance", "actor": actor,
+                  "allowance": outcome,
+                  "next": ("run `hermes-memory form --under-allowance "
+                           f"{outcome['id']}` to perform a pass under it"
+                           if name == "allowance" else
+                           "the archive keeps whatever it already formed; withdrawing a grant "
+                           "spends nothing and forgets nothing")})
+
+
+def _allowance_ledger(settings) -> dict[str, Any]:
+    """Every standing grant on this machine, live or closed, and what each has cost."""
+    import sqlite3
+
+    from .processing.allowance import Allowances
+    from .processing.instance_gate import status_gate
+
+    reading = status_gate(settings)
+    if reading is None:
+        return {"ledger": "absent", "allowances": [],
+                "note": "no admission ledger exists, so nothing has been queued or granted "
+                        "from this installation"}
+    try:
+        grants = Allowances(reading.store, owner_principal=settings.owner_principal)
+        live = grants.current()
+        rows = grants.ledger(include_closed=True)
+    except sqlite3.OperationalError:
+        return {"ledger": "instance", "allowances": [],
+                "note": "this admission ledger predates standing grants; run any writable "
+                        "command to bring it up"}
+    finally:
+        reading.close()
+    return {"ledger": "instance",
+            "active": (live or {}).get("id"),
+            "allowances": rows,
+            "note": "an expired grant authorizes nothing even while its row is still here"}
+
+
 def _owner_command(settings, args) -> int:
     """The decisions that are not an agent's to make, reachable by the owner.
 
@@ -1196,6 +1306,10 @@ def _owner_command(settings, args) -> int:
     to a human: a forgetting, an identity, and the withdrawal of one. The library behind
     each already refuses a caller who is not the named owner principal — what was missing
     was a door, and a list of what is standing behind it waiting for somebody with one.
+
+    A standing grant over the shared models is the same kind of decision and reaches the
+    same door, with one difference: it belongs to the machine rather than to one archive,
+    so it is answered from the instance ledger and needs no profile.
     """
     from .install.profiles import InstallationError
     from .knowledge.assertions import AssertionStore
@@ -1211,16 +1325,34 @@ def _owner_command(settings, args) -> int:
                  "lesson-activation": args.activate_lesson,
                  "lesson-retraction": args.retract_lesson,
                  "lesson-confirmation": args.confirm_lesson,
-                 "lesson-contradiction": args.contradict_lesson}
+                 "lesson-contradiction": args.contradict_lesson,
+                 "allowance": args.grant_allowance,
+                 "allowance-revocation": args.revoke_allowance}
     chosen = [name for name, value in decisions.items() if value]
     if args.list and chosen:
         print("refused: --list reads and a decision writes; ask for one or the other",
               file=sys.stderr)
         return 2
-    if not args.list and not chosen:
+    if args.allowances and (args.list or chosen):
+        print("refused: --allowances reads the instance ledger; ask for it alone",
+              file=sys.stderr)
+        return 2
+    if len(chosen) > 1:
+        print(f"refused: {' and '.join(sorted(chosen))} are separate decisions and one "
+              "command makes one of them — asking for both and running the first would "
+              "report a decision that was never taken", file=sys.stderr)
+        return 2
+    if not args.list and not args.allowances and not chosen:
         print("refused: nothing was asked. `hermes-memory owner --list` shows what awaits "
               "a decision", file=sys.stderr)
         return 2
+    if args.allowances:
+        return _emit(_allowance_ledger(settings))
+    if chosen and chosen[0] in INSTANCE_DECISIONS:
+        # A standing grant is a decision about the machine's models, which every profile
+        # shares (§10.5), so it is not attributed to one person's archive and does not
+        # require the archive to exist.
+        return _owner_allowance(settings, name=chosen[0], args=args)
     try:
         targets = _archive_targets(settings, args.profile)
     except (InstallationError, EvidenceError) as error:
@@ -1732,10 +1864,10 @@ def _form_command(settings, args) -> int:
     """The one place memory-originated inference is dispatched from a shell.
 
     Planning is a reading. Performing is a write to the queue, a slot in a device the
-    whole machine shares, and a spend from a daily budget, so it requires the digest of
-    the list that was actually shown and the name of the person who authorised it. There
-    is no ``--yes`` and no default: an unattended pass is a worker that has not been
-    commissioned yet, not a flag on this command.
+    whole machine shares, and a spend from a daily budget, so it requires either the digest
+    of the list that was actually shown and the name of the person who authorised it, or a
+    standing grant the owner issued with its own caps. There is no ``--yes``: a pass that
+    needs no reading has still been read and decided once, by name, and the grant says so.
     """
     from .install.profiles import InstallationError
     from .processing.formation import (DEFAULT_BATCH, MAX_JOBS, FormationError,
@@ -1750,10 +1882,10 @@ def _form_command(settings, args) -> int:
     if args.reconcile:
         # Nothing is dispatched and nothing is spent, so there is no list to approve — and
         # an approval digest over work this command does not do is a category error.
-        if args.review or args.actor:
-            print("refused: --reconcile queues no work, so --review and --actor have "
-                  "nothing to authorise. Run it alone, or run the pass without it",
-                  file=sys.stderr)
+        if args.review or args.under_allowance or args.actor:
+            print("refused: --reconcile queues no work, so --review, --under-allowance and "
+                  "--actor have nothing to authorise. Run it alone, or run the pass without "
+                  "it", file=sys.stderr)
             return 2
         try:
             return _emit(formation_reconcile(settings, limit=limit))
@@ -1766,13 +1898,18 @@ def _form_command(settings, args) -> int:
     except FormationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
-    if not args.review:
-        return _emit({**proposal, "next": "nothing left this process. Approve this exact "
-                                          "list with --review <digest> and an --actor; a "
-                                          "pass that costs tokens names who authorised it"})
+    if not args.review and not args.under_allowance:
+        standing = proposal.get("allowance")
+        return _emit({**proposal, "next": (
+            "nothing was left unperformed by this process. Approve this exact list with "
+            "--review <digest> and an --actor; a pass that costs tokens names who "
+            "authorised it" if standing is None else
+            f"nothing was left unperformed by this process. Either approve this exact list "
+            f"with --review <digest>, or run it under allowance {standing['id']} "
+            f"({standing['records']['left']} record(s) left of it)")})
     try:
         return _emit(formation_apply(
-            settings, review=args.review,
+            settings, review=args.review, under_allowance=args.under_allowance,
             actor=args.actor or settings.owner_principal or "",
             limit=limit, max_jobs=max_jobs))
     except FormationError as error:

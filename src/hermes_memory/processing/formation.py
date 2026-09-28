@@ -10,7 +10,10 @@ and the backend client.
 It is deliberately operator-invoked. §8.2 begins with capture plus the local index and
 refuses to enable an async worker before operation reconciliation and per-request bounds
 have been proven, so a bounded pass happens when a named person asks for one, and the
-queue is never reported as somebody else's job.
+queue is never reported as somebody else's job. The one way it can be performed without
+somebody reading the list first is a standing, capped grant the owner issued
+(:mod:`processing.allowance`) — which is still a named person's decision, recorded with a
+record cap, a token cap and an expiry.
 
 The plan is a reading and the apply is the same reading re-taken: the digest covers the
 work itself — which records, which route, what ceiling, how many jobs — and not the
@@ -18,12 +21,14 @@ surrounding activity that a busy machine changes every second.
 """
 from __future__ import annotations
 
+import sqlite3
 from typing import Any, Sequence
 
 from ..backend.capabilities import PINNED_VERSION
 from ..backend.document_map import VERIFIED, DocumentMap
 from ..config import scoped_secret
 from ..ids import digest, now
+from .allowance import Allowances
 from .budgets import Budget, Budgets
 from .instance_gate import instance_gate, status_gate
 from .jobs import JobQueue
@@ -169,6 +174,7 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
         admission = _admission(reading)
         if admission["paused"]:
             blocking.append("all inference is paused by the operator")
+        standing = _standing(reading, resource)
         planned = budget["planned"]
         actionable = {
             "plan_version": PLAN_VERSION, "profile": settings.profile,
@@ -184,6 +190,12 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
             "token_budget": budget["token_budget"], "tokens_used": budget["tokens_used"],
             "blocking": blocking,
         }
+        note = "planning only; run with --review <digest> to perform the pass"
+        if standing is not None:
+            note = (f"planning only; approve this list with --review <digest>, or perform it "
+                    f"under allowance {standing['id']} — {standing['records']['left']} "
+                    f"record(s) and {standing['tokens']['left']:,} token(s) left of it, until "
+                    f"{standing['expires_at']}")
         return {
             "ok": not blocking,
             **actionable,
@@ -194,14 +206,16 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
             "queue": queue,
             "budget": budget,
             "gate": admission,
+            "allowance": standing,
             "not_performed": [
                 "no model request was sent while this was planned",
                 "no job was written to the queue",
                 "no projection row was created or confirmed",
                 "nothing paused by an operator was resumed",
+                "no standing allowance was charged; planning a pass spends nothing",
             ],
             "review_digest": digest([PLAN_VERSION, actionable]),
-            "note": "planning only; run with --review <digest> to perform the pass",
+            "note": note,
         }
     finally:
         if store is not None:
@@ -210,20 +224,34 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
             reading.close()
 
 
-def formation_apply(settings, *, review: str, actor: str, limit: int = DEFAULT_BATCH,
+def formation_apply(settings, *, actor: str, review: str | None = None,
+                    under_allowance: str | None = None, limit: int = DEFAULT_BATCH,
                     max_jobs: int = MAX_JOBS, client: Any = None,
                     worker_id: str | None = None) -> dict[str, Any]:
     """Perform exactly the bounded pass that was shown, and account for every part of it.
 
-    The digest has to match the plan as it stands *now*: records captured in the meantime
-    that change the selection, a pause somebody set, or a budget that was spent while the
-    plan was being read is a different pass, and this refuses rather than performing the
-    old one under the new name.
+    Two doors, one work. ``review`` is the digest of a list somebody read: it has to match the
+    plan as it stands *now*, because records captured in the meantime that change the
+    selection, a pause somebody set, or a budget spent while the plan was being read is a
+    different pass, and this refuses rather than performing the old one under the new name.
+    ``under_allowance`` names a standing grant the owner issued, with a record cap, a token cap
+    and an expiry — the owner has already read and decided, so what bounds this pass is that
+    grant: it may not take more records than the grant has left, and its measured spend is
+    charged back to it.
+
+    Either way every refusal the plan reported still refuses here. An allowance is a way to
+    skip the re-read, not a way past the budget, the pause or the empty queue.
     """
     _bounded(limit)
+    if (review is None) == (under_allowance is None):
+        raise FormationError(
+            "a bounded pass is authorized one of two ways: --review <digest> of the list that "
+            "was actually shown, or --under-allowance <id> of a standing grant the owner "
+            "issued — never both, because then which decision a spend answers to would depend "
+            "on the order the flags were written in")
     if not isinstance(actor, str) or not actor.strip():
         raise FormationError("an actor must be named: formation spends a shared device")
-    if not isinstance(review, str) or not review.strip():
+    if review is not None and (not isinstance(review, str) or not review.strip()):
         raise FormationError("run `hermes-memory form` without --review first and approve "
                              "the digest it prints")
     if not isinstance(max_jobs, int) or not 1 <= max_jobs <= MAX_JOBS:
@@ -233,13 +261,31 @@ def formation_apply(settings, *, review: str, actor: str, limit: int = DEFAULT_B
 
     with instance_gate(settings) as gate:
         proposal = formation_plan(settings, limit=limit, gate=gate)
-        if review != proposal["review_digest"]:
+        if review is not None and review != proposal["review_digest"]:
             raise FormationError("the review digest does not match what would happen now. "
                                  "Run `hermes-memory form` again and approve the plan it "
                                  "prints")
         if proposal["blocking"]:
             raise FormationError("refused: " + "; ".join(proposal["blocking"]))
         route = retain_route(settings)
+
+        grants = Allowances(gate.store, owner_principal=settings.owner_principal)
+        allowance: dict[str, Any] | None = None
+        if under_allowance is not None:
+            # Expired grants are retired here rather than answered around: this is a pass that
+            # writes to the ledger anyway, and a stale `active` row is a permission that reads
+            # as live to every later report.
+            grants.retire_expired()
+            standing, refusal = grants.authorize(
+                allowance=under_allowance, records=int(proposal["planned_jobs"]),
+                tokens=int(proposal["planned_jobs"]) * int(proposal["per_job_tokens"]),
+                resource=route.resource)
+            if standing is None:
+                raise FormationError(f"refused: {refusal}")
+            # The grant bounds the drain, not only the selection: a permission for five records
+            # must not attempt the fifty the queue happens to already be holding.
+            max_jobs = min(max_jobs, standing["records"]["left"])
+            allowance = standing
 
         with EvidenceStore(settings.db_path) as store:
             jobs = JobQueue(store)
@@ -257,7 +303,26 @@ def formation_apply(settings, *, review: str, actor: str, limit: int = DEFAULT_B
                 routes=build_routes(settings, credentials=settings.route_credentials),
                 slot_queue_s=settings.gate_queue_s,
                 worker_id=(worker_id or f"form-{actor.strip()}")[:120])
+            spent_before = int(budgets.used(route.resource)["tokens"])
             drained = holder.drain(max_jobs=max_jobs)
+            performed = [
+                f"{queued['created']} job(s) queued and up to {max_jobs} attempted",
+                "usage charged to the instance gate from what the backend reported",
+            ]
+            if allowance is not None:
+                charged = {"records": int(drained["attempted"]),
+                           "tokens": max(0, int(budgets.used(route.resource)["tokens"])
+                                         - spent_before)}
+                settled = grants.consume(allowance["id"], **charged)
+                store._audit("formation_under_allowance", allowance["id"], {
+                    "actor": actor.strip(), "resource": route.resource,
+                    "route": ROUTE_NAME, "review_digest": proposal["review_digest"],
+                    **charged, "state": settled["state"]})
+                performed.append(
+                    f"allowance {allowance['id']} was charged {charged['records']} record(s) "
+                    f"and {charged['tokens']:,} measured token(s) and is now "
+                    f"{settled['state']}")
+                allowance = settled
             return {
                 "ok": True,
                 "performed_at": now(),
@@ -271,11 +336,9 @@ def formation_apply(settings, *, review: str, actor: str, limit: int = DEFAULT_B
                 "queued": queued,
                 "drain": drained,
                 "budget": budgets.report(),
+                "allowance": allowance,
                 "unprojected_after": count_unprojected(store, bank_id=settings.bank_id),
-                "performed": [
-                    f"{queued['created']} job(s) queued and up to {max_jobs} attempted",
-                    "usage charged to the instance gate from what the backend reported",
-                ],
+                "performed": performed,
             }
 
 
@@ -468,3 +531,20 @@ def _admission(reading) -> dict[str, Any]:
             "held": [f"{row['resource']} for {row['holder']}" for row in reading.held()],
             "blocked": reading.blocked_resources(),
             "waiting": sum(sum(states.values()) for states in reading.occupancy().values())}
+
+
+def _standing(reading, resource: str) -> dict[str, Any] | None:
+    """The owner's live standing grant covering this device, or None.
+
+    Reported outside the approved digest deliberately: whether a pass happens to need a fresh
+    read is not part of the work being read, and an approval should not expire because
+    somebody granted or revoked a permission elsewhere on the machine.
+    """
+    if reading is None:
+        return None
+    try:
+        return Allowances(reading.store).current(resource=resource)
+    except sqlite3.OperationalError:
+        # A gate ledger from before allowances existed. Reading it is not the plan's job and
+        # an older file answers as what it is: no grant.
+        return None

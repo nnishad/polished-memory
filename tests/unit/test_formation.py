@@ -23,6 +23,7 @@ from hermes_memory.backend.hindsight_client import HindsightUnavailable
 from hermes_memory.config import load_settings
 from hermes_memory.ids import backend_document_id
 from hermes_memory.processing.budgets import Budget, Budgets
+from hermes_memory.processing.allowance import ANY_RESOURCE, Allowances
 from hermes_memory.processing import formation
 from hermes_memory.processing.formation import (DEFAULT_BATCH, KIND, MAX_BATCH, MAX_JOBS,
                                                 FormationError, backend_client,
@@ -1020,3 +1021,182 @@ def test_the_pass_queues_for_its_device_with_the_owner_s_number(installation, mo
     report = approve(replace(installation, gate_queue_s=77.0), Answers(), limit=1)
     assert report["ok"] is True
     assert given["slot_queue_s"] == 77.0
+
+
+# -- a standing grant instead of a fresh read --------------------------------
+
+def grant(settings, **kwargs):
+    """The owner's bounded permission, issued through the library the CLI door calls.
+
+    Defaults are deliberately generous: a test that matters here is about a *bound*, and says
+    so by tightening one number rather than by failing for an unrelated cap.
+    """
+    arguments = {"records": 20, "tokens": 200_000, "duration_s": 6.0,
+                 "resource": ANY_RESOURCE, "reason": "form while I sleep"}
+    arguments.update(kwargs)
+    with instance_gate(settings) as gate:
+        return Allowances(gate.store, owner_principal=settings.owner_principal).grant(
+            actor=OWNER, **arguments)
+
+
+def unattended(settings, client=None, **kwargs):
+    """The pass an operator schedules: the grant is the approval, so no digest is read."""
+    backend = client or Answers()
+    receipt = formation_apply(settings, under_allowance=kwargs.pop("allowance", ANY_RESOURCE),
+                              actor=OWNER, client=backend, **kwargs)
+    return receipt, backend
+
+
+def test_a_standing_grant_performs_the_pass_that_needed_a_digest(installation):
+    created = grant(installation)
+    receipt, backend = unattended(installation, allowance=created["id"])
+    assert receipt["drain"]["attempted"] == 3 and len(backend.retain_calls) == 3
+    assert formation_plan(installation)["unprojected"] == 0
+
+
+def test_the_grant_found_by_the_star_is_the_one_the_owner_issued(installation):
+    created = grant(installation)
+    receipt, _ = unattended(installation)
+    assert receipt["allowance"]["id"] == created["id"]
+
+
+def test_what_a_grant_loses_is_what_the_backend_reported_not_what_was_estimated(installation):
+    """The estimate is the ceiling a pass may ask for; the charge is the number it used.
+
+    Three records cost 963 tokens on the answering backend, while the plan priced them at the
+    per-job ceiling. A grant debited the estimate would read as nearly spent after a healthy
+    pass and refuse the next one for a spend that never happened.
+    """
+    created = grant(installation, tokens=20_000)
+    receipt, _ = unattended(installation, allowance=created["id"])
+    assert receipt["allowance"]["tokens"] == {"used": 963, "cap": 20_000, "left": 19_037}
+    assert receipt["allowance"]["records"]["used"] == 3
+    assert receipt["allowance"]["state"] == "active"
+    assert receipt["allowance"]["reason"] == "form while I sleep"
+
+
+def test_a_grant_bounds_the_drain_and_not_only_the_selection(installation):
+    """One record left of a permission must not become every job the queue happens to hold.
+
+    The queue can keep work from an earlier pass that ran out of budget or was superseded. A
+    drain under a grant for one more record is a pass over one, whatever else is waiting, and
+    the claim `--limit` makes about the size of a pass holds under either door.
+    """
+    with EvidenceStore(installation.db_path) as store:
+        jobs = JobQueue(store)
+        route = retain_route(installation)
+        for row in store.db.execute("SELECT id, revision FROM records ORDER BY ingested_at "
+                                    "LIMIT 3").fetchall():
+            jobs.enqueue(kind=KIND, inputs=[row["id"]], input_revision=row["revision"],
+                         route=route,
+                         processor_fingerprint=processor_fingerprint(installation, route),
+                         priority="maintenance", token_budget=4048)
+    created = grant(installation, records=1, tokens=200_000)
+    receipt, backend = unattended(installation, allowance=created["id"], limit=1)
+    assert receipt["drain"]["attempted"] == 1
+    assert len(backend.retain_calls) == 1
+    assert receipt["allowance"]["records"] == {"used": 1, "cap": 1, "left": 0}
+    assert receipt["allowance"]["state"] == "spent"
+
+
+def test_the_pass_that_ran_under_a_grant_is_attributed_in_the_audit(installation):
+    created = grant(installation)
+    unattended(installation, allowance=created["id"])
+    with EvidenceStore(installation.db_path) as store:
+        row = store.db.execute("SELECT action, object_id, metadata FROM audit WHERE "
+                              "action='formation_under_allowance'").fetchone()
+    assert row is not None and row["object_id"] == created["id"]
+    written = json.loads(row["metadata"])
+    assert written["actor"] == OWNER and written["records"] == 3
+    assert written["tokens"] == 963 and written["resource"] == REMOTE
+
+
+def test_a_grant_does_not_unlock_a_pass_the_plan_already_refused(installation):
+    created = grant(installation)
+    with instance_gate(installation) as gate:
+        gate.pause(actor=OWNER, reason="the models are being updated")
+    with pytest.raises(FormationError, match="refused: all inference is paused"):
+        unattended(installation, allowance=created["id"])
+
+
+def test_a_grant_does_not_outrank_the_daily_ceiling(installation):
+    """Two controls, and the day is the one that wins: a grant cannot buy tokens that do not
+    exist in it."""
+    created = grant(installation)
+    with instance_gate(installation) as gate:
+        Budgets(gate.store, daily={REMOTE: Budget(tokens=200000)},
+                scope="global").charge(REMOTE, tokens=199_500)
+    with pytest.raises(FormationError, match="cannot fit one item"):
+        unattended(installation, allowance=created["id"])
+
+
+def test_a_grant_with_records_left_but_a_pass_too_big_for_them_is_refused(installation):
+    created = grant(installation, records=2)
+    with pytest.raises(FormationError, match="of 2 record\\(s\\) left"):
+        unattended(installation, allowance=created["id"])
+
+
+def test_a_grant_for_another_device_is_not_this_pass_s_permission(installation):
+    created = grant(installation, resource="a-quiet-gpu")
+    with pytest.raises(FormationError, match="a different device is a different decision"):
+        unattended(installation, allowance=created["id"])
+
+
+def test_an_expired_grant_is_refused_and_moved_out_of_active(installation):
+    created = grant(installation)
+    with instance_gate(installation) as gate:
+        gate.store.db.execute("UPDATE allowances SET expires_at=? WHERE id=?",
+                              ("2000-01-01T00:00:00+00:00", created["id"]))
+    with pytest.raises(FormationError, match="is expired"):
+        unattended(installation, allowance=created["id"])
+    with instance_gate(installation) as gate:
+        assert gate.store.db.execute("SELECT state FROM allowances WHERE id=?",
+                                     (created["id"],)).fetchone()[0] == "expired"
+
+
+def test_a_refused_grant_leaves_the_archive_exactly_as_it_was(installation):
+    created = grant(installation, records=1)
+    with EvidenceStore(installation.db_path) as store:
+        store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    raw = installation.db_path.read_bytes()
+    backend = Answers()
+    with pytest.raises(FormationError, match="refused:"):
+        unattended(installation, client=backend, allowance=created["id"])
+    assert installation.db_path.read_bytes() == raw
+    assert backend.retain_calls == []
+    with instance_gate(installation) as gate:
+        row = gate.store.db.execute("SELECT used_records, passes FROM allowances WHERE id=?",
+                                    (created["id"],)).fetchone()
+    assert (row["used_records"], row["passes"]) == (0, 0)
+
+
+def test_the_two_doors_are_offered_one_at_a_time(installation):
+    plan = formation_plan(installation)
+    for kwargs in ({}, {"review": plan["review_digest"],
+                        "under_allowance": ANY_RESOURCE}):
+        with pytest.raises(FormationError, match="one of two ways"):
+            formation_apply(installation, actor=OWNER, client=Answers(), **kwargs)
+
+
+def test_a_live_grant_is_shown_but_does_not_expire_the_approval(installation):
+    """The digest is the work; whether a fresh read happens to be needed is not part of it.
+
+    A grant issued while an operator was reading the list would otherwise invalidate the
+    approval they were about to type, for a pass that is exactly the one they saw.
+    """
+    before = formation_plan(installation)
+    created = grant(installation)
+    after = formation_plan(installation)
+    assert after["review_digest"] == before["review_digest"]
+    assert after["allowance"]["id"] == created["id"]
+    assert created["id"] in after["note"] and "--under-allowance" not in after["note"]
+    assert before["allowance"] is None
+    assert "no standing allowance was charged" in " ".join(after["not_performed"])
+
+
+def test_a_granted_pass_still_names_the_plan_it_performed(installation):
+    """The receipt carries the digest nobody signed, so the work is reconstructible."""
+    plan = formation_plan(installation)
+    grant(installation)
+    receipt, _ = unattended(installation)
+    assert receipt["review_digest"] == plan["review_digest"]

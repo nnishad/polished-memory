@@ -1,5 +1,5 @@
 {
-  "framework_digest": "ca554928bd62490f97070519689e70359a0ef027a20f8769093058a9b9239c4f",
+  "framework_digest": "66a58a9587468bfbd8502aca0ed886f23117dad9300e53dbd42d1a06bcbe9d6f",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",
@@ -145,6 +145,6 @@
     "evidence_migrations": 12,
     "evidence_newer": "refused",
     "evidence_older": "migrated forward on open",
-    "gate_ledger_version": 2
+    "gate_ledger_version": 3
   }
 }

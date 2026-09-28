@@ -17,7 +17,7 @@ from typing import Callable, Sequence
 
 __all__ = ["Migration", "MIGRATIONS", "MIGRATION_LEDGER", "apply_migrations",
            "current_version", "connect", "GATE_STATEMENTS", "CONTROLS_STATEMENTS",
-           "BUDGET_STATEMENTS", "OPERATION_STATEMENTS"]
+           "BUDGET_STATEMENTS", "OPERATION_STATEMENTS", "ALLOWANCE_STATEMENTS"]
 
 MIGRATION_LEDGER = "CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
 
@@ -126,6 +126,39 @@ OPERATION_STATEMENTS: tuple[str, ...] = (
     )""",
     "CREATE INDEX backend_operations_state ON backend_operations(state, updated_at)",
     "CREATE INDEX backend_operations_bank ON backend_operations(bank_id, state)",
+)
+
+# A standing, bounded decision by the owner: "these many records, this many tokens, until this
+# instant, without me reading each list". It is kept in the *instance* ledger because what it
+# authorizes is a claim on one machine's physical models, and in a ledger rather than a
+# settings file because the grant has to be attributable, countable against real spend, and
+# revocable mid-flight by somebody with a name.
+#
+# `expires_at` is NOT NULL on purpose: an approval with no end is a configuration change, and
+# one of those wearing the other's clothes is how an installation ends up dispatching inference
+# years after anybody agreed to it.
+ALLOWANCE_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE allowances(
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        max_records INTEGER NOT NULL CHECK(max_records > 0),
+        token_budget INTEGER NOT NULL CHECK(token_budget > 0),
+        used_records INTEGER NOT NULL DEFAULT 0,
+        used_tokens INTEGER NOT NULL DEFAULT 0,
+        passes INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL CHECK(state IN ('active', 'revoked', 'spent', 'expired'))
+    )""",
+    """
+    CREATE UNIQUE INDEX allowance_one_live ON allowances(scope, stage, resource)
+        WHERE state='active'""",
+    "CREATE INDEX allowance_expiry ON allowances(state, expires_at)",
 )
 
 

@@ -222,12 +222,18 @@ class Maintenance:
         # quiet installation an expired claim keeps its device occupied forever — and
         # `status` reports a worker that is gone as if it were still running.
         uncertain = list(self.gate.reap_expired()) if self.gate is not None else []
+        # A standing grant whose clock has passed authorizes nothing, but its row keeps saying
+        # `active` until something writes it, and a quiet installation never does. Retiring it
+        # is the same housekeeping as reaping a lease: a ledger whose rows disagree with the
+        # clock is one nobody can read.
+        grants = _retire_grants(self.gate, clock=self.clock)
         return {"counts": self.jobs.counts(),
                 "ready_for_retry": [item.id for item in waiting][:8],
                 "quarantined": [item.id for item in stuck][:8],
                 "overdue_reaped": reaped[:8],
                 "leases_uncertain": len(uncertain),
                 "uncertain_ids": uncertain[:8],
+                "grants_expired": grants[:8],
                 "note": "a backed-off job is claimed by the next worker that looks; nothing "
                         "here spends anything to move it, and an expired lease becomes "
                         "uncertain rather than free"}
@@ -365,3 +371,24 @@ def run(settings, *, limit: int = DEFAULT_LIMIT, at: str | None = None,
 
 def _bounded(value: int) -> int:
     return value if isinstance(value, int) and 1 <= value <= MAX_LIMIT else DEFAULT_LIMIT
+
+
+def _retire_grants(gate, *, clock) -> list[str]:
+    """Close the standing grants whose clock has passed, and name them.
+
+    A reading answers an expired grant as no permission and must not write; this is the pass
+    that does. It is asked against the pass's own clock, so a run speaking for one instant does
+    not retire a grant against a different one. Nothing here sends a request, so the module's
+    one rule holds.
+    """
+    import sqlite3
+
+    from .allowance import Allowances
+
+    if gate is None:
+        return []
+    try:
+        return list(Allowances(gate.store, clock=clock).retire_expired())
+    except sqlite3.OperationalError:
+        # A gate database older than standing grants has none to retire.
+        return []

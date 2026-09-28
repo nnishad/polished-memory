@@ -24,8 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from ..ids import now
-from ..storage.migrations import (BUDGET_STATEMENTS, CONTROLS_STATEMENTS,
-                                  GATE_STATEMENTS, OPERATION_STATEMENTS, connect)
+from ..storage.migrations import (ALLOWANCE_STATEMENTS, BUDGET_STATEMENTS,
+                                  CONTROLS_STATEMENTS, GATE_STATEMENTS,
+                                  OPERATION_STATEMENTS, connect)
 from .resource_gate import ResourceGate
 
 __all__ = ["GATE_FILENAME", "GATE_SCHEMA_VERSION", "SCHEMA_STEPS", "GateStore", "GateError",
@@ -39,7 +40,8 @@ GATE_SCHEMA = (*GATE_STATEMENTS, *CONTROLS_STATEMENTS, *BUDGET_STATEMENTS)
 # Statements to run when the ledger is found at a given version. A schema is not replaced
 # wholesale on upgrade: an existing installation's reservations must survive the arrival of
 # a new table, so each step adds only what is missing.
-SCHEMA_STEPS: dict[int, tuple[str, ...]] = {0: GATE_SCHEMA, 1: OPERATION_STATEMENTS}
+SCHEMA_STEPS: dict[int, tuple[str, ...]] = {0: GATE_SCHEMA, 1: OPERATION_STATEMENTS,
+                                           2: ALLOWANCE_STATEMENTS}
 GATE_SCHEMA_VERSION = max(SCHEMA_STEPS) + 1
 
 
