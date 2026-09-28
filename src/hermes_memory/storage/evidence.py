@@ -7,6 +7,7 @@ download may happen while holding a write transaction here.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,10 +17,14 @@ from ..ids import digest, now, record_id as make_record_id, timestamp
 from .migrations import apply_migrations, connect
 
 __all__ = ["EvidenceStore", "ReadOnlyStore", "EvidenceError", "Evidence",
-           "Prepared", "prepare_envelope", "journal"]
+           "Prepared", "prepare_envelope", "journal", "fts_query", "fts_terms"]
 
 _MAXIMUM_TEXT = 4_000_000
 _KNOWN_OCCURRED_PRECISION = {"second", "minute", "hour", "day", "week", "month", "year", "unknown"}
+_TOKEN = re.compile(r"[^\W]+", re.UNICODE)
+# An over-long query is a pasted document, not a question. Matching on the first terms of it
+# still answers; matching on all of them would match nothing.
+MAX_TERMS = 24
 
 
 class EvidenceError(ValueError):
@@ -219,6 +224,27 @@ def _apply_supersede(db: sqlite3.Connection, old_id: str, new_id: str, *,
     db.execute("DELETE FROM record_fts WHERE id=?", (old_id,))
 
 
+def fts_terms(query: str) -> list[str]:
+    """The words a search should match, in the order they were said, without repeats."""
+    seen: list[str] = []
+    for token in _TOKEN.findall(query or ""):
+        if token not in seen:
+            seen.append(token)
+    return seen
+
+
+def fts_query(query: str) -> str:
+    """Turn what somebody typed into a conjunction of quoted terms, or '' if there are none.
+
+    FTS5 parses its argument as a query language, so an index door that takes free text takes
+    syntax with it: a stray quote is a syntax error, `AND` widens a search nobody widened, and
+    `ZZ-114` is read as a column named 114 — which on a live installation came back as
+    "no such column: 114" from an ordinary request to forget a note. Quoting each word is what
+    makes an answer mean the words and nothing else.
+    """
+    return " ".join(f'"{term}"' for term in fts_terms(query)[:MAX_TERMS])
+
+
 class EvidenceStore:
     def __init__(self, path: str | Path):
         path = Path(path)
@@ -294,13 +320,17 @@ class EvidenceStore:
         row = self.db.execute("SELECT MAX(seq) FROM change_journal").fetchone()
         return self.epoch(), int(row[0] or 0)
 
-    def search(self, match: str, *, limit: int = 20) -> list[Evidence]:
+    def search(self, query: str, *, limit: int = 20) -> list[Evidence]:
         """Lexical search over committed, visible evidence.
 
-        This path deliberately never touches the model or the network, so it
-        still answers while inference is paused or Hindsight is down.
+        `query` is free text and is never read as an FTS expression — see :func:`fts_query`.
+        This path deliberately never touches the model or the network, so it still answers
+        while inference is paused or Hindsight is down.
         """
         limit = _bounded_limit(limit)
+        expression = fts_query(query)
+        if not expression:
+            return []
         # COALESCE must wrap the whole scalar subquery: applied inside it, an
         # absent visibility row yields an empty result set and the comparison
         # becomes NULL = 0, which silently filters out every fresh record.
@@ -311,7 +341,7 @@ class EvidenceStore:
               AND COALESCE((SELECT v.hidden FROM record_visibility v WHERE v.record_id = r.id), 0) = 0
             ORDER BY rank LIMIT ?
             """,
-            (match, limit),
+            (expression, limit),
         ).fetchall()
         return [Evidence.from_row(row) for row in rows]
 

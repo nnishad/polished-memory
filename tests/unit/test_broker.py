@@ -13,8 +13,8 @@ import pytest
 
 from conftest import envelope
 from hermes_memory.backend.hindsight_client import RecallOutcome
-from hermes_memory.context import ContextBroker, PacketCache, fts_expression
-from hermes_memory.storage.evidence import EvidenceStore
+from hermes_memory.context import ContextBroker, PacketCache
+from hermes_memory.storage.evidence import EvidenceStore, fts_query
 from hermes_memory.storage.identity import IdentityStore
 
 ME = "me@example.com"
@@ -180,7 +180,7 @@ def test_an_over_long_query_reports_the_terms_it_dropped(store, broker):
 
     assert "terms" in packet.truncated
     assert packet.channels.lexical == "available"
-    assert fts_expression(query).count('"') == 48
+    assert fts_query(query).count('"') == 48
 
 
 # -- authority ----------------------------------------------------------------

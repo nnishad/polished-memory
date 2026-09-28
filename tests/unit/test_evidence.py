@@ -11,7 +11,7 @@ from hermes_memory.ids import backend_document_id, record_id
 from hermes_memory.backend.document_map import DocumentMap
 from hermes_memory.lifecycle.erasure import ErasureManager
 from hermes_memory.storage.lineage import Lineage
-from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
+from hermes_memory.storage.evidence import (MAX_TERMS, EvidenceError, EvidenceStore, fts_query)
 from hermes_memory.storage.migrations import (
     MIGRATIONS,
     apply_migrations,
@@ -186,6 +186,36 @@ def test_a_hidden_record_leaves_retrieval_but_stays_answerable_as_history(store)
     assert store.live_and_visible(committed["id"]) is False
     kept = store.get(committed["id"], include_hidden=True)
     assert kept is not None and "meeting" in kept.text
+
+
+def test_a_query_is_matched_as_words_and_never_as_a_query_language(store):
+    """FTS5 reads its argument as a language, and this argument is somebody's sentence.
+
+    Measured on a live installation: an ordinary request to forget a note quoted as
+    `ZZ-114 loading dock ramp` came back as "no such column: 114". The same text reaching
+    `memory_recall` would have answered "nothing found" — a punctuation character mistaken for
+    an empty archive, which is the worst thing a memory can say when it is only confused.
+    """
+    note = store.commit(envelope(
+        source_id="note-zz114",
+        text="Temporary note ZZ-114: the loading dock ramp is booked for Thursday."))["id"]
+    invoice = store.commit(envelope(source_id="dock-invoice",
+                                    text="The invoice for the dock repair."))["id"]
+
+    assert [item.id for item in store.search("ZZ-114 loading dock ramp")] == [note]
+    assert [item.id for item in store.search("-invoice")] == [invoice], \
+        "a leading minus excludes nothing here; it is not a query language"
+    for hostile in ('a " b', "AND OR NOT", "meeting:", "(paren)", "*", "^", '":', "NEAR/3"):
+        assert isinstance(store.search(hostile), list), hostile
+    assert store.search("") == []
+    assert store.search("   ") == []
+
+
+def test_a_query_becomes_quoted_terms_capped_at_the_first_few():
+    assert fts_query('the "meeting" AND') == '"the" "meeting" "AND"'
+    assert fts_query("a a b") == '"a" "b"', "a word said twice is matched once"
+    assert fts_query("") == ""
+    assert len(fts_query(" ".join(f"w{i}" for i in range(60))).split()) == MAX_TERMS
 
 
 def test_parent_must_resolve_to_live_evidence(store):
