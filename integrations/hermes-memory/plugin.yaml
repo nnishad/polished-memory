@@ -23,22 +23,19 @@ provides_tools:
   - memory_identity_candidate
   - memory_forget_request
 
-# Hooks this plugin actually implements. Anything not listed here is not
-# claimed: notably there is no provider-initiated notification hook in Hermes,
-# so proactive output is left as a durable artifact for cron to collect.
-# on_turn_start and identity_signature are deliberately absent — the host calls
-# them, but we have nothing verified to do with them, and a hook we cannot
-# describe is a hook we should not have installed.
-provides_hooks:
-  - sync_turn
-  - prefetch
-  - queue_prefetch
-  - on_pre_compress
-  - on_memory_write
-  - on_session_end
-  - on_session_switch
-  - on_delegation
-  - backup_paths
+# Hooks registered with the host's hook registry: none, and saying so is the point.
+# `sync_turn`, `prefetch`, `queue_prefetch`, `on_pre_compress`, `on_memory_write`,
+# `on_session_end`, `on_session_switch`, `on_delegation` and `backup_paths` are methods the
+# memory manager calls on a registered provider — a different channel with a different
+# lifecycle, reached through `agent/memory_manager.py`, not hook events. Claiming them here
+# announced nine subscriptions the host does not offer, and `hermes plugins doctor` answered
+# each with "unknown hook" while registering zero; the callbacks themselves are unchanged.
+# Tools are the same story on the other side: the host collects them by calling
+# `get_tool_schemas()` after the provider initializes, so `provides_tools` below is a
+# declaration the static doctor cannot confirm from registration alone.
+# Notably there is no provider-initiated notification hook in Hermes, so proactive output is
+# left as a durable artifact for cron to collect.
+provides_hooks: []
 
 # Maps to plugins.entries.hermes-memory.settings. Distinct from the provider's
 # own get_config_schema(), which drives `hermes memory setup`.

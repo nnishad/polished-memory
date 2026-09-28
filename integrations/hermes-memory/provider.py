@@ -751,9 +751,9 @@ class HermesMemoryProvider(_MemoryProvider):
             return
         from hermes_memory.ids import digest
 
+        marker = digest([child_session_id, task, result])[:24]
         self._spool.append(
-            event_id=f"delegation:{self._session_id}:{digest([child_session_id, task,
-                                                              result])[:24]}",
+            event_id=f"delegation:{self._session_id}:{marker}",
             session_id=self._session_id,
             created_at=_utc_now(),
             payload={"kind": "delegation", "task": str(task)[:4000],
@@ -777,9 +777,9 @@ class HermesMemoryProvider(_MemoryProvider):
         from hermes_memory.ids import digest
 
         provenance = metadata or {}
+        identity = digest([content, provenance.get("previous_content")])[:16]
         self._spool.append(
-            event_id=f"native:{target}:{action}:{digest([content,
-                                                         provenance.get('previous_content')])[:16]}",
+            event_id=f"native:{target}:{action}:{identity}",
             session_id=str(provenance.get("session_id", self._session_id)),
             created_at=_utc_now(),
             payload={"kind": "native_memory_write", "action": action, "target": target,

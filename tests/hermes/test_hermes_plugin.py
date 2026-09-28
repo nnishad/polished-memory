@@ -1,9 +1,11 @@
 """C13 provider contract and the durability guarantee the host cannot give us."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
+import tokenize
 
 import pytest
 from hermes_memory.install.profiles import ProfileRegistry, open_installation
@@ -1175,3 +1177,45 @@ def test_an_undescribed_turn_is_not_told_how_to_act(provider):
     assert texts == ["Do not discuss payment terms unprompted."]
     assert described[0]["why"] == "the excluded case was absent", \
         "the answer says which rule let it in"
+
+
+def test_the_plugin_stays_readable_by_the_interpreter_the_host_loads_at():
+    """Hermes imports this plugin with its own interpreter, which sits at our declared floor.
+
+    A replacement field that breaks across lines is PEP 701, so below 3.12 the file is a
+    SyntaxError and the host registers nothing: the doctor answers "0 tool(s), 0 hook(s)"
+    and memory looks absent rather than broken. Checking this with the interpreter that runs
+    the suite would never catch it, because 3.12 and later accept the form.
+    """
+    offenders = []
+    for path in sorted(PLUGIN.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        start = getattr(tokenize, "FSTRING_START", None)
+        end = getattr(tokenize, "FSTRING_END", None)
+        if start is None:
+            try:
+                compile(text, str(path), "exec")
+            except SyntaxError as error:
+                offenders.append(f"{path.name}: line {error.lineno}: {error.msg}")
+            continue
+        depth, opened = 0, None
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        except (tokenize.TokenError, IndentationError, SyntaxError) as error:
+            offenders.append(f"{path.name}: does not tokenize ({error})")
+            continue
+        for token in tokens:
+            if token.type == start:
+                depth += 1
+                opened = opened or token.start[0]
+            elif token.type == end:
+                depth -= 1
+                if depth == 0 and opened is not None:
+                    if token.end[0] != opened:
+                        offenders.append(f"{path.name}: f-string spans lines {opened}-"
+                                        f"{token.end[0]}")
+                    opened = None
+    assert offenders == [], (
+        "the host parses a plugin at the floor this package declares; a multi-line "
+        f"replacement field is a SyntaxError there: {offenders}")
+

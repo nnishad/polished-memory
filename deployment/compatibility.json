@@ -131,7 +131,7 @@
       "__init__.py": "8931936a44bad9848d154532b2b1ac868d6a0c3c27a953f4bbe69d3fef2488ba",
       "client.py": "c37f5472fe01d7fe1f4bb0fea46c4566865cb2e937dbef8ddc3c237ac6ace9ab",
       "delivery.py": "0fa5477cca13be8760af4f7ce49738ae96e62a3a5853b1293a91df8d4db2e235",
-      "provider.py": "6caf07b43e23a3c33b51e699eceb5ea6759bd8d7101669c026822744128adb11",
+      "provider.py": "6def0639969a3f7fadb7849d1f2dca56474369a0f6918dbd919f5743ecd29f0d",
       "setup.py": "cff5daa30cc556beb239fd94230e54f47636d7920930faca10eee4017a098454",
       "spool.py": "121ec110eb8bb0fff0710ca1fbac088815d1429c6c09ffa158a5458591c48abf"
     },
