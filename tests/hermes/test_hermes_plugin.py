@@ -1219,3 +1219,50 @@ def test_the_plugin_stays_readable_by_the_interpreter_the_host_loads_at():
         "the host parses a plugin at the floor this package declares; a multi-line "
         f"replacement field is a SyntaxError there: {offenders}")
 
+
+def test_the_manifest_claims_exactly_what_the_provider_registers(provider):
+    """The host reads these two lists and compares them against what registration yields.
+
+    Nine `provides_hooks` entries were provider callbacks rather than hook events, so the
+    host answered each with "unknown hook" and registered nothing; a tool the provider
+    registered was missing from `provides_tools`. Either way the manifest was stating
+    something about the installation that the host could disprove, and a plugin the host
+    cannot describe is a plugin that looks absent rather than broken.
+    """
+    text = (PLUGIN / "plugin.yaml").read_text(encoding="utf-8")
+
+    def listed(key):
+        """The block under `key:` — a list of `- name` lines, or the empty flow list.
+
+        Parsed by hand so the guarantee needs no YAML library: this is the same choice the
+        manifest reader in the installer makes.
+        """
+        lines = text.splitlines()
+        try:
+            head = next(i for i, line in enumerate(lines) if line.startswith(f"{key}:"))
+        except StopIteration:
+            return None
+        rest = lines[head].partition(":")[2].strip()
+        if rest == "[]":
+            return []
+        if rest:
+            return [item.strip().strip("'\"") for item in rest.strip("[]").split(",")
+                    if item.strip()]
+        items = []
+        for line in lines[head + 1:]:
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                continue
+            if not stripped.startswith("-"):
+                break
+            items.append(stripped[1:].strip())
+        return items
+
+    registered = sorted(str(item.get("name")) for item in provider.get_tool_schemas())
+    assert listed("provides_hooks") == [], \
+        ("a memory provider dispatches lifecycle callbacks through the manager, not the "
+         "host's hook registry, so it subscribes to no hook event")
+    assert sorted(listed("provides_tools") or []) == registered, \
+        (f"the manifest declares {sorted(listed('provides_tools') or [])} but the provider "
+         f"registers {registered}")
+
