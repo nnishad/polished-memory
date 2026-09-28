@@ -527,11 +527,12 @@ def conflicts(report: dict[str, Any]) -> list[str]:
 #: Which of the sentences `conflicts()` produces describe a collision with something real.
 #: Everything else it can say is worth telling the operator and does not make this
 #: installation wrong: a loose permission, a credential at rest, a port this installation
-#: already holds and would simply replace (§10.4). A runtime whose host half is registered at
-#: another commit is on the blocking side because the transaction cannot get past
-#: `register-plugin` without the host's own --force, which is the owner's act to take.
+#: already holds and would simply replace (§10.4). A host registered at another commit is on
+#: the advisory side for the same reason — the transaction's own `register-plugin` step
+#: refuses to rewrite the host's registration without its --force, and gating the whole plan
+#: at step one would stop the operator from staging the release that closes the gap.
 BLOCKING_MARKERS = ("already listening", "capture owner", "no hermes executable",
-                    "no owner principal", "two different revisions")
+                    "no owner principal")
 
 
 def blocks_setup(line: str) -> bool:

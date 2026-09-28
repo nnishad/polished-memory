@@ -452,16 +452,18 @@ def test_a_process_whose_descriptors_cannot_be_read_does_not_end_the_search(inst
 
 
 def test_the_gate_closes_on_collisions_and_on_nothing_else(installation, tmp_path, monkeypatch):
-    """Eight reasons to say something, of which exactly five are reasons to stop.
+    """Eight reasons to say something, of which exactly four are reasons to stop.
 
     This is the whole content of `inventory --conflicts`'s exit status. A stranger on a wanted
-    port, a second capture owner, no hermes to register against, no principal who can confirm a
-    forgetting and a host registered at somebody else's commit each mean a run here would act
-    on something that is not this installation's to act on. A loose permission, a credential
-    left at rest and a delivery switch with no destination are this installation's own business,
-    worth fixing and no reason to refuse the run. Count the partition rather than spot-checking
-    it: a sentence that quietly moved from one side to the other is the difference between a
-    healthy installation reading as blocked and a broken one reading as fine (§10.4).
+    port, a second capture owner, no hermes to register against and no principal who can confirm
+    a forgetting each mean a run here would act on something that is not this installation's to
+    act on. A loose permission, a credential left at rest, a delivery switch with no destination
+    and a host registered at another commit are this installation's own business: worth fixing,
+    and no reason to refuse the run — the split in particular is closed by staging a release and
+    letting the host re-register, so refusing every step would block the way out. Count the
+    partition rather than spot-checking it: a sentence that quietly moved from one side to the
+    other is the difference between a healthy installation reading as blocked and a broken one
+    reading as fine (§10.4).
     """
     home, _ = installation
     (home / "hermes-memory.env").write_text(
@@ -487,13 +489,14 @@ def test_the_gate_closes_on_collisions_and_on_nothing_else(installation, tmp_pat
     assert len(said) == 8, said
 
     stopping = blocking(report)
-    assert len(stopping) == 5, stopping
+    assert len(stopping) == 4, stopping
     assert all(blocks_setup(line) for line in stopping)
     for marker in BLOCKING_MARKERS:
         assert any(marker in line for line in stopping), marker
     assert not any("readable beyond its owner" in line for line in stopping)
     assert not any("holds a credential value" in line for line in stopping)
     assert not any("no usable destination" in line for line in stopping)
+    assert not any("two different revisions" in line for line in stopping)
 
 
 def test_a_port_held_by_a_stranger_on_another_stack_is_still_a_collision(installation,
@@ -726,7 +729,8 @@ def test_a_host_on_another_commit_than_its_runtime_is_reported_as_split(installa
     assert report["release"]["source_commit"] == "d" * 40
     said = conflicts(report)
     assert any("two different revisions" in line for line in said), said
-    assert any("cccccccccccc" in line and "dddddddddddd" in line for line in blocking(report)), \
+    assert any("cccccccccccc" in line and "dddddddddddd" in line for line in said), said
+    assert not any("two different revisions" in line for line in blocking(report)), \
         blocking(report)
 
     # The units do not always name the release: an installation that only has the pointer is
