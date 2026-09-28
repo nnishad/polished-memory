@@ -18,8 +18,8 @@ import pytest
 from hermes_memory.backend.hindsight_client import HindsightError
 from hermes_memory.config import load_settings
 from hermes_memory.ids import document_id_is_ambiguous
-from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, WARN, Doctor,
-                                             Finding)
+from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, PROBE_SETTLE_READS,
+                                            PROBE_SETTLE_WAIT_S, WARN, Doctor, Finding)
 from hermes_memory.storage.evidence import EvidenceStore
 
 APPROVED_LAN = "192.168.68.65"
@@ -44,14 +44,20 @@ class Tripwire:
 
 
 class FakeBackend:
-    """The probe surface, with the answers a real backend would give."""
+    """The probe surface, with the answers a real backend would give.
+
+    It obeys what it is asked rather than answering one fixed thing: a probe whose fake
+    returns results whatever the door did would let the door stop looking entirely and
+    still report a healthy backend.
+    """
 
     def __init__(self, *, bank_id="probe-bank", healthy=True, results=(1, 2),
-                 fail_on=None):
+                 fail_on=None, empty_reads=0):
         self.bank_id = bank_id
         self.healthy = healthy
         self.results = tuple(results)
         self.fail_on = set(fail_on or ())
+        self.empty_reads = empty_reads
         self.calls: list[str] = []
 
     def health(self):
@@ -74,10 +80,14 @@ class FakeBackend:
         self.calls.append("recall")
         if "recall" in self.fail_on:
             raise RuntimeError("no index yet")
+        if self.calls.count("recall") <= self.empty_reads:
+            return SimpleNamespace(results=())     # retained, not searchable yet
         return SimpleNamespace(results=self.results)
 
     def delete_document(self, document_id):
         self.calls.append("delete")
+        if "delete" in self.fail_on:
+            raise RuntimeError("the bank is read-only")
         return {"deleted": True}
 
 
@@ -589,18 +599,77 @@ def test_the_probe_retains_under_a_name_the_client_will_accept():
     assert not document_id_is_ambiguous(PROBE_DOCUMENT_ID)
 
 
+def test_the_probe_window_is_bounded_enough_to_be_run_by_a_waiting_person(store):
+    """The settle window is the door's own, so its worst case is a stated policy.
+
+    `doctor --synthetic-probe` is run by somebody standing at a terminal because something is
+    already wrong. A number that drifts into a minute of silence turns the diagnostic into the
+    fault, so the ceiling is asserted rather than assumed.
+    """
+    assert 1 <= PROBE_SETTLE_READS <= 10
+    assert (PROBE_SETTLE_READS - 1) * PROBE_SETTLE_WAIT_S <= 45.0
+
+
 def test_the_probe_document_is_deleted_even_when_the_round_trip_fails(store):
     backend = FakeBackend(fail_on={"recall"})
     finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip()
     assert finding.severity == FAIL
     assert "delete" in backend.calls, "a probe that leaves a document behind is a leak"
+    assert finding.as_dict()["error"] == "no index yet", (
+        "the reason the round trip failed is not lost to the cleanup")
+
+
+def test_a_probe_that_fails_and_cannot_clean_up_reports_both_facts(store):
+    """One finding, two faults: what broke, and what the door could not put back."""
+    backend = FakeBackend(fail_on={"recall", "delete"})
+    finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip(reads=1)
+    assert finding.severity == FAIL
+    evidence = finding.as_dict()
+    assert evidence["error"] == "no index yet"
+    assert evidence["not_deleted"] == "the bank is read-only"
 
 
 def test_a_backend_that_retains_without_indexing_is_the_failure_itself(store):
     finding = Doctor(store, backend=lambda: FakeBackend(results=())
-                     ).backend_synthetic_round_trip()
+                     ).backend_synthetic_round_trip(reads=1)
     assert finding.severity == FAIL
     assert "silently empty" in finding.remedy
+
+
+def test_a_retain_that_takes_a_moment_to_be_searchable_is_not_called_broken(store):
+    """A synchronous retain is answered before the engine has anything to recall.
+
+    Read once, immediately, that is indistinguishable from a backend which stores without
+    indexing — which is exactly how the live probe reported a backend that answered the same
+    query a few seconds later. The window is the door's own, bounded, and counted.
+    """
+    slept: list[float] = []
+    backend = FakeBackend(results=(1,), empty_reads=2)
+    finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip(
+        reads=4, wait_s=7.5, sleeper=slept.append)
+    assert finding.severity == OK
+    assert slept == [7.5, 7.5], "the door waits on its own clock, not the backend's"
+    assert backend.calls.count("recall") == 3
+    assert finding.as_dict()["waited_seconds"] == 15.0
+    assert "after 15s of settling" in finding.detail
+
+
+def test_a_backend_still_empty_after_the_window_keeps_failing(store):
+    slept: list[float] = []
+    finding = Doctor(store, backend=lambda: FakeBackend(results=())
+                     ).backend_synthetic_round_trip(reads=3, wait_s=5.0,
+                                                    sleeper=slept.append)
+    assert finding.severity == FAIL
+    assert slept == [5.0, 5.0], "the last read is not followed by a wait nobody will act on"
+    assert "after 10s of settling" in finding.detail
+    assert finding.as_dict()["returned"] == 0
+
+
+def test_a_probe_that_cannot_clean_up_after_itself_says_so(store):
+    backend = FakeBackend(results=(1,), fail_on={"delete"})
+    finding = Doctor(store, backend=lambda: backend).backend_synthetic_round_trip(reads=1)
+    assert finding.severity == OK, "the round trip worked; the leak is a separate fact"
+    assert "read-only" in finding.as_dict()["not_deleted"], finding.as_dict()
 
 
 def test_a_probe_without_a_configured_backend_says_so_rather_than_crashing(store):

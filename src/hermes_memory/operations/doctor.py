@@ -14,6 +14,7 @@ pause the gmail connector" is.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -40,6 +41,13 @@ PROBE_TEXT = "Hermes doctor synthetic probe. This sentence is a connectivity tes
 #: and this framework refuses such an id rather than sending it, so a name written with an
 #: underscore here fails the probe before it ever reaches the backend.
 PROBE_DOCUMENT_ID = "doctor-probe"
+#: How many times, and how far apart, the round trip looks for what it just retained. The
+#: engine answers a retain before the derived units are searchable, so one immediate read
+#: reports a healthy backend as broken — and an operator who has just been told their
+#: retrieval is silently empty does not trust the next finding either. Bounded, and the
+#: window it spent is in the evidence, so a real fault is still named after the wait.
+PROBE_SETTLE_READS = 4
+PROBE_SETTLE_WAIT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -517,42 +525,72 @@ class Doctor:
                         "not_routed": missing,
                         "observed_at": now()})
 
-    def backend_synthetic_round_trip(self) -> Finding:
+    def backend_synthetic_round_trip(self, *, reads: int = PROBE_SETTLE_READS,
+                                     wait_s: float = PROBE_SETTLE_WAIT_S,
+                                     sleeper: Callable[[float], None] = time.sleep) -> Finding:
         """One bounded, synthetic write and read, in a bank of its own.
 
         The text is a fixed sentence and the bank is named for the probe, so nothing
         private is sent and nothing of the owner's is overwritten. This is the only
         doctor action that talks to a model or stores anything outside the canonical
         record set, and it happens only when it was asked for by name.
+
+        The read is repeated inside a bounded window, because a synchronous retain is
+        answered before the engine has anything searchable derived from it: one immediate
+        read calls a working backend broken. Running out of the window is still the failure.
         """
         client = self.client()
         if client is None:
             return Finding("synthetic-probe", WARN, "no backend to probe",
                            "configure a route first")
+        attempts = max(1, int(reads))
+        waited = 0.0
+        returned = 0
+        failed = None
+        left_behind = None
         try:
             client.retain(document_id=PROBE_DOCUMENT_ID, content=PROBE_TEXT,
                           metadata={"probe": "doctor"})
-            found = client.recall("doctor synthetic probe", max_tokens=64)
+            for attempt in range(1, attempts + 1):
+                found = client.recall("doctor synthetic probe", max_tokens=64)
+                returned = len(found.results)
+                if returned or attempt == attempts:
+                    break
+                sleeper(wait_s)
+                waited += wait_s
         except Exception as error:
-            return Finding("synthetic-probe", FAIL, f"the round trip failed: {error}",
-                           "check the backend's own logs; the framework wrote nothing "
-                           "about this to the canonical store",
-                           {"error": str(error)[:300]})
+            failed = str(error)[:300]
         finally:
+            # In a finally rather than on the success path: a probe that leaves a document
+            # behind is a leak, and it is one whether the round trip worked or not.
             try:
                 client.delete_document(PROBE_DOCUMENT_ID)
-            except Exception:
-                pass
-        if not found.results:
+            except Exception as error:
+                # The probe's own cleanup failing is a fact, not a detail: the synthetic
+                # document stays in the probe bank, and a report that swallowed this would
+                # leave a stranger's probe text sitting there with nobody to say so.
+                left_behind = str(error)[:200]
+        evidence = {"returned": returned, "bank": self.probe_bank, "reads": attempts,
+                    "waited_seconds": waited}
+        if left_behind is not None:
+            evidence["not_deleted"] = left_behind
+        if failed is not None:
+            evidence["error"] = failed
+            return Finding("synthetic-probe", FAIL, f"the round trip failed: {failed}",
+                           "check the backend's own logs; the framework wrote nothing "
+                           "about this to the canonical store",
+                           evidence)
+        if not returned:
             return Finding("synthetic-probe", FAIL,
-                           "the backend took the text and could not find it again",
+                           f"the backend took the text and still could not find it after "
+                           f"{waited:g}s of settling",
                            "a backend that retains without indexing makes recall silently "
                            "empty; re-check after its index settles",
-                           {"returned": 0})
+                           evidence)
         return Finding("synthetic-probe", OK,
-                       "a synthetic document survived retain and recall",
-                       evidence={"returned": len(found.results),
-                                 "bank": self.probe_bank})
+                       "a synthetic document survived retain and recall"
+                       + ("" if not waited else f", after {waited:g}s of settling"),
+                       evidence=evidence)
 
 
 def _severity_for(state: str) -> str:

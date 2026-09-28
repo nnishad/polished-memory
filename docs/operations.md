@@ -59,6 +59,14 @@ ran, so a later reader can tell what was actually looked at. Exit is `0`, or `1`
 reached `fail`; refusals (an unreadable configuration, an unenrolled profile) exit `2` with
 the reason on stderr.
 
+The synthetic probe retains one fixed sentence and reads it back, and the read is repeated
+inside a bounded window — four looks, ten seconds apart at most — because the engine answers
+a synchronous retain before it can search what it derived from it. A single immediate read
+calls a working backend broken, which is how the live probe first reported the engine. When
+the window runs out the probe fails, and its evidence says how many reads it made and how
+long it waited; the document is deleted whichever way the round trip went, and a delete that
+fails is named in the report rather than swallowed.
+
 Every finding carries a remedy where one exists. "degraded" is not an answer; "run
 `hermes-memory form` to work this queue, or resume a stage an operator paused" is.
 
