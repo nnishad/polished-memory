@@ -711,6 +711,29 @@ def a_release_cut_at(root, commit):
     return root
 
 
+def test_the_inventory_says_when_the_release_it_names_was_staged(installation, tmp_path):
+    """A hold's reason is words about the machine of the day; the staging instant dates them.
+
+    The census that names the commit the running release was cut at also carries when it was
+    staged, because that is what lets another reading call a hold a leftover rather than a
+    current decision. A record written before the field existed is an absence, and an absence
+    is never a conflict.
+    """
+    home, settings = installation
+    dated = a_release_cut_at(tmp_path / "dated", "d" * 40)
+    (dated / "RELEASE.json").write_text(
+        json.dumps({"source_commit": "d" * 40, "staged_at": "2026-09-28T02:00:00+00:00"}),
+        encoding="utf-8")
+    silent = a_release_cut_at(tmp_path / "silent", "d" * 40)
+
+    report = survey(settings, environ={"HERMES_MEMORY_RELEASE": str(dated)}, proc=None)
+    assert report["release"]["staged_at"] == "2026-09-28T02:00:00+00:00"
+    older = survey(settings, environ={"HERMES_MEMORY_RELEASE": str(silent)}, proc=None)
+    assert older["release"]["staged_at"] == "not recorded"
+    assert conflicts(older) == conflicts(report), \
+        "a release that records no staging instant is treated as a fault"
+
+
 def test_a_host_on_another_commit_than_its_runtime_is_reported_as_split(installation, tmp_path):
     """The plugin answering the host and the code answering the plugin are one contract.
 

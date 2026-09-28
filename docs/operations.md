@@ -146,7 +146,10 @@ rather than echoed from the command that was just run. The inference hold comes 
 `inference_hold` — actor, reason, policy version and the moment it was written — because a
 hold that stops every profile on the machine is the one decision a second operator needs
 to be able to attribute, and `instance_hold_by`/`instance_hold_reason` say the same thing
-in the status stage itself. Starting a service never lifts one,
+in the status stage itself. A release record also carries the instant it was staged, so a hold
+written before that instant is reported as possibly a decision about the machine this release
+replaced — a reason is free text, and it outlives the tree it described; a release that
+records no instant is left silent rather than dated anyway. Starting a service never lifts one,
 `--resume` is the only way back, and every hold is attributed — with no owner principal
 configured and no `--actor`, a pause is refused rather than recorded against nobody. A
 `--source` on the two installation-wide scopes is refused rather than ignored, and naming a

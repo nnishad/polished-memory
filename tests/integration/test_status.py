@@ -838,6 +838,55 @@ def test_a_job_queued_by_the_real_queue_is_counted(store):
     assert report.state == CONFIGURED, "the queue holds work; nothing is performing it"
 
 
+def test_a_hold_left_over_from_a_superseded_release_says_so(store, tmp_path):
+    """A hold's reason is free text about the machine that was running when it was written.
+
+    The release record carries the instant it was staged, so the reading can say "this
+    decision predates the release now answering" instead of leaving an operator to work out
+    whether the hold still describes anything. A release that records no instant — every tree
+    staged before the field existed — says nothing rather than guessing.
+    """
+    from types import SimpleNamespace
+
+    from hermes_memory.processing.instance_gate import ResourceGate
+
+    store.set_control("global", "delivery", "paused", actor="owner",
+                      reason="switching to the staged release deadbeef",
+                      policy_version="operator-pause")
+    home = tmp_path / "instance"
+    current = home / "runtime" / "current"
+    current.mkdir(parents=True)
+    record = current / "RELEASE.json"
+    reporter = lambda: StatusReporter(store, settings=SimpleNamespace(home=home),
+                                      gate=ResourceGate(store))
+
+    record.write_text(json.dumps({"staged_at": "2099-01-01T00:00:00+00:00"}), encoding="utf-8")
+    detail = reporter().delivery().detail
+    assert "set before this release was staged (2099-01-01T00:00:00+00:00)" in detail, \
+        "a hold older than the running release is reported as though it were about it"
+
+    record.write_text(json.dumps({"staged_at": "2000-01-01T00:00:00+00:00"}), encoding="utf-8")
+    assert "set before this release" not in reporter().delivery().detail, \
+        "a decision taken about this release is called a leftover"
+
+    record.write_text(json.dumps({"source_commit": "a" * 40}), encoding="utf-8")
+    assert "set before this release" not in reporter().delivery().detail, \
+        "a release that records no staging instant was dated anyway"
+    assert reporter().release_staged_at() is None
+
+    # A zone-less instant is not a moment; comparing one against a zoned one would raise.
+    record.write_text(json.dumps({"staged_at": "2099-01-01T00:00:00"}), encoding="utf-8")
+    assert "set before this release" not in reporter().delivery().detail, \
+        "a naive timestamp was ordered against a zoned one"
+
+    # The inference hold is the other stage an operator has to know is stale.
+    store.set_control("global", "inference", "paused", actor="owner",
+                      reason="the gpu is being ventilated", policy_version="operator-pause")
+    record.write_text(json.dumps({"staged_at": "2099-01-01T00:00:00+00:00"}), encoding="utf-8")
+    assert "set before this release was staged" in reporter().observations().detail, \
+        "the inference hold was left as undateable as the delivery one"
+
+
 def test_an_operators_hold_stops_the_delivery_stage_without_a_single_paused_source(store):
     """The fence is the whole installation's, and the headline has to say so.
 

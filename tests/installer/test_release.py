@@ -211,11 +211,31 @@ def test_a_release_carries_the_units_and_the_plugin_beside_the_runtime(instance,
 
 
 def test_the_manifest_says_which_pin_and_whose_decision_this_is(instance, source, tmp_path):
+    from datetime import datetime
+
+    from hermes_memory.install.release import running_staged_at, staged_at
+
     into = Path(staged(instance, source, tmp_path, runner=Fake())["staged"])
     written = json.loads((into / MANIFEST).read_text(encoding="utf-8"))
     assert written["backend_spec"] == BACKEND_SPEC
     assert written["staged_by"] == OWNER
     assert written["review_digest"]
+    # The instant an owner's hold can be older than. Without it, a reason written about a
+    # superseded release reads as though it were about the one now answering.
+    assert datetime.fromisoformat(written["staged_at"]).tzinfo is not None
+    assert staged_at(into) == written["staged_at"]
+    assert running_staged_at(instance[1]) is None, "nothing points at a release yet"
+    pointer = Path(instance[1].home) / "runtime" / "current"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.symlink_to(into, target_is_directory=True)
+    assert running_staged_at(instance[1]) == written["staged_at"]
+    # A tree staged before the field existed stays silent rather than being dated anyway.
+    (into / MANIFEST).write_text(json.dumps({"staged_by": OWNER}), encoding="utf-8")
+    assert staged_at(into) is None
+    # So does one whose record cannot be read at all: an unreadable record is an absence.
+    (into / MANIFEST).write_text("{", encoding="utf-8")
+    assert staged_at(into) is None
+    assert running_staged_at(instance[1]) is None
 
 
 # -- what a release has to be ------------------------------------------------

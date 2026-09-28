@@ -130,6 +130,7 @@ def _target_shape(target: str | None) -> str:
 
 def _release(settings, environment: dict[str, str]) -> dict[str, Any]:
     from .compatibility import tree_root
+    from .release import staged_at
 
     tree = tree_root()
     named = str(environment.get("HERMES_MEMORY_RELEASE") or "").strip()
@@ -146,6 +147,10 @@ def _release(settings, environment: dict[str, str]) -> dict[str, Any]:
         # host's copy of the plugin is compared against it below: a runtime and a plugin from
         # two revisions is §10.3's pairing broken, and nothing else here can see it.
         "source_commit": _release_commit(root),
+        # When the release the pointer names was staged. A hold records why somebody paused
+        # a stage in free text that outlives the machine it described; this is the instant
+        # that lets a reading say the decision predates the release now running.
+        "staged_at": staged_at(root) or "not recorded",
         "python": sys.version.split()[0],
         "python_executable": sys.executable,
         "uv": shutil.which("uv") or "not found",

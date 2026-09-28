@@ -103,6 +103,19 @@ class StatusReporter:
             "backend": self.backend, "resource_gate": self.resource_gate,
         }
 
+    def release_staged_at(self) -> str | None:
+        """When the release this installation runs was staged, or nothing when it says less.
+
+        Read from the tree the units point at rather than from this process's own import path:
+        the question is about the machine that is answering, and a staged release that
+        predates this field is allowed to stay silent.
+        """
+        if self.settings is None:
+            return None
+        from ..install.release import running_staged_at
+
+        return running_staged_at(self.settings)
+
     # -- report --------------------------------------------------------------
 
     def report(self, *, profile: str | None = None) -> dict[str, Any]:
@@ -245,7 +258,7 @@ class StatusReporter:
                   f"{counts.get('candidate', 0)} candidate assertion(s); "
                   f"queue {_flatten(queue)}")
         if held:
-            detail += _hold_note(hold, "inference")
+            detail += _hold_note(hold, "inference", self.release_staged_at())
         elif waiting:
             detail += ("; only `hermes-memory form` works this queue — nothing drains it "
                        "by itself")
@@ -362,7 +375,7 @@ class StatusReporter:
             "delivery", state,
             f"{in_flight} artifact(s) waiting on the transport, {unproven} without a "
             f"delivery proof, {counts.get('confirmed', 0)} confirmed"
-            + (_hold_note(hold, "delivery") if held else ""),
+            + (_hold_note(hold, "delivery", self.release_staged_at()) if held else ""),
             {"by_state": dict(counts), "in_flight": in_flight, "unproven": unproven,
              "past_expiry": overdue, "paused_sources": sorted(paused),
              "instance_hold": held, "instance_hold_by": (hold or {}).get("actor"),
@@ -679,17 +692,40 @@ def _any(counts: dict[str, int], states: Sequence[str]) -> bool:
     return any(counts.get(state) for state in states)
 
 
-def _hold_note(hold: dict[str, Any] | None, stage: str) -> str:
+def _hold_note(hold: dict[str, Any] | None, stage: str,
+               staged_at: str | None = None) -> str:
     """Name whoever is holding a stage, rather than saying that something is.
 
     Both holds are owner decisions by construction — no other credential can write
     them — but the reading that says "the owner" without saying which one, or why, is
-    the one an operator cannot act on.
+    the one an operator cannot act on. And a reason is free text about the machine that
+    was running when it was written: when the release now running was staged after the
+    hold, the reading says so, because the decision may be about a machine that is gone.
     """
     if not hold:
         return f", and the owner is holding {stage} for this installation"
-    return (f", and the owner is holding {stage} for this installation"
+    note = (f", and the owner is holding {stage} for this installation"
             f" ({hold['actor']}: {hold['reason']})")
+    if staged_at and _before(hold.get("changed_at"), staged_at):
+        note += (f"; it was set before this release was staged ({staged_at}), so it may be "
+                 "a decision about the machine this release replaced")
+    return note
+
+
+def _before(earlier: Any, later: Any) -> bool:
+    """True when both instants parse and the first is the older. Silence is not a comparison.
+
+    A release record that predates this field, or a hold written without a zone, answers no
+    question here; inventing an order would date an owner's decision on no evidence.
+    """
+    try:
+        first = datetime.fromisoformat(str(earlier))
+        second = datetime.fromisoformat(str(later))
+    except (TypeError, ValueError):
+        return False
+    if first.tzinfo is None or second.tzinfo is None:
+        return False
+    return first < second
 
 
 def _flatten(counts: dict[str, int]) -> str:

@@ -38,12 +38,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from ..backend.capabilities import PINNED_VERSION
-from ..ids import content_digest, digest
+from ..ids import content_digest, digest, now
 from .compatibility import source_checkout
 from .services import executables, render
 
 __all__ = ["ReleaseError", "plan", "apply", "verify", "carry", "BACKEND_SPEC",
-           "MANIFEST", "CARRIED", "release_root"]
+           "MANIFEST", "CARRIED", "release_root", "staged_at", "running_staged_at"]
 
 #: The backend this build is written against, as one spec string.
 BACKEND_SPEC = f"hindsight-api-slim[embedded-db]=={PINNED_VERSION}"
@@ -62,6 +62,25 @@ class ReleaseError(ValueError):
 def release_root(settings) -> Path:
     """Where this instance's staged releases live."""
     return Path(settings.home) / "runtime"
+
+
+def staged_at(root: Path | str) -> str | None:
+    """When a staged release says it was staged, or None when it does not say.
+
+    A release record is allowed to be silent: trees staged before this field was written
+    hold nothing, and a reading that invented an instant for them would date decisions it
+    cannot date. An unreadable record is the same absence, not a difference.
+    """
+    try:
+        record = json.loads((Path(root) / MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return str(record.get("staged_at") or "").strip() or None
+
+
+def running_staged_at(settings) -> str | None:
+    """The staging instant of the release the runtime pointer names, if it records one."""
+    return staged_at(release_root(settings) / "current")
 
 
 def _python(into: Path, *, backend: bool = False) -> Path:
@@ -219,6 +238,11 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
                     "backend_spec": BACKEND_SPEC if backend else None,
                     "framework_version": _version(),
                     "staged_by": actor.strip(), "python": sys.version.split()[0],
+                    # When this tree was staged. A hold says why somebody paused a stage, and
+                    # the reason is free text that outlives the machine it was about: the
+                    # staging instant is what lets a reading say "this decision predates the
+                    # release now running" instead of leaving the operator to guess.
+                    "staged_at": now(),
                     "carried": {name: len(files) for name, files in staged["carried"].items()}}
         (target / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                                        encoding="utf-8")
