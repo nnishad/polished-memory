@@ -7,6 +7,7 @@ to place one row would test those components instead of the reading.
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from hermes_memory.operations.status import (CONFIGURED, DEGRADED, DISABLED, OPE
 from hermes_memory.processing.jobs import JobQueue
 from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import Route
+from hermes_memory.sources.capture_spool import spool_beside
 from hermes_memory.storage.evidence import EvidenceError
 
 from conftest import envelope
@@ -57,6 +59,28 @@ def connector(store, sync, source="gmail", *, coverage="current") -> dict:
     store.db.execute("UPDATE connectors SET coverage_state=? WHERE source=?",
                      (coverage, source))
     return state
+
+
+def host_spool(store, *event_ids, state="pending") -> Path:
+    """Lay a capture spool beside the store, in the shape the plugin writes it.
+
+    Written here rather than through the plugin's own module: this is the host's file, and the
+    reading under test has to make sense of it without any help from whoever filled it.
+    """
+    path = spool_beside(store.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE IF NOT EXISTS spool(event_id TEXT PRIMARY KEY, session_id TEXT,"
+               " payload TEXT, created_at TEXT, state TEXT, attempts INTEGER,"
+               " last_error TEXT)")
+    for event_id in event_ids:
+        db.execute("INSERT INTO spool VALUES(?,?,?,?,?,?,?)",
+                   (event_id, "sess-1", json.dumps({"kind": "conversation_turn",
+                                                    "user": "u", "assistant": "a"}),
+                    "2026-09-28T09:00:00+00:00", state, 0, None))
+    db.commit()
+    db.close()
+    return path
 
 
 def a_goal(store, *, goal_id="goal-1", status="active", **overrides):
@@ -236,6 +260,67 @@ def test_a_formation_pause_does_not_claim_the_ingestion_stage_is_stopped(store, 
     sync.pause("gmail", actor="owner", reason="thinking", policy_version="v1",
                stages=("formation",))
     assert StatusReporter(store).capture().state == OPERATIONAL
+
+
+# -- the host's capture spool ------------------------------------------------
+
+def test_turns_the_host_handed_over_that_nothing_has_read_are_not_an_operational_stage(
+        store, sync):
+    """The bug this reading exists for: a full spool and a green connector table.
+
+    Those events are not in this database, so every number the stage otherwise reports stays
+    perfect while the conversations go unread.
+    """
+    connector(store, sync, coverage="current")
+    host_spool(store, "e1", "e2")
+    report = StatusReporter(store).capture()
+    assert report.state == DEGRADED
+    assert report.evidence["spool_unread"] is True
+    assert report.evidence["spool"]["pending"] == 2
+    assert "2 captured event(s) in the host spool" in report.detail
+
+
+def test_a_source_that_has_drained_the_spool_once_is_not_called_broken_by_the_tail(store, sync):
+    """A bounded pass that has not caught up is a queue, not the fault above.
+
+    Only the count is said, so the reading stays true without condemning a drain that works.
+    """
+    connector(store, sync, source="hermes", coverage="current")
+    store.db.execute("UPDATE connectors SET last_success_at=? WHERE source='hermes'",
+                     ("2026-09-28T10:00:00+00:00",))
+    host_spool(store, "e1", "e2", "e3")
+    report = StatusReporter(store).capture()
+    assert report.state == OPERATIONAL
+    assert report.evidence["spool_unread"] is False
+    assert "3 captured event(s) in the host spool" in report.detail
+
+
+def test_an_empty_spool_is_not_evidence_of_a_stopped_capture(store, sync):
+    connector(store, sync, coverage="current")
+    host_spool(store)
+    report = StatusReporter(store).capture()
+    assert report.state == OPERATIONAL
+    assert report.evidence["spool"]["present"] is True
+    assert report.evidence["spool"]["pending"] == 0
+
+
+def test_a_file_at_the_spool_path_that_is_not_a_spool_is_named_not_swallowed(store, sync):
+    connector(store, sync, coverage="current")
+    path = spool_beside(store.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(path).execute("CREATE TABLE something_else(id TEXT)").close()
+    report = StatusReporter(store).capture()
+    assert report.state == DEGRADED
+    assert "cannot be read" in report.detail
+    assert "no 'spool' table" in report.evidence["spool"]["error"]
+
+
+def test_a_paused_stage_does_not_blame_the_loop_for_turns_it_was_told_not_to_read(store, sync):
+    connector(store, sync, source="hermes")
+    sync.pause_capture("hermes", actor="owner", reason="privacy review",
+                       policy_version="v1")
+    host_spool(store, "e1", "e2")
+    assert StatusReporter(store).capture().state == PAUSED
 
 
 # -- the local index ---------------------------------------------------------

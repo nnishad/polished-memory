@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 import tempfile
 from pathlib import Path
@@ -21,6 +22,7 @@ from hermes_memory.ids import document_id_is_ambiguous
 from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, PROBE_QUERY,
                                             PROBE_SETTLE_READS, PROBE_SETTLE_WAIT_S,
                                             PROBE_TEXT, WARN, Doctor, Finding)
+from hermes_memory.sources.capture_spool import spool_beside
 from hermes_memory.storage.evidence import EvidenceStore
 
 APPROVED_LAN = "192.168.68.65"
@@ -329,6 +331,29 @@ def test_a_source_working_through_its_backfill_is_not_a_fault(store, sync):
     sync.register("gmail", policy_version="local-only")
     store.db.execute("UPDATE connectors SET coverage_state='partial' WHERE source='gmail'")
     assert Doctor(store).coverage().severity == OK
+
+
+def test_a_spool_the_host_filled_and_nobody_opened_names_the_door_that_drains_it(store, sync):
+    """Every connector number is green here; the turns are in the other file.
+
+    The remedy has to be the pass that reads that file, not the connector this installation
+    cannot find, or the operator is sent to the one door with no handle on it.
+    """
+    path = spool_beside(store.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE spool(event_id TEXT PRIMARY KEY, session_id TEXT, payload TEXT,"
+               " created_at TEXT, state TEXT, attempts INTEGER, last_error TEXT)")
+    db.execute("INSERT INTO spool VALUES('e1','s','{}','2026-09-28T09:00:00+00:00','pending',"
+               "0,NULL)")
+    db.commit()
+    db.close()
+    sync.register("gmail", policy_version="local-only")
+
+    finding = Doctor(store, backend=Tripwire()).coverage()
+    assert finding.severity == FAIL
+    assert "hermes-memory maintain" in finding.remedy
+    assert finding.evidence["spool"]["pending"] == 1
 
 
 def test_a_quarantined_job_names_the_work_that_will_not_retry_itself(store):

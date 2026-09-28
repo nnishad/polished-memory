@@ -31,7 +31,7 @@ __all__ = ["Maintenance", "Ticker", "DEFAULT_LIMIT", "MAX_LIMIT", "SECTIONS", "r
 
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
-SECTIONS = ("proactive", "summaries", "identity", "queue", "erasure")
+SECTIONS = ("capture", "proactive", "summaries", "identity", "queue", "erasure")
 
 
 class Maintenance:
@@ -140,6 +140,45 @@ class Maintenance:
                 **json.loads(str(row["metadata"] or "{}"))}
 
     # -- the sections --------------------------------------------------------
+
+    def _capture(self, *, moment: str, limit: int) -> dict[str, Any]:
+        """Drain the host's capture spool into the record set. The consumer half of C2.
+
+        The plugin writes every turn it is allowed to keep into a spool beside the profile's
+        own store, and the adapter that turns those events into records takes a drain rather
+        than a path on purpose. Nothing here is optional about that: an installation whose
+        spool is never read has recorded every conversation it will ever show, in a file no
+        component looks at, while its status answers that capture is operational.
+        """
+        from ..sources.capture_spool import (SPOOL_SOURCE, spool_backlog, spool_beside,
+                                             spool_drain)
+        from ..sources.sdk import HermesEvents
+        from ..sources.runtime import ConnectorRuntime
+        from ..sources.sync import SyncController
+
+        spool = spool_beside(self.store.path)
+        before = spool_backlog(spool)
+        if not before["present"]:
+            return {"spool": str(spool), "present": False, "records": 0, "pending": 0,
+                    "note": "no capture spool for this profile; nothing to drain"}
+
+        sync = SyncController(self.store, clock=self.clock)
+        try:
+            sync.state(SPOOL_SOURCE)
+        except EvidenceError:
+            # Registration is this component's to do, not the plugin's: the policy says these
+            # events are read where they already are and never leave the machine.
+            sync.register(SPOOL_SOURCE, policy_version="local-only")
+        runtime = ConnectorRuntime(self.store, sync, holder=f"maintenance@{moment}",
+                                   clock=self.clock)
+        run = runtime.run(HermesEvents(spool_drain(spool), records_per_page=limit))
+        after = spool_backlog(spool)
+        return {"spool": str(spool), "present": True, "records": run.records,
+                "repeats": run.repeats, "gaps": run.gaps, "pages": run.pages,
+                "stopped": run.stopped, "cursor": run.cursor,
+                "coverage_state": run.coverage_state, "pending": after["pending"],
+                "pending_before": before["pending"],
+                "note": run.note or "the spool is the source; the cursor is the position in it"}
 
     def _proactive(self, *, moment: str, limit: int) -> dict[str, Any]:
         swept = self.engine.sweep(at=moment, limit=limit)

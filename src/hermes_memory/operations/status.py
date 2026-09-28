@@ -22,6 +22,8 @@ from ..backend.worker_launcher import OperationLedger
 from ..ids import now, timestamp
 from ..processing.instance_gate import instance_gate, status_gate
 from ..processing.resource_gate import UNCERTAIN, WAITING, ResourceGate
+from ..sources.capture_spool import (
+    SPOOL_SOURCE, SpoolError, spool_backlog, spool_beside)
 from ..sources.sync import COVERAGE_STATES
 from ..storage.evidence import EvidenceError
 
@@ -166,14 +168,38 @@ class StatusReporter:
                            if row["coverage_state"] in UNHEALTHY_COVERAGE)
         records = int(self.db.execute(
             "SELECT count(*) FROM records WHERE deleted=0").fetchone()[0])
-        state = (UNCONFIGURED if not sources else
-                 PAUSED if self._all_stopped("capture", paused) else
-                 DEGRADED if unhealthy or open_gaps else OPERATIONAL)
+        spool = self._spool()
+        # Turns the host handed over and no connector has ever committed are invisible here:
+        # they are not in this database, so the stage's own ledger says nothing about them. A
+        # spool with rows waiting and no successful drain behind them is the stage not working,
+        # whichever green number the connectors table happens to hold.
+        drained = any(row["source"] == SPOOL_SOURCE and row["last_success_at"]
+                      for row in sources)
+        unread = bool(spool.get("error")) or (spool["pending"] > 0 and not drained)
+        if self._all_stopped("capture", paused):
+            # Somebody's decision, with a name and a timestamp: turns waiting behind a pause
+            # are what the pause asked for.
+            state = PAUSED
+        elif unread:
+            # Ahead of the unconfigured answer on purpose. The host has handed over a source
+            # with work in it, so "nothing is configured here" would be the same lie the
+            # degraded table told, only in a different set of clothes.
+            state = DEGRADED
+        elif not sources:
+            state = UNCONFIGURED
+        elif unhealthy or open_gaps:
+            state = DEGRADED
+        else:
+            state = OPERATIONAL
+        detail = (f"{len(sources)} source(s) registered, "
+                  f"{len([row for row in sources if row['source'] in paused])} paused, "
+                  f"{sum(open_gaps.values())} open gap(s), {records} live record(s)")
+        if spool["present"]:
+            detail += f"; {spool['pending']} captured event(s) in the host spool"
+        if spool.get("error"):
+            detail += f"; the host spool cannot be read: {spool['error']}"
         return StageReport(
-            "capture", state,
-            f"{len(sources)} source(s) registered, "
-            f"{len([row for row in sources if row['source'] in paused])} paused, "
-            f"{sum(open_gaps.values())} open gap(s), {records} live record(s)",
+            "capture", state, detail,
             {"sources": [{"source": row["source"], "generation": row["generation"],
                           "coverage_state": row["coverage_state"],
                           "paused": row["source"] in paused,
@@ -185,6 +211,8 @@ class StatusReporter:
              "unhealthy": unhealthy,
              "records": records,
              "open_gaps": sum(open_gaps.values()),
+             "spool": spool,
+             "spool_unread": unread,
              "coverage_states": sorted(COVERAGE_STATES)})
 
     def raw_indexing(self) -> StageReport:
@@ -599,6 +627,19 @@ class StatusReporter:
     @property
     def capture_only(self) -> bool:
         return bool(getattr(self.settings, "capture_only", False))
+
+    def _spool(self) -> dict[str, Any]:
+        """What the host's capture spool holds beside this store — counts, never text.
+
+        A file at that path which is not a spool is reported rather than raised: an unreadable
+        spool is a finding about capture, not a reason this reading cannot answer.
+        """
+        path = spool_beside(self.store.path)
+        try:
+            return spool_backlog(path)
+        except SpoolError as error:
+            return {"spool": str(path), "present": True, "pending": 0, "settled": 0,
+                    "states": {}, "oldest_at": None, "error": str(error)}
 
     def _pauses(self, stage: str) -> dict[str, dict[str, Any]]:
         rows = self.db.execute(

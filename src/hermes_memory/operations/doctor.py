@@ -229,6 +229,17 @@ class Doctor:
             return Finding("coverage", WARN, "no source is registered",
                            "add one with setup or import a fixture",
                            {"state": report.state})
+        spool = report.evidence.get("spool") or {}
+        if report.evidence.get("spool_unread"):
+            # Named separately from the degraded case below because the action differs: the
+            # source is not unreachable and nobody paused it. The host handed turns over and
+            # this installation has never opened the file they are in.
+            return Finding("coverage", FAIL, report.detail,
+                           "`hermes-memory maintain` drains the host spool into the record set "
+                           "once; if the pending count keeps growing between passes, the "
+                           "background loop is not running — see the `background` check",
+                           {"state": report.state, "spool": spool,
+                            "unhealthy": report.evidence.get("unhealthy")})
         degraded = report.state == DEGRADED
         return Finding("coverage", _severity_for(report.state), report.detail,
                        "run the connector again, or pause it if the source is gone"

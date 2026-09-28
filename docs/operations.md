@@ -296,19 +296,37 @@ shrugs off.
 ## The background pass
 
 ```sh
-hermes-memory maintain                          # one bounded pass, all five sections
+hermes-memory maintain                          # one bounded pass, all six sections
+hermes-memory maintain --section capture
 hermes-memory maintain --section proactive
 hermes-memory maintain --limit 5 --at 2026-09-15T09:00:00+00:00
 hermes-memory maintain --hermes-home ~/.hermes/profiles/work
 ```
 
-Five things were built and had no caller: due reminders were never taken, a summary that a
-correction invalidated was reported as stale but never queued for the refresh that would
-clear it, an identity candidate citing forgotten evidence stayed pending forever, a job
-waiting out a backoff was listed while being unclaimable, and nobody counted what an
-erasure still owes a backend. `maintain` is the pass that runs them, and the runtime unit
-runs it on a period (`HERMES_MEMORY_MAINTENANCE_INTERVAL_S`, 900 seconds by default, `0` to
-hand the timer back to you).
+Six things were built and had no caller: the host's capture spool was written and never
+opened, due reminders were never taken, a summary that a correction invalidated was reported
+as stale but never queued for the refresh that would clear it, an identity candidate citing
+forgotten evidence stayed pending forever, a job waiting out a backoff was listed while being
+unclaimable, and nobody counted what an erasure still owes a backend. `maintain` is the pass
+that runs them, and the runtime unit runs it on a period
+(`HERMES_MEMORY_MAINTENANCE_INTERVAL_S`, 900 seconds by default, `0` to hand the timer back to
+you).
+
+The first of those six is the one that decides whether this installation has any evidence at
+all. The plugin appends every turn it is allowed to keep to `capture-spool.db` beside the
+profile's canonical store — durable, its own retry columns, readable by nothing in the core —
+and the `capture` section is the consumer: it registers the `hermes` source under the
+`local-only` policy, walks the spool in its own insertion order, and hands each page to the
+connector runtime, which commits it and moves the cursor in one transaction. A row is retired
+under the plugin's own word, `settled`, and only once a *later* read has passed it: that is the
+state the plugin's compaction (`forget_settled_before`) reclaims, so a reader that invented a
+word of its own would fill the file forever while reporting a state no component can name; and
+because the connector advances its cursor after committing, a pass that died between the two
+replays the page rather than skipping it, with the store's event-id dedupe making the replay
+cheap. Position is the cursor, never the text: event ids are the host's strings and are never
+compared. `status` reads the same file's counts rather than trusting the connector table alone,
+which is how a full spool and a green pipeline now disagree instead of agreeing that everything
+is fine.
 
 **The pass never spends a model call.** That single rule is why it can run unattended while
 `form` cannot: `form` costs tokens, a device slot and a unit of the daily budget, so it
