@@ -594,8 +594,9 @@ def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
     actions.append(f"plugin files at the release tree digest {_tree_digest(ctx)}")
     if registered and registered != ctx.ref:
         blocking.append(f"the host registers hermes-memory at {registered} and this release is "
-                        f"{ctx.ref}; replacing a registered plugin is the host's --force, and "
-                        "setup will not rewrite a host's mind on a reviewer's behalf")
+                        f"{ctx.ref or 'not named by --ref'}; replacing a registered plugin is "
+                        "the host's --force, and setup will not rewrite a host's mind on a "
+                        "reviewer's behalf")
     if not (ctx.ref and _HEX.fullmatch(ctx.ref)):
         blocking.append("--ref must be the 40-character commit this release was cut at; "
                         "setup will not install a moving pointer")

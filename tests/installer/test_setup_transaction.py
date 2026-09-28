@@ -1038,6 +1038,23 @@ def test_a_host_holding_a_different_commit_is_told_so_rather_than_overwritten(in
         proposal["blocked"]
 
 
+def test_a_step_given_no_commit_names_the_omission_rather_than_the_release(installation):
+    """A missing ``--ref`` is this run's gap, not a property of the tree beside it.
+
+    The sentence is read at the moment somebody decides whether the installation is broken,
+    and "this release is None" describes a tree that is plainly there — the reviewable fact is
+    that no commit was named for it.
+    """
+    settings, environ = installation
+    activity = registered_host(Path(settings.home).parent, "c" * 40)
+    proposal = plan(settings, hermes_home=activity, environ=environ,
+                    runner=lambda argv: (0, ""))
+    said = [line for line in proposal["blocked"] if "registers hermes-memory at" in line]
+    assert said, proposal["blocked"]
+    assert "not named by --ref" in said[0], said[0]
+    assert "None" not in said[0], said[0]
+
+
 def test_a_backend_directory_that_went_missing_reopens_the_step_that_owns_it(installation,
                                                                              tmp_path):
     """The receipt says the layout was made; the filesystem no longer agrees.
