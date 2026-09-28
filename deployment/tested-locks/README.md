@@ -6,7 +6,7 @@ be asked a useful question: did the code change, or did the world under it?
 
 | File | Resolved for | Verified by |
 | --- | --- | --- |
-| `uv-py3.12.lock` | CPython 3.12.13, `uv lock` output of this tree | `uv run pytest` (2641 passed, 1 skipped) and `uv run python evals/run_synthetic.py` (56 of 56 measured checks) |
+| `uv-py3.12.lock` | CPython 3.12.13, `uv lock` output of this tree | `uv run pytest` (2643 passed, 1 skipped) and `uv run python evals/run_synthetic.py` (56 of 56 measured checks) |
 | `../dependencies.json` | the same lock, with each package's declared license | generated offline from resolved metadata; nothing was installed to produce it |
 
 Two things are deliberate and should not be "fixed" by a dependency bot:

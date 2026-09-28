@@ -23,7 +23,8 @@ from typing import Any, Callable, Sequence
 
 from ..config import DEFAULT_ENV_FILENAME, endpoint_is_private, env_file_values
 from ..ids import content_digest, digest, now
-from .inventory import blocks_setup, conflicts, provider_selection, survey
+from .inventory import (blocks_setup, conflicts, provider_selection, registered_revision,
+                        survey)
 from .profiles import InstallationError, ProfileRegistry, STATE_FILENAME
 from .services import plan as service_plan
 from .uninstall import record_provider_selection
@@ -41,8 +42,6 @@ STEPS: tuple[str, ...] = ("inventory", "plan", "stage", "configure", "initialize
                           "canary", "finish")
 
 PLAN_VERSION = "setup-plan-v1"
-#: The key the host files its own registration record under.
-PLUGIN_KEY = "hermes-memory"
 INPUT_VERSION = "setup-step-v1"
 _HEX = re.compile(r"[0-9a-f]{40}")
 CANARY_SOURCE = "setup-canary"
@@ -552,23 +551,6 @@ def _backend_directories(ctx: Context) -> list[Path]:
             Path(placed.instance_home) / "cache" / "huggingface"]
 
 
-def _registered_revision(hermes_home: Path) -> str | None:
-    """Which commit the host says it registered this plugin at, read from its own record.
-
-    Read rather than asked: an inventory of the installation must not run the host to find out
-    what the host wrote down, and the metadata file is the record the host itself uses.
-    """
-    record = Path(hermes_home) / "plugins" / ".install-metadata.json"
-    if not record.is_file():
-        return None
-    try:
-        recorded = json.loads(record.read_text(encoding="utf-8")).get(PLUGIN_KEY) or {}
-    except ValueError:
-        return None
-    revision = str(recorded.get("revision") or "").strip()
-    return revision or None
-
-
 def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
     """The host's own install path, with the reviewed commit pinned.
 
@@ -579,7 +561,7 @@ def _register_plugin(ctx: Context, *, apply: bool) -> dict[str, Any]:
     """
     commands = [argv for argv, name in host_commands(ctx) if name != "activate"]
     release = _release_root(ctx)
-    registered = _registered_revision(ctx.hermes_home)
+    registered = registered_revision(ctx.hermes_home)
     blocking: list[str] = []
     if registered and registered == ctx.ref:
         # The host already registers exactly this commit, so the transaction says so instead

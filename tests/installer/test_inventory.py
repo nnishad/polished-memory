@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import ssl
 from pathlib import Path
 
 import pytest
@@ -109,22 +110,32 @@ def probe(installation, host_home, **kwargs):
 # -- it reads, it does not do --------------------------------------------------
 
 def test_the_inventory_writes_nothing_and_opens_no_socket(installation, host_home, tmp_path):
+    """A subclass that refuses to be built, rather than a function wearing its place.
+
+    The claim is about construction: no socket is opened. Replacing `socket.socket` with a
+    plain function also makes any module that subclasses it unimportable, which turned this
+    into a test of whichever import order the suite happened to hit — a read-only report may
+    import a client library; it may not connect through one.
+    """
     before = {path for path in tmp_path.rglob("*")}
-    monkeypatch_socket = []
+    opened = []
     real_socket = socket.socket
+    assert real_socket in ssl.SSLSocket.__mro__, \
+        "the TLS class has to be built before anything is swapped out"
 
-    def refusing(*args, **kwargs):
-        monkeypatch_socket.append("socket")
-        raise AssertionError("an inventory must not open a socket")
+    class Refusing(real_socket):
+        def __init__(self, *args, **kwargs):
+            opened.append("socket")
+            raise AssertionError("an inventory must not open a socket")
 
-    socket.socket = refusing
+    socket.socket = Refusing
     try:
         report = probe(installation, host_home)
     finally:
         socket.socket = real_socket
     assert {path for path in tmp_path.rglob("*")} == before
     assert report["endpoints"]["probed"] is False
-    assert "socket" not in json.dumps(monkeypatch_socket)
+    assert opened == []
 
 
 def test_the_report_is_plain_data(installation, host_home):
@@ -441,38 +452,42 @@ def test_a_process_whose_descriptors_cannot_be_read_does_not_end_the_search(inst
 
 
 def test_the_gate_closes_on_collisions_and_on_nothing_else(installation, tmp_path, monkeypatch):
-    """Seven reasons to say something, of which exactly four are reasons to stop.
+    """Eight reasons to say something, of which exactly five are reasons to stop.
 
     This is the whole content of `inventory --conflicts`'s exit status. A stranger on a wanted
-    port, a second capture owner, no hermes to register against and no principal who can
-    confirm a forgetting each mean a run here would act on something that is not this
-    installation's to act on. A loose permission, a credential left at rest and a delivery
-    switch with no destination are this installation's own business, worth fixing and no
-    reason to refuse the run. Count the partition rather than spot-checking it: a sentence
-    that quietly moved from one side to the other is the difference between a healthy
-    installation reading as blocked and a broken one reading as fine (§10.4).
+    port, a second capture owner, no hermes to register against, no principal who can confirm a
+    forgetting and a host registered at somebody else's commit each mean a run here would act
+    on something that is not this installation's to act on. A loose permission, a credential
+    left at rest and a delivery switch with no destination are this installation's own business,
+    worth fixing and no reason to refuse the run. Count the partition rather than spot-checking
+    it: a sentence that quietly moved from one side to the other is the difference between a
+    healthy installation reading as blocked and a broken one reading as fine (§10.4).
     """
     home, _ = installation
     (home / "hermes-memory.env").write_text(
         config(home, HINDSIGHT_URL="http://127.0.0.1:8080",
                HINDSIGHT_API_KEY="a-secret-left-in-a-config-file",
-               DELIVERY_ENABLED="true", DELIVERY_TARGET="nobody-has-agreed-to-this"), encoding="utf-8")
+               DELIVERY_ENABLED="true",
+               DELIVERY_TARGET="nobody-has-agreed-to-this"), encoding="utf-8")
     (home / "hermes-memory.env").chmod(0o644)
     (home / "data" / "live").mkdir(parents=True)
     (home / "data" / "live" / "canonical.db").write_text("", encoding="utf-8")
     (home / "data" / "stray").mkdir(parents=True)
     (home / "data" / "stray" / "canonical.db").write_text("", encoding="utf-8")
+    a_host_registered_at(tmp_path, "c" * 40)
+    staged = a_release_cut_at(tmp_path / "staged", "d" * 40)
     monkeypatch.setattr(inventory_module, "shutil", FakePath({}))
 
     from hermes_memory.config import load_settings
 
-    report = survey(load_settings(), hermes_home=tmp_path, environ={},
+    report = survey(load_settings(), hermes_home=tmp_path,
+                    environ={"HERMES_MEMORY_RELEASE": str(staged)},
                     proc=a_port_8080_in_use(tmp_path))
     said = conflicts(report)
-    assert len(said) == 7, said
+    assert len(said) == 8, said
 
     stopping = blocking(report)
-    assert len(stopping) == 4, stopping
+    assert len(stopping) == 5, stopping
     assert all(blocks_setup(line) for line in stopping)
     for marker in BLOCKING_MARKERS:
         assert any(marker in line for line in stopping), marker
@@ -674,6 +689,78 @@ def test_a_release_root_the_units_never_set_is_said_as_not_set(installation, tmp
                    environ={"HERMES_MEMORY_RELEASE": "/srv/hermes-memory/current"},
                    proc=None)
     assert named["release"]["release_root"] == "/srv/hermes-memory/current"
+
+
+# -- the host's plugin and the runtime's release --------------------------------
+
+def a_host_registered_at(home, revision):
+    """The record the host keeps for its own plugin registration."""
+    (home / "plugins").mkdir(parents=True, exist_ok=True)
+    (home / "plugins" / ".install-metadata.json").write_text(
+        json.dumps({"hermes-memory": {"revision": revision}}), encoding="utf-8")
+    return home
+
+
+def a_release_cut_at(root, commit):
+    """A staged release, with the record the staging door leaves beside the ``bin/``."""
+    (root / "deployment").mkdir(parents=True, exist_ok=True)
+    (root / "RELEASE.json").write_text(json.dumps({"source_commit": commit}), encoding="utf-8")
+    return root
+
+
+def test_a_host_on_another_commit_than_its_runtime_is_reported_as_split(installation, tmp_path):
+    """The plugin answering the host and the code answering the plugin are one contract.
+
+    §10.3 pairs the wheel and the plugin from one revision; a re-release that left the host's
+    registration pointing at the old commit splits that contract in half, and every other
+    number here still reads as healthy. Only the host's own --force may close the gap, so the
+    inventory names both commits rather than waiting for a setup run to refuse.
+    """
+    home, settings = installation
+    registered = a_host_registered_at(tmp_path / "host", "c" * 40)
+    staged = a_release_cut_at(tmp_path / "release", "d" * 40)
+
+    report = survey(settings, hermes_home=registered,
+                    environ={"HERMES_MEMORY_RELEASE": str(staged)}, proc=None)
+    assert report["host"]["plugin_registered_revision"] == "c" * 40
+    assert report["release"]["source_commit"] == "d" * 40
+    said = conflicts(report)
+    assert any("two different revisions" in line for line in said), said
+    assert any("cccccccccccc" in line and "dddddddddddd" in line for line in blocking(report)), \
+        blocking(report)
+
+    # The units do not always name the release: an installation that only has the pointer is
+    # the ordinary one, and the split has to be visible from that too.
+    a_release_cut_at(home / "runtime" / "current", "f" * 40)
+    fell_back = survey(settings, hermes_home=registered, environ={}, proc=None)
+    assert fell_back["release"]["source_commit"] == "f" * 40
+    assert any("two different revisions" in line for line in conflicts(fell_back)), \
+        conflicts(fell_back)
+
+
+def test_a_registration_that_cannot_be_compared_is_not_called_a_split(installation, tmp_path):
+    """Two records that are simply absent are not evidence of a mismatch.
+
+    A plugin installed by hand, or a tree that was never staged by the release door, has no
+    commit to compare. The honest answer is that this installation says nothing about it —
+    not a blocking sentence that sends somebody off to fix a thing that is not broken.
+    """
+    home, settings = installation
+    unrecorded = a_host_registered_at(tmp_path / "handmade", "c" * 40)
+    bare = tmp_path / "unstaged"
+    (bare / "deployment").mkdir(parents=True)
+
+    report = survey(settings, hermes_home=unrecorded,
+                    environ={"HERMES_MEMORY_RELEASE": str(bare)}, proc=None)
+    assert report["release"]["source_commit"] == "not recorded"
+    assert not any("two different revisions" in line for line in conflicts(report)), \
+        conflicts(report)
+
+    aligned = survey(settings, hermes_home=a_host_registered_at(tmp_path / "same", "e" * 40),
+                     environ={"HERMES_MEMORY_RELEASE":
+                              str(a_release_cut_at(tmp_path / "cut", "e" * 40))}, proc=None)
+    assert not any("two different revisions" in line
+                   for line in conflicts(aligned)), conflicts(aligned)
 
 
 def test_the_ledger_is_reported_present_only_when_it_is_actually_there(installation,

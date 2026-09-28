@@ -12,6 +12,7 @@ guessed fact is an interruption waiting to happen at the worst possible step.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -24,11 +25,19 @@ from urllib.parse import urlparse
 from ..config import DEFAULT_ENV_FILENAME, env_file_values
 
 __all__ = ["survey", "listening_ports", "provider_selection", "conflicts", "blocking",
-           "blocks_setup", "BLOCKING_MARKERS"]
+           "blocks_setup", "registered_revision", "BLOCKING_MARKERS"]
 
 ENV_PREFIX = "HERMES_MEMORY_"
 _HEX_PORT = re.compile(r"^[0-9A-Fa-f]{4}$")
 LISTEN = "0A"
+#: A commit, in the only form the host and the release record both use. Anything else is an
+#: absence ("not recorded"), and an absence is not a difference.
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+# The plugin's own name in the host's records, and the two files that hold what the host and
+# the staging door wrote down about it.
+PLUGIN_KEY = "hermes-memory"
+HOST_METADATA = Path("plugins") / ".install-metadata.json"
+RELEASE_RECORD = "RELEASE.json"
 # Where `backup` writes its copies, relative to a profile's data directory. Named here because
 # the search for a second capture owner has to look straight through it.
 SNAPSHOT_DIR = "snapshots"
@@ -123,6 +132,8 @@ def _release(settings, environment: dict[str, str]) -> dict[str, Any]:
     from .compatibility import tree_root
 
     tree = tree_root()
+    named = str(environment.get("HERMES_MEMORY_RELEASE") or "").strip()
+    root = Path(named) if named else Path(settings.home) / "runtime" / "current"
     return {
         "framework_version": _version("hermes-memory"),
         # Named as an absence when there is no tree: an installed build whose plugin is not
@@ -131,6 +142,10 @@ def _release(settings, environment: dict[str, str]) -> dict[str, Any]:
         # The units name this path; whether the code answering is the code they start is
         # a question an operator asks at exactly the moment it is expensive to get wrong.
         "release_root": environment.get("HERMES_MEMORY_RELEASE", "not set"),
+        # Which commit the release was cut at, from the record the staging door wrote. The
+        # host's copy of the plugin is compared against it below: a runtime and a plugin from
+        # two revisions is §10.3's pairing broken, and nothing else here can see it.
+        "source_commit": _release_commit(root),
         "python": sys.version.split()[0],
         "python_executable": sys.executable,
         "uv": shutil.which("uv") or "not found",
@@ -139,11 +154,45 @@ def _release(settings, environment: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def _release_commit(root: Path) -> str:
+    """The commit a staged release says it was cut at, or why that is not knowable."""
+    record = root / RELEASE_RECORD
+    if not record.is_file():
+        return "not recorded"
+    try:
+        commit = str(json.loads(record.read_text(encoding="utf-8")).get("source_commit") or "")
+    except ValueError:
+        return "unreadable"
+    return commit.strip() or "not recorded"
+
+
 def _version(distribution: str) -> str | None:
     try:
         return metadata.version(distribution)
     except metadata.PackageNotFoundError:
         return None
+
+
+def registered_revision(hermes_home: Path | None) -> str | None:
+    """Which commit the host says it registered this plugin at, read from its own record.
+
+    Read rather than asked: an inventory must not run the host to find out what the host wrote
+    down, and this file is the record the host itself uses. Two doors need the answer — the
+    setup transaction refuses to rewrite a registered plugin, and a report has to say when the
+    runtime and the host's copy of the plugin are different revisions — so it lives beside the
+    other host readings rather than beside one of them.
+    """
+    if hermes_home is None:
+        return None
+    record = Path(hermes_home) / HOST_METADATA
+    if not record.is_file():
+        return None
+    try:
+        written = json.loads(record.read_text(encoding="utf-8")).get(PLUGIN_KEY) or {}
+    except ValueError:
+        return None
+    revision = str(written.get("revision") or "").strip()
+    return revision or None
 
 
 def _host(home: Path | None, environment: dict[str, str]) -> dict[str, Any]:
@@ -167,6 +216,7 @@ def _host(home: Path | None, environment: dict[str, str]) -> dict[str, Any]:
         "memory_provider": provider_selection(config) if config.is_file() else "no config.yaml to read",
         "plugin_config": str(provider_config),
         "plugin_config_present": provider_config.is_file(),
+        "plugin_registered_revision": registered_revision(root) or "not recorded",
         "env_file": str(root / ".env"),
         # The host gap of §9.5: a queued body can still be sent after the framework
         # has revalidated it, so unattended live alerts are not claimable here.
@@ -446,6 +496,15 @@ def conflicts(report: dict[str, Any]) -> list[str]:
     if len(stores) > 1:
         say.append(f"{len(stores)} canonical stores are visible under the searched homes "
                    f"({', '.join(stores)}); one profile has one capture owner")
+    registered = report["host"]["plugin_registered_revision"]
+    cut = report["release"]["source_commit"]
+    if (_COMMIT.fullmatch(registered) and _COMMIT.fullmatch(cut) and registered != cut):
+        # Two records that name commits, and one release whose plugin copy the host never took.
+        # A missing record on either side is not a difference: an installation that registered
+        # its plugin by hand is unusual, and saying so here would be guessing at it.
+        say.append(f"the host registers hermes-memory at {registered[:12]} and this release was "
+                   f"cut at {cut[:12]}: the runtime and the host's copy of the plugin are two "
+                   "different revisions, and only the host's own --force closes that")
     if report["installation"]["world_readable"]:
         say.append(f"{report['installation']['config_file']} is readable beyond its owner "
                    "and holds the route configuration")
@@ -468,9 +527,11 @@ def conflicts(report: dict[str, Any]) -> list[str]:
 #: Which of the sentences `conflicts()` produces describe a collision with something real.
 #: Everything else it can say is worth telling the operator and does not make this
 #: installation wrong: a loose permission, a credential at rest, a port this installation
-#: already holds and would simply replace (§10.4).
+#: already holds and would simply replace (§10.4). A runtime whose host half is registered at
+#: another commit is on the blocking side because the transaction cannot get past
+#: `register-plugin` without the host's own --force, which is the owner's act to take.
 BLOCKING_MARKERS = ("already listening", "capture owner", "no hermes executable",
-                    "no owner principal")
+                    "no owner principal", "two different revisions")
 
 
 def blocks_setup(line: str) -> bool:

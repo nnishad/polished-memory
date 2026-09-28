@@ -164,6 +164,16 @@ blocked. Plain `hermes-memory inventory` is the door for everything worth readin
 run, advisories included, and its exit status never carries an opinion about whether to
 proceed: the advice half of the split is for a human, and only the collision half gates.
 
+One of the colliding facts is the host's own registration record. §10.3 pairs the wheel and
+the plugin from one revision, so the inventory reads the commit the host wrote down
+(`~/.hermes/plugins/.install-metadata.json`) beside the commit the staged release carries
+(`<release>/RELEASE.json`), and says so when they differ: *the runtime and the host's copy of
+the plugin are two different revisions*. Nothing else here can see that split — every other
+number in the report still reads as healthy — and only the host's own `--force` closes it,
+which is an owner's act rather than something a setup run may do on a reviewer's behalf. A
+release that records no commit, or a plugin installed by hand, is not reported as a mismatch:
+an absence is not a difference.
+
 `--start` and `hermes-memory start` are the only ways anything gets started, and starting
 is a separate decision from installing the units. Autostart is a third decision:
 
