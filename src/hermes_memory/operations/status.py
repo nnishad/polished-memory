@@ -161,9 +161,14 @@ class StatusReporter:
         sources = self.db.execute("SELECT * FROM connectors ORDER BY source").fetchall()
         paused = self._pauses("capture")
         gaps = self.db.execute(
-            "SELECT source, count(*) AS n FROM source_gaps WHERE cleared_at IS NULL "
-            "GROUP BY source ORDER BY source").fetchall()
+            "SELECT g.source, count(*) AS n FROM source_gaps g "
+            "JOIN connectors c ON c.source = g.source AND c.generation = g.generation "
+            "WHERE g.cleared_at IS NULL GROUP BY g.source ORDER BY g.source").fetchall()
         open_gaps = {row["source"]: int(row["n"]) for row in gaps}
+        # Only the generation that is still reading counts as debt. A gap is a promise that the
+        # thing is missing, and a reconfigured connector re-reads from the beginning — so the
+        # retired generation's rows are history (still `sources --gaps`'s to show), while
+        # counting them here would keep a stage open on a failure it has already answered.
         unhealthy = sorted(row["source"] for row in sources
                            if row["coverage_state"] in UNHEALTHY_COVERAGE)
         records = int(self.db.execute(

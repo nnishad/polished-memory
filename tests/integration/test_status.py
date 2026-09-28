@@ -234,6 +234,33 @@ def test_a_gap_the_next_arrival_closed_is_not_still_a_debt(store, sync):
     assert StatusReporter(store).capture().state == OPERATIONAL
 
 
+def test_a_retired_generations_gap_is_history_rather_than_current_debt(store, sync):
+    """The new generation re-reads from the beginning, so the old failure is answered.
+
+    `sources --gaps` still shows it, under the generation that met it; a stage that counted it
+    open would report a connector behind on work it has already promised to do again.
+    """
+    connector(store, sync)
+    insert(store, "source_gaps", source="gmail", generation=1, ref="chat.txt#7",
+           reason="read failed", first_seen_at=PAST, last_seen_at=PAST)
+    sync.reconfigure("gmail", policy_version="local-only", actor="owner", reason="remapped")
+
+    report = StatusReporter(store).capture()
+    assert report.evidence["open_gaps"] == 0
+    assert report.state == OPERATIONAL
+    history = sync.gaps("gmail", generation=1, include_cleared=True)
+    assert [gap["ref"] for gap in history] == ["chat.txt#7"]
+
+
+def test_a_gap_the_current_generation_still_owes_is_counted(store, sync):
+    connector(store, sync)
+    insert(store, "source_gaps", source="gmail", generation=1, ref="chat.txt#7",
+           reason="read failed", first_seen_at=PAST, last_seen_at=PAST)
+    report = StatusReporter(store).capture()
+    assert report.state == DEGRADED
+    assert report.evidence["open_gaps"] == 1
+
+
 def test_pausing_every_source_is_reported_as_a_stop_somebody_asked_for(store, sync):
     connector(store, sync, source="gmail")
     connector(store, sync, source="whatsapp")

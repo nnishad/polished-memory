@@ -582,12 +582,17 @@ hermes-memory import --source whatsapp --path ~/exports/phone --policy local-onl
 `sources list` reports each connector's own account: the cursor it stopped at, its
 generation and policy version, what coverage it claims, whether its lease is held, and with
 `--gaps` the ranges it could not hand over. Coverage is what the source says it has; a gap
-is what it could not give, and neither is a claim about what is missing. A source that was
+is what it could not give, and neither is a claim about what is missing. A gap is answered by
+the thing arriving — including by a *part* of it, which is how an event delivered later as its
+two sides closes the debt on the event — and only the generation that is still reading owes it:
+`status` counts the current generation's open gaps, while the retired ones stay in the ledger
+for `--gaps` to show under the generation that met them. A source that was
 disabled is not forgotten — disabling revokes authorisation for what comes next.
 
 `sources reconfigure` is what an operator runs when a connector's old position no longer
 describes the same stream: a re-mapped account, a changed endpoint, a narrowed or widened
-scope. It starts a new generation, which strands any writer still holding the previous
+scope, or a core upgrade that taught an adapter an event kind it used to skip. It starts a new
+generation, which strands any writer still holding the previous
 fence instead of committing under the new declaration, drops the cursor so the next read
 begins at the start, resets coverage to `unknown`, and re-records the ingestion scope.
 Run without `--review` it writes nothing and prints the connectors it found, what each one
