@@ -128,12 +128,19 @@ class Capabilities:
                 "unsupported": list(self.unsupported), "mismatches": list(self.mismatches)}
 
 
-def capabilities_for(version: str, *, route_names: set[str] | None = None) -> Capabilities:
+def capabilities_for(version: str, *, route_names: set[str] | None = None,
+                     ruled_out: set[str] | None = None) -> Capabilities:
     """Build the capability set for an observed version.
 
-    When the backend tells us which routes it actually serves, that overrides
-    the table: a build that removed an endpoint would otherwise keep us sending
-    requests to it, and a version string alone does not prove a route exists.
+    When the backend tells us which routes it actually serves, that overrides the table: a
+    build that removed an endpoint would otherwise keep us sending requests to it, and a
+    version string alone does not prove a route exists.
+
+    `route_names` is a *census* — pass it only when the whole served set is known. A partial
+    observation is `ruled_out`: names that were asked about and answered 404, subtracted from
+    the table with everything else left as declared. Confusing the two reported a backend as
+    routing neither `retain` nor `recall` on the strength of three read-only probes, both of
+    which it had been answering for hours.
     """
     declared = {cap.name for cap in CAPABILITIES if _at_least(version, cap.since)}
     if route_names is not None:
@@ -143,6 +150,12 @@ def capabilities_for(version: str, *, route_names: set[str] | None = None) -> Ca
                             unsupported=tuple(absent), observed_via="routes",
                             mismatches=tuple(f"advertised at {version} but not routed: {name}"
                                              for name in absent))
+    absent = sorted(declared & {str(name) for name in ruled_out or ()})
+    if absent:
+        return Capabilities(version=version, supported=frozenset(declared - set(absent)),
+                            unsupported=tuple(absent), observed_via="routes",
+                            mismatches=tuple(f"asked for at {version} and it answered 404: "
+                                             f"{name}" for name in absent))
     return Capabilities(version=version, supported=frozenset(declared),
                         observed_via="version")
 

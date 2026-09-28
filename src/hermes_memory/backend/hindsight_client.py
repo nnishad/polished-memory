@@ -136,16 +136,17 @@ class HindsightClient:
             raise
         routes = None
         if probe_routes:
-            # A version string alone does not prove an endpoint exists; the
-            # cheapest honest probe is one request per read-only route family.
+            # A version string alone does not prove an endpoint exists; a 404 does prove the
+            # opposite. So the read-only route families are asked about, and what comes back
+            # is subtracted from the table — it is a partial look, not a census, and three
+            # probes must not be allowed to say that a backend which has been answering
+            # `retain` for hours does not route it.
             routes = set()
             for name in ("list_banks", "bank_stats", "list_operations"):
                 probe = self._call("GET", self._path_for(name), None, capability=None)
-                if probe.ok or probe.status in {400, 404}:
-                    routes.add(name)
                 if probe.status == 404:
-                    routes.discard(name)
-        self._capabilities = capabilities_for(version, route_names=routes or None)
+                    routes.add(name)
+        self._capabilities = capabilities_for(version, ruled_out=routes)
         self._capabilities = Capabilities(**{**self._capabilities.__dict__,
                                              "observed_via": observed})
         return self._capabilities

@@ -107,6 +107,24 @@ def test_the_pinned_version_supports_the_operations_we_reconcile_with(client):
         assert name in client.capabilities.supported, name
 
 
+def test_read_only_probes_are_not_reported_as_the_whole_route_table(client, transport):
+    """A 404 on three read-only routes says nothing at all about `retain`.
+
+    Read as a census, that partial look told the doctor that a backend which had been
+    answering retains for hours routed neither retain nor recall — and `require` takes the
+    report at its word, so the next caller holding that client would refuse the work outright
+    on the strength of a lookup the engine had never been asked to provide.
+    """
+    transport.when("GET /v1/default/banks", TransportResult(200, {"banks": []}))
+    transport.when(f"GET /v1/default/banks/{BANK}/stats", TransportResult(404, {}))
+    transport.when(f"GET /v1/default/banks/{BANK}/operations", TransportResult(404, {}))
+
+    observed = client.negotiate(probe_routes=True)
+    assert {"retain", "recall", "delete_memories"} <= observed.supported, observed.unsupported
+    assert sorted(observed.unsupported) == ["bank_stats", "list_operations"]
+    assert all("answered 404" in line for line in observed.mismatches), observed.mismatches
+
+
 def test_an_older_backend_reports_the_newer_capabilities_it_lacks():
     caps = capabilities_for("0.9.2")
     assert "dry_run_extract" not in caps.supported, "advertised at 0.10.1, absent at 0.9.2"
