@@ -501,6 +501,34 @@ def test_the_release_check_vouches_for_the_manifest_that_ships(store, tmp_path, 
     assert finding.evidence["manifest"] == str(path)
 
 
+def test_a_manifest_written_at_another_tree_state_names_both_digests(store, tmp_path,
+                                                                    monkeypatch):
+    """The claims a build can be held to and the tree a manifest was written from are two facts.
+
+    Printing only the shipped digest under a heading that says this build agrees invites a
+    reader to take it for *this* build's digest, and a `compatibility` reading that reports
+    `agree: false` beside it then looks like a contradiction rather than a different question.
+    """
+    import json
+
+    from hermes_memory.install import compatibility
+
+    release = tmp_path / "release"
+    (release / "deployment").mkdir(parents=True)
+    path = release / "deployment" / "compatibility.json"
+    compatibility.write(path=path)
+    facts = json.loads(path.read_text(encoding="utf-8"))
+    facts["framework_digest"] = "0" * 64
+    path.write_text(json.dumps(facts), encoding="utf-8")
+    monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(release))
+
+    finding = Doctor(store).release()
+    assert finding.severity == OK, "development edits the tree, not the release's claims"
+    assert "claims match this build" in finding.detail
+    assert "this tree at" in finding.detail, finding.detail
+    assert len(finding.evidence["tree_digest"]) == 64
+
+
 def test_a_manifest_that_claims_another_engine_stops_the_installation(store, tmp_path,
                                                                      monkeypatch):
     """The one artefact that says "this release works with that backend" has to be true.

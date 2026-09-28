@@ -326,8 +326,21 @@ def verify(*, path: Path | None = None, settings=None,
             differences.append(f"{key}: shipped {actual!r}, this build {wanted!r}")
     differences += [f"the shipped manifest claims compatibility this build does not: {key}"
                     for key in sorted(set(shipped) - set(current) - {"not_claimed"})]
-    return {"ok": not differences, "checked": str(target), "differences": differences,
-            "remedy": remedy if differences else None,
-            "digests": {"framework": current["framework_digest"],
-                        "shipped": shipped.get("framework_digest"),
-                        "agree": current["framework_digest"] == shipped.get("framework_digest")}}
+    report = {"ok": not differences, "checked": str(target), "differences": differences,
+              "remedy": remedy if differences else None,
+              "digests": {"framework": current["framework_digest"],
+                          "shipped": shipped.get("framework_digest"),
+                          "agree": current["framework_digest"] ==
+                                   shipped.get("framework_digest")}}
+    if not digests and not report["digests"]["agree"]:
+        # The two statements sit in one report and look contradictory unless said apart: the
+        # claims this build checks are matched, and the digest — which names the tree the
+        # manifest was written from — is not, because the tree has been edited since. That is
+        # a packaging fact rather than a running one, and only `--digests` holds a release to
+        # it. Left unexplained, a reader takes "agree: false" for the contradiction the
+        # "ok": true above it is denying.
+        report["digests"]["note"] = (
+            "the manifest was written at a different tree state than this one; the claims it "
+            "makes are what this build makes, and `compatibility --digests` is the check that "
+            "a release is cut with a manifest regenerated for the code beside it")
+    return report

@@ -405,12 +405,20 @@ class Doctor:
         path = manifest_path(self.settings)
         if checked["ok"]:
             shipped = read_shipped(path=path)
+            digests = checked["digests"]
+            # "agrees" is about the claims, which is what a running build can be held to. The
+            # digest names the tree the manifest was written from, and a tree that has been
+            # edited since is not a contradiction of this finding — so both numbers are shown
+            # rather than one of them described as agreement.
             return Finding("release", OK,
-                           f"{path.name} agrees with this build; framework "
-                           f"{shipped['framework_digest'][:12]} pinned to Hindsight "
-                           f"{shipped['hindsight']['engine_pinned']}",
+                           f"{path.name}'s claims match this build; written at framework "
+                           f"{shipped['framework_digest'][:12]}"
+                           + ("" if digests["agree"]
+                              else f", this tree at {digests['framework'][:12]}")
+                           + f", pinned to Hindsight {shipped['hindsight']['engine_pinned']}",
                            evidence={"manifest": str(path),
                                      "framework_digest": shipped["framework_digest"],
+                                     "tree_digest": digests["framework"],
                                      "pinned": shipped["hindsight"]["engine_pinned"],
                                      "schema": shipped["schema"]["evidence_migrations"]})
         if checked.get("absent"):

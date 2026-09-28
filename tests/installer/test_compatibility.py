@@ -94,10 +94,22 @@ def test_a_source_edit_changes_the_digest_without_condemning_the_release(shipped
     facts = json.loads(shipped.read_text(encoding="utf-8"))
     facts["framework_digest"] = "0" * 64
     shipped.write_text(json.dumps(facts), encoding="utf-8")
-    assert compatibility.verify(path=shipped)["ok"] is True
+    reported = compatibility.verify(path=shipped)
+    assert reported["ok"] is True
+    assert "different tree state" in reported["digests"]["note"], (
+        "`ok: true` printed beside `agree: false` reads as a contradiction unless the report "
+        "says which of the two it actually checked")
     stale = compatibility.verify(path=shipped, digests=True)
     assert stale["ok"] is False and stale["digests"]["agree"] is False
+    assert "note" not in stale["digests"], "the strict check says it as a difference instead"
     assert any("framework_digest" in line for line in stale["differences"])
+
+
+def test_a_manifest_written_from_this_tree_has_nothing_to_explain(shipped):
+    """The explanation is for a mismatch; a matching pair must not acquire one."""
+    checked = compatibility.verify(path=shipped)
+    assert checked["ok"] is True and checked["digests"]["agree"] is True
+    assert "note" not in checked["digests"]
 
 
 def test_a_plugin_file_that_no_longer_matches_the_release_is_caught_by_the_digests(shipped):
