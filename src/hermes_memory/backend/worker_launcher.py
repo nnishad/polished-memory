@@ -200,7 +200,7 @@ async def _discard(memory: Any, *, error: BaseException,
                     "error": f"{type(error).__name__}: {str(error)[:200]}",
                     "next": "waiting, then building a fresh engine"}
     try:
-        await memory.shutdown()
+        await memory.close()
     except Exception as shutdown_error:
         announcement["shutdown_error"] = (
             f"{type(shutdown_error).__name__}: {str(shutdown_error)[:200]}")
@@ -662,7 +662,7 @@ def _launch(settings, *, modules: Mapping[str, Any], config: Any,
             try:
                 await poller.run()
             finally:
-                await memory.shutdown()
+                await memory.close()
 
         try:
             asyncio.run(run())

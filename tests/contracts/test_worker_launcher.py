@@ -63,7 +63,11 @@ class Backend:
 
 
 class Engine:
-    """``MemoryEngine`` at the tag: these keywords, and nothing else, are what we pass."""
+    """``MemoryEngine`` at the tag: these keywords, and nothing else, are what we pass.
+
+    The method names are the pinned engine's own, because a double that invents one keeps the
+    suite green while the call fails on a real machine.
+    """
 
     def __init__(self, *, run_migrations, task_backend, tenant_extension,
                  operation_validator):
@@ -74,7 +78,7 @@ class Engine:
         self._backend = Backend()
         self.executed = []
         self.initialized = False
-        self.shutdown_called = False
+        self.closed = False
 
     async def execute_task(self, task):
         self.executed.append(task)
@@ -85,8 +89,8 @@ class Engine:
     async def on_task_wall_timeout(self, task):
         return "timed out"
 
-    async def shutdown(self):
-        self.shutdown_called = True
+    async def close(self):
+        self.closed = True
 
 
 class Poller:
@@ -552,7 +556,7 @@ def test_the_real_launch_path_composes_the_pinned_construction_end_to_end(tmp_pa
     assert main([]) == 0
     assert built["poller"].arguments["max_slots"] == 1
     assert built["poller"].ran and built["engine"].initialized
-    assert built["engine"].shutdown_called is True
+    assert built["engine"].closed is True
     assert built["engine"].executed == [TASK], "the wrapper passed the task through"
     with GateStore(gate_path(load_settings())) as store:
         assert OperationLedger(store).get("op-1")["state"] == "finished"
@@ -666,7 +670,7 @@ def test_an_attempt_that_races_a_hold_is_torn_down_and_retried_with_a_fresh_engi
     built = run(bring_up(a_build(engines, first=HeldDuringStartup), ledger.store,
                          sleep=a_ticker(ledger.store, slept, lift_after=1)))
     assert len(engines) == 2
-    assert engines[0].shutdown_called is True and engines[0].initialized is False
+    assert engines[0].closed is True and engines[0].initialized is False
     assert built["memory"] is engines[1] and engines[1].initialized is True
 
 
@@ -685,7 +689,7 @@ def test_a_startup_failure_that_is_not_the_hold_still_exits(ledger):
                      sleep=a_ticker(ledger.store, slept)))
     assert slept == [], "a broken installation is not waited out; waiting is for a race"
     assert len(engines) == 1
-    assert engines[0].shutdown_called is False, "nothing was torn down behind a retry loop"
+    assert engines[0].closed is False, "nothing was torn down behind a retry loop"
 
 
 # -- the engine's own database ------------------------------------------------
@@ -741,7 +745,7 @@ def test_a_worker_that_starts_before_its_database_waits_for_it(ledger, capsys):
                          db_wait_s=20.0, db_poll_s=5.0))
     assert slept == [5.0, 5.0], "the wait is the launcher's own, not systemd's restart timer"
     assert len(engines) == 3, "a fresh engine per attempt, as with a hold"
-    assert [engine.shutdown_called for engine in engines[:2]] == [True, True]
+    assert [engine.closed for engine in engines[:2]] == [True, True]
     assert built["memory"] is engines[2] and engines[2].initialized is True
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     waits = [line for line in lines
@@ -764,7 +768,7 @@ def test_a_database_that_never_answers_is_still_a_failure(ledger):
                      sleep=a_ticker(ledger.store, slept), db_wait_s=10.0, db_poll_s=5.0))
     assert slept == [5.0, 5.0], "two waits at this ceiling, and then the refusal is the answer"
     assert len(engines) == 3
-    assert engines[-1].shutdown_called is False, "the last attempt is not torn down twice"
+    assert engines[-1].closed is False, "the last attempt is not torn down twice"
 
 
 def test_an_unclean_teardown_of_a_half_started_engine_is_said_not_swallowed(ledger, capsys):
@@ -774,7 +778,7 @@ def test_an_unclean_teardown_of_a_half_started_engine_is_said_not_swallowed(ledg
             a_hold(ledger.store)
             raise RuntimeError("503: paused")
 
-        async def shutdown(self):
+        async def close(self):
             raise RuntimeError("connection already closed")
 
     engines = []
