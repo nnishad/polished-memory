@@ -207,7 +207,71 @@ def test_a_release_tree_carrying_its_own_manifest_is_the_one_read(tmp_path, monk
     monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(release))
     assert compatibility.manifest_path() == other
     monkeypatch.delenv("HERMES_MEMORY_RELEASE")
-    assert compatibility.manifest_path() == compatibility.SHIP_AT
+    assert compatibility.manifest_path() == compatibility.REPO / compatibility.RELATIVE
+
+
+def a_checkout(tmp_path):
+    """A tree `facts()` can describe, standing in for the one this test would otherwise use."""
+    root = tmp_path / "checkout"
+    (root / "integrations").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
+    shutil.copytree(PLUGIN, root / "integrations" / "hermes-memory")
+    return root
+
+
+def test_packaging_writes_beside_the_build_that_is_running_it(tmp_path, monkeypatch):
+    """A release on the disk is somebody's installation; it is not this command's target.
+
+    The manifest is generated for the code that produced it, so a source run has to file it in
+    its own tree. Reading the instance home's `runtime/current` as the target instead — which
+    is where a *check* looks, because a check asks what a release claims — rewrites a running
+    release's statement of its own compatibility with a digest of different code, and the next
+    check then agrees with itself about a release neither side describes.
+    """
+    home = a_checkout(tmp_path)
+    live = tmp_path / "instance" / "runtime" / "current" / "deployment"
+    live.mkdir(parents=True)
+    claimed = live / "compatibility.json"
+    claimed.write_text(json.dumps({"framework_digest": "that release's own code"}),
+                       encoding="utf-8")
+    monkeypatch.setattr(compatibility, "tree_root", lambda: home)
+
+    written = compatibility.write(environ={"HERMES_MEMORY_HOME": str(tmp_path / "instance")})
+    assert written == home / "deployment" / "compatibility.json"
+    assert json.loads(written.read_text(encoding="utf-8"))["package"]["package"] \
+        == "hermes-memory"
+    assert json.loads(claimed.read_text(encoding="utf-8"))["framework_digest"] \
+        == "that release's own code", "the running release was rewritten"
+
+
+def test_the_release_being_packed_is_the_one_a_write_describes(tmp_path, monkeypatch):
+    """``HERMES_MEMORY_RELEASE`` names the act, and the tree beside it is the target.
+
+    A packager staging a release from a checkout has to be able to file the manifest into the
+    thing being built, and a digest that landed in the source tree instead would be copied into
+    the release a step later — describing the wrong code either way.
+    """
+    packed = tmp_path / "packing"
+    (packed / "deployment").mkdir(parents=True)
+    monkeypatch.setattr(compatibility, "tree_root", lambda: a_checkout(tmp_path))
+
+    written = compatibility.write(environ={"HERMES_MEMORY_RELEASE": str(packed)})
+    assert written == packed / "deployment" / "compatibility.json"
+    assert not (tmp_path / "checkout" / "deployment").exists()
+
+
+def test_a_build_with_no_tree_to_describe_writes_nothing(monkeypatch):
+    """A wheel on its own has nowhere truthful to file this, and has to say so.
+
+    The alternative is a manifest written three directories above a `site-packages` parent: a
+    path that looks like a tree, describes no code, and then satisfies the check that reads it
+    back (§10.3).
+    """
+    monkeypatch.setattr(compatibility, "tree_root", lambda: None)
+    monkeypatch.delenv("HERMES_MEMORY_RELEASE", raising=False)
+    with pytest.raises(compatibility.CompatibilityUnavailable,
+                       match="needs a tree to describe"):
+        compatibility.write(environ={})
 
 
 def test_the_manifest_claims_nothing_it_cannot_support(shipped):
@@ -229,8 +293,6 @@ def release(tmp_path, monkeypatch):
     """A release tree this test owns, standing where the installer would put one."""
     root = tmp_path / "release"
     (root / "deployment").mkdir(parents=True)
-    monkeypatch.setattr(compatibility, "SHIP_AT",
-                        root / "deployment" / "compatibility.json")
     monkeypatch.setenv("HERMES_MEMORY_RELEASE", str(root))
     return root / "deployment" / "compatibility.json"
 

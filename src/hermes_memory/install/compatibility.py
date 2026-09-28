@@ -40,7 +40,6 @@ class CompatibilityUnavailable(ValueError):
 
 REPO = Path(__file__).resolve().parents[3]
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
-SHIP_AT = REPO / "deployment" / "compatibility.json"
 PLUGIN_DIR = REPO / "integrations" / "hermes-memory"
 RELATIVE = Path("deployment") / "compatibility.json"
 #: What makes a directory the tree this build belongs to. A source checkout has both, a
@@ -220,26 +219,24 @@ def manifest_path(settings=None, environ: dict[str, str] | None = None) -> Path 
     return tree / RELATIVE if tree else None
 
 
-def write(*, path: Path | None = None, settings=None,
-          environ: dict[str, str] | None = None) -> Path:
+def write(*, path: Path | None = None, environ: dict[str, str] | None = None) -> Path:
     """Regenerate the manifest, for packaging.
 
-    The target is chosen by convention, not by which files already exist: writing a manifest
-    is how one comes to exist. ``HERMES_MEMORY_RELEASE`` names the release being packed, the
-    instance home's ``runtime/current`` names it otherwise, and a source run falls to the
-    checkout — which is the only place a manifest may be invented rather than copied.
+    The target is chosen by which act this is, not by which files already happen to exist:
+    writing a manifest is how one comes to exist. ``HERMES_MEMORY_RELEASE`` names the release
+    being packed; otherwise the file is rewritten beside the tree this build was imported from,
+    which is the only place a manifest may be invented rather than copied. A running
+    installation's ``runtime/current`` is deliberately not a candidate: a digest computed from
+    the code running this command, filed beside the code it is not, makes the check that reads
+    it back agree with itself about a release neither side describes.
     """
     source = os.environ if environ is None else environ
     target = path
     if target is None:
         release = str(source.get("HERMES_MEMORY_RELEASE") or "")
-        pointer = Path(settings.home) / "runtime" / "current" if settings is not None else None
-        if release:
-            target = Path(release) / RELATIVE
-        elif pointer is not None and (pointer / "deployment").is_dir():
-            target = pointer / RELATIVE
-        else:
-            target = SHIP_AT
+        tree = Path(release) if release else tree_root()
+        if tree is not None:
+            target = tree / RELATIVE
     root = tree_for(target)
     if root is None:
         raise CompatibilityUnavailable(

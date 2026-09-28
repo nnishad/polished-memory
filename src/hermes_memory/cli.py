@@ -2093,7 +2093,7 @@ def _compatibility_command(settings, args) -> int:
     from .install import compatibility
 
     if args.write:
-        written = compatibility.write(settings=settings)
+        written = compatibility.write()
         return _emit({"written": str(written), "facts": compatibility.facts(),
                       "note": "ship this file with the release it describes"})
     checked = compatibility.verify(settings=settings, digests=args.digests)

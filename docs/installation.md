@@ -44,6 +44,12 @@ not make `doctor` red; the packaging step compares the digests as well —
 `hermes-memory compatibility --digests`, which is what a release build has to pass — so a
 patched plugin directory or a tree that was never cut as a release is caught.
 
+The write goes to the tree that is running the command: `HERMES_MEMORY_RELEASE` names the
+release being packed, and with nothing named the file lands beside this checkout. A live
+installation's `runtime/current` is never a target, even though that is exactly where a
+*check* looks — a digest of one tree filed beside another would be read back as agreement, and
+the release would carry a compatibility claim no code matches.
+
 ## Configuration
 
 The runtime reads one owned file, `$HERMES_MEMORY_HOME/hermes-memory.env`, then the
