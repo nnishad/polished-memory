@@ -267,6 +267,19 @@ class Doctor:
                            # that word for the opposite claim, and two meanings in one key is
                            # how a reader ends up certain of the wrong thing.
                            {"queue": counts, "age": age, "operator_needed": True})
+        unprojected = observations.evidence.get("unprojected")
+        if unprojected and not counts:
+            # The queue is empty and that is exactly the finding: formation is an approved act,
+            # so nothing queues itself, and records can sit captured and unasked forever while
+            # every queue reading says there is no work.
+            return Finding("queue", WARN,
+                           f"{unprojected} live record(s) have no backend projection and "
+                           "nothing is queued to form them",
+                           "`hermes-memory form` shows the list and prices it; the pass itself "
+                           "is the owner's to approve with --review, because it spends a device "
+                           "and a model call",
+                           {"unprojected": unprojected, "queue": counts, "age": age,
+                            "state": observations.state})
         return Finding("queue", _severity_for(observations.state), observations.detail,
                        evidence={"queue": counts, "age": age,
                                  "state": observations.state})

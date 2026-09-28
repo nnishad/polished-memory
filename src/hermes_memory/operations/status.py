@@ -283,13 +283,24 @@ class StatusReporter:
         # avoid, because nothing in this installation claims a job by itself.
         waiting = _any(queue, WAITING_JOBS) and not _any(queue, RUNNING_JOBS)
         running = _any(queue, RUNNING_JOBS)
+        # The local `assertions` table is what this stage has *confirmed*, not what it is owed:
+        # a record can be captured, live, and never asked of the backend, and the queue can be
+        # empty because formation is an approved act rather than because there is nothing to
+        # form. Measuring only the confirmed rows called a working pipeline unconfigured on a
+        # machine with five verified documents and seven records nobody has offered yet.
+        unprojected = self._unprojected()
         state = (DEGRADED if stuck else
                  PAUSED if held or self._all_stopped("formation", paused) else
-                 OPERATIONAL if counts or running else
-                 CONFIGURED if waiting else UNCONFIGURED)
+                 OPERATIONAL if running else
+                 CONFIGURED if (unprojected or waiting) else
+                 OPERATIONAL if counts else UNCONFIGURED)
         detail = (f"{counts.get('confirmed', 0)} confirmed / "
                   f"{counts.get('candidate', 0)} candidate assertion(s); "
                   f"queue {_flatten(queue)}")
+        if unprojected:
+            detail += (f"; {unprojected} live record(s) have no backend projection and nothing "
+                       "is queued to form them — `hermes-memory form` shows the list and prices "
+                       "the approval, which is the part nothing does for itself")
         if held:
             detail += _hold_note(hold, "inference", self.release_staged_at())
         elif waiting:
@@ -298,6 +309,7 @@ class StatusReporter:
         return StageReport(
             "observations", state, detail,
             {"assertions": dict(counts), "queue": dict(queue), "stuck": stuck,
+             "unprojected": unprojected,
              "paused_sources": sorted(paused), "instance_hold": held,
              "instance_hold_by": (hold or {}).get("actor"),
              "instance_hold_reason": (hold or {}).get("reason"),
@@ -632,6 +644,21 @@ class StatusReporter:
     @property
     def capture_only(self) -> bool:
         return bool(getattr(self.settings, "capture_only", False))
+
+    def _unprojected(self) -> int | None:
+        """Live records the derived backend has never been asked about.
+
+        None when this installation has no backend to project to — a reading that invented a
+        debt against an absent endpoint would be worse than one that says nothing. Counted here
+        because this is the stage that has to say whether formation is acting, and formation
+        itself will not answer without a plan somebody reviewed.
+        """
+        from ..processing.formation import count_unprojected
+
+        bank_id = getattr(self.settings, "bank_id", None)
+        if not bank_id or not getattr(self.settings, "hindsight_url", None):
+            return None
+        return count_unprojected(self.store, bank_id=bank_id)
 
     def _spool(self) -> dict[str, Any]:
         """What the host's capture spool holds beside this store — counts, never text.

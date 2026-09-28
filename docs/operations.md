@@ -24,6 +24,13 @@ Nine stages report separately, and each one answers only for itself: `capture`,
 `unconfigured` and `disabled` — and `configured` is never written as `operational`, because
 a route that exists is not a route that answered.
 
+`observations` is the stage where that distinction earns its keep. Its local `assertions` table
+counts what formation has *confirmed*, and an empty queue means nobody has approved a pass, not
+that nothing is owed — so the stage also counts live records with no backend projection. Seven
+of those with an idle queue is `configured`, with the number in the line and `hermes-memory
+form` named as the door: the debt is said out loud without the reading pretending to pay it,
+because paying it costs a model call, a device slot and an approval that is the owner's to give.
+
 The report also carries four things an operator reads next:
 
 - `erasure_backlog` — obligations that are not verified gone everywhere, tombstones, and how

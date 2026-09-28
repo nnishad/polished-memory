@@ -37,7 +37,8 @@ def settings(**overrides):
     # ``home`` is in the surface because the resource gate is read from the instance
     # admission ledger beside it, not from whichever profile asked first.
     base = {"capture_only": False, "hindsight_url": "http://127.0.0.1:8080/v1",
-            "owner_principal": "owner", "home": Path(tempfile.mkdtemp(prefix="hm-"))}
+            "owner_principal": "owner", "bank_id": "hermes",
+            "home": Path(tempfile.mkdtemp(prefix="hm-"))}
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -400,6 +401,43 @@ def test_capture_only_disables_formation_rather_than_calling_it_broken(store):
     report = StatusReporter(store, settings=settings(capture_only=True)).observations()
     assert report.state == DISABLED
     assert report.evidence["reason"] == "capture-only"
+
+
+def test_records_the_backend_has_never_been_asked_about_are_said_not_gone(store):
+    """An empty queue is not an empty debt, and this is the reading that has to know.
+
+    Formation waits on a plan somebody reviewed, so nothing will ever queue these by itself;
+    a stage that only counts confirmed assertions calls that machine idle.
+    """
+    recorded(store)
+    recorded(store, source_id="r-2")
+    report = StatusReporter(store, settings=settings()).observations()
+
+    assert report.evidence["unprojected"] == 2
+    assert report.state == CONFIGURED
+    assert "2 live record(s) have no backend projection" in report.detail
+    assert "hermes-memory form" in report.detail
+
+
+def test_a_record_the_backend_has_answered_for_is_not_still_owed(store):
+    record = recorded(store)
+    revision = store.db.execute("SELECT revision FROM records WHERE id=?",
+                                (record,)).fetchone()[0]
+    insert(store, "backend_documents", record_id=record, revision=revision,
+           backend="hindsight", bank_id="hermes", document_id="doc-1",
+           desired_epoch=store.epoch(), state="verified")
+
+    report = StatusReporter(store, settings=settings()).observations()
+    assert report.evidence["unprojected"] == 0
+    assert "no backend projection" not in report.detail
+
+
+def test_a_debt_is_not_invented_for_an_installation_with_no_backend(store):
+    """No endpoint means nothing is owed to a backend, so the count says nothing at all."""
+    recorded(store)
+    report = StatusReporter(store, settings=settings(hindsight_url="")).observations()
+    assert report.evidence["unprojected"] is None
+    assert "no backend projection" not in report.detail
 
 
 def test_a_quarantined_job_is_a_stuck_queue_not_a_busy_one(store):

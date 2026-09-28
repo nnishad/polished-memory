@@ -356,6 +356,23 @@ def test_a_spool_the_host_filled_and_nobody_opened_names_the_door_that_drains_it
     assert finding.evidence["spool"]["pending"] == 1
 
 
+def test_records_nobody_has_offered_to_formation_are_warned_with_the_door_that_prices_them(
+        installed):
+    """The queue is empty, and that is the finding.
+
+    Nothing may form a record without a plan somebody read, so an installation can stay
+    captured-but-unformed forever while every queue reading says there is no work waiting.
+    """
+    store, settings = installed
+    evidence(store, "Weight is 77.1kg")
+
+    finding = Doctor(store, settings=settings, backend=Tripwire()).queue()
+    assert finding.severity == WARN
+    assert "1 live record(s) have no backend projection" in finding.detail
+    assert "hermes-memory form" in finding.remedy
+    assert finding.evidence["unprojected"] == 1
+
+
 def test_a_quarantined_job_names_the_work_that_will_not_retry_itself(store):
     _job(store, state="quarantined")
     finding = Doctor(store).queue()
