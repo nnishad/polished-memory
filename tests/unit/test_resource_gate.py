@@ -47,6 +47,43 @@ def test_a_second_caller_cannot_take_an_occupied_resource(gate):
     assert gate.blocked_resources() == [REMOTE]
 
 
+# -- what a route actually answered ------------------------------------------
+
+def test_the_newest_settled_answer_is_kept_per_route(gate, clock):
+    """The ledger is the record of what came back, and only the newest one answers now."""
+    first = take(gate, resource=REMOTE, route="retain")
+    gate.release(first, outcome="succeeded")
+    clock.advance(10)
+    earlier = take(gate, resource=LOCAL, route="reflect")
+    gate.release(earlier, outcome="succeeded")
+    clock.advance(10)
+    latest = take(gate, resource=REMOTE, route="reflect")
+    gate.release(latest, outcome="failed")
+
+    outcomes = gate.last_outcomes()
+    assert sorted(outcomes) == ["reflect", "retain"]
+    assert outcomes["reflect"]["outcome"] == "failed", "the newest dispatch is the answer"
+    assert outcomes["reflect"]["state"] == "released"
+    assert outcomes["reflect"]["resource"] == REMOTE
+    assert outcomes["reflect"]["settled_at"] == 1_020.0
+    assert outcomes["retain"]["outcome"] == "succeeded"
+
+
+def test_a_dispatch_that_has_not_settled_is_not_an_answer(gate):
+    """A held slot has produced no outcome, so the route is not claimed to be working."""
+    take(gate, resource=REMOTE, route="retain")
+    assert gate.last_outcomes() == {}
+
+
+def test_an_answer_nobody_established_is_reported_as_the_open_question_it_is(gate):
+    """An unresolved reservation keeps the device blocked; its reason is the route's news."""
+    held = take(gate, resource=REMOTE, route="reflect")
+    gate.mark_uncertain(held, reason="the connection went away mid-request")
+    outcome = gate.last_outcomes()["reflect"]
+    assert outcome["state"] == "uncertain"
+    assert outcome["outcome"] == "the connection went away mid-request"
+
+
 def test_the_single_slot_rule_is_enforced_by_the_schema_not_by_a_check(gate):
     """The partial unique index must refuse a second holder even if code is wrong."""
     take(gate)

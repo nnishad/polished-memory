@@ -105,7 +105,8 @@ class Doctor:
         """
         checks = [self.layout, self.database, self.schema, self.configuration,
                   self.coverage, self.queue, self.background, self.provenance, self.lineage,
-                  self.erasure, self.delivery, self.gate, self.credentials_in_records,
+                  self.erasure, self.delivery, self.gate, self.inference_outcomes,
+                  self.credentials_in_records,
                   self.leases, self.backend_ledger, self.release]
         with snapshot(self.db):
             findings = [check() for check in checks]
@@ -502,6 +503,43 @@ class Doctor:
                         "superseded_epoch": report.evidence.get("superseded_epoch"),
                         "state": report.state})
 
+    def route_outcomes(self) -> dict[str, dict[str, Any]]:
+        """What the admission ledger says came back, per route. Empty without a gate."""
+        gate = getattr(self.status, "gate", None)
+        return gate.last_outcomes() if gate is not None else {}
+
+    def inference_outcomes(self) -> Finding:
+        """The newest settled dispatch on each route, and whether it succeeded.
+
+        A capability census can only say that a route is served. This is the installation's
+        own evidence of what a route did when it was asked for work, and a route that keeps
+        failing is a different finding from a route that was never routed — they have
+        different remedies, and only one of them is a model decision.
+        """
+        outcomes = self.route_outcomes()
+        if not outcomes:
+            return Finding("inference", OK,
+                           "no dispatch has settled, so no route has been observed answering",
+                           evidence={"observed": {}})
+        observed = {name: {"outcome": str(row["outcome"]), "resource": row["resource"],
+                           "state": row["state"], "settled_at": row["settled_at"]}
+                    for name, row in sorted(outcomes.items())}
+        stalled = sorted(name for name, item in observed.items()
+                         if item["outcome"] != "succeeded")
+        detail = ", ".join(f"{name} last answered {item['outcome']}"
+                           for name, item in observed.items())
+        if stalled:
+            return Finding("inference", WARN,
+                           f"{len(stalled)} route(s) did not answer their newest dispatch with "
+                           f"a success: {detail}",
+                           "a served route is not a working one: the model configured for it "
+                           "is the part that answers, so check what runs that route before "
+                           "enabling a stage that needs its answer",
+                           {"stalled": stalled, "observed": observed})
+        return Finding("inference", OK,
+                       f"every route answered its newest dispatch: {detail}",
+                       evidence={"observed": observed})
+
     def backend_connectivity(self) -> Finding:
         """An explicit request: is anything answering. Never run by default."""
         client = self.client()
@@ -530,18 +568,39 @@ class Doctor:
                            {"reported_version": report.get("version"),
                             "error": str(error)[:300]})
         missing = list(observed["unsupported"]) + list(observed["mismatches"])
-        return Finding("backend-connectivity", OK if not missing else WARN,
-                       "the backend answered" + ("" if not missing else
-                                                 f", with {len(missing)} pinned "
-                                                 f"capability/capabilities it does not route"),
-                       None if not missing else
-                       "the pinned version and the running build disagree; check the "
-                       "backend's tag before enabling a stage that needs the missing route",
+        supported = set(observed["supported"])
+        # "supported" is a claim about the routes a backend serves. Read alone it promises a
+        # working answer, and this installation's own admission ledger has already seen ones
+        # that do not work, so the two are reported together or the report contradicts the
+        # `inference` check in the same document.
+        outcomes = {name: str(row["outcome"]) for name, row in self.route_outcomes().items()
+                    if name in supported}
+        stalled = sorted(name for name, outcome in outcomes.items() if outcome != "succeeded")
+        detail = "the backend answered"
+        if missing:
+            detail += f", with {len(missing)} pinned capability/capabilities it does not route"
+        if stalled:
+            detail += (", and " + ", ".join(f"{name} last answered {outcomes[name]}"
+                                           for name in stalled)
+                       + " on its newest dispatch")
+        remedy = None
+        if missing:
+            remedy = ("the pinned version and the running build disagree; check the "
+                      "backend's tag before enabling a stage that needs the missing route")
+        if stalled:
+            remedy = ((remedy + "; ") if remedy else "") + (
+                "a served route is not a working one: the model behind it answers the "
+                "dispatch, so look at what runs that route before enabling a stage that "
+                "depends on its answer")
+        return Finding("backend-connectivity", WARN if (missing or stalled) else OK,
+                       detail, remedy,
                        {"reported_version": report.get("version"),
                         "observed_via": observed["observed_via"],
                         "pinned_to": observed["pinned_to"],
-                        "supported": sorted(observed["supported"]),
+                        "supported": sorted(supported),
                         "not_routed": missing,
+                        "last_observed": outcomes,
+                        "observed_failing": stalled,
                         "observed_at": now()})
 
     def backend_synthetic_round_trip(self, *, reads: int = PROBE_SETTLE_READS,

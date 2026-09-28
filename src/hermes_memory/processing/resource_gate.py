@@ -408,6 +408,23 @@ class ResourceGate:
             "FROM gate_reservations WHERE state=? ORDER BY acquired_at", (UNCERTAIN,)).fetchall()
         return [dict(row) for row in rows]
 
+    def last_outcomes(self) -> dict[str, dict[str, Any]]:
+        """The newest settled answer on each route, as this installation got it.
+
+        A pin says which routes the backend serves; this says what came back when one was
+        asked for work. The two are different claims and they disagree: a route can be
+        routed and still be answered by a model that cannot do the thing it was asked to
+        do, which is exactly the gap between "supported" and "usable here".
+        """
+        rows = self.db.execute(
+            "SELECT route, resource, state, outcome, "
+            "coalesce(released_at, acquired_at) AS settled_at FROM gate_reservations "
+            "WHERE outcome IS NOT NULL ORDER BY settled_at DESC, id")
+        newest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            newest.setdefault(row["route"], dict(row))
+        return newest
+
     def unresolved_for(self, resource: str) -> bool:
         """Whether this device is blocked by a request nobody can answer for.
 

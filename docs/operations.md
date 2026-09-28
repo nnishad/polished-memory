@@ -189,6 +189,15 @@ the daily budget: the token count of a request nobody saw the end of is not a nu
 adding to a total. The ledger keeps both records — the holder that could not answer, and
 the operator who answered for it, with the name given.
 
+The same ledger answers a second question, which is the one an operator actually asks after a
+failed run: not *can* a route be reached but *did* it work. `doctor` reads `inference` from the
+newest settled dispatch per route — `reflect last answered failed`, `retain last answered
+succeeded` — and it counts a reservation nobody has settled as an answer that has not come in.
+`backend-connectivity` now pairs its census with those observations, because the two claims are
+not the same claim: the pin and the served routes say that `reflect` exists, while the model
+behind it decides whether the reflection is usable here. A route the backend serves and that
+keeps failing is a warning with a model decision as its remedy, not a green capability list.
+
 ## Working the archive
 
 ```sh

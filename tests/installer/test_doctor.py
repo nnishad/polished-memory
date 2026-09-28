@@ -167,8 +167,8 @@ def test_a_bare_store_is_described_rather_than_condemned(store):
     report = Doctor(store, backend=tripwire).examine()
     assert [item["check"] for item in report["findings"]] == [
         "layout", "database", "schema", "configuration", "coverage", "queue",
-        "background", "provenance", "lineage", "erasure", "delivery", "gate", "credentials",
-        "leases", "backend", "release"]
+        "background", "provenance", "lineage", "erasure", "delivery", "gate", "inference",
+        "credentials", "leases", "backend", "release"]
     assert report["probes"] == {"connectivity": False, "synthetic": False}
     assert tripwire.reached == []
 
@@ -600,6 +600,92 @@ def test_a_lease_that_is_current_is_not_reported(store, sync):
     finding = Doctor(store).leases()
     assert finding.severity == OK
     sync.release(fence)
+
+
+# -- what the routes actually answered ---------------------------------------
+
+def dispatched(store, *, moment, answers):
+    """Settle real dispatches through the admission ledger, as a running worker would."""
+    from hermes_memory.operations.status import StatusReporter
+    from hermes_memory.processing.resource_gate import ResourceGate
+
+    clock = {"now": moment}
+    gate = ResourceGate(store, clock=lambda: clock["now"])
+    for index, (route, outcome) in enumerate(answers.items()):
+        clock["now"] = moment + index
+        reservation = gate.try_acquire(route=route, holder="worker-1", priority=3,
+                                       resource="remote-9b")
+        assert reservation is not None
+        if outcome is None:
+            gate.mark_uncertain(reservation, reason="nobody has established the end")
+        else:
+            gate.release(reservation, outcome=outcome)
+    return Doctor(store, status=StatusReporter(store, settings=None, gate=gate))
+
+
+def test_a_route_that_answered_every_dispatch_is_not_a_finding(store):
+    doctor = dispatched(store, moment=1_000.0, answers={"retain": "succeeded",
+                                                        "reflect": "succeeded"})
+    finding = doctor.inference_outcomes()
+    assert finding.severity == OK
+    assert "retain last answered succeeded" in finding.detail
+    assert finding.evidence["observed"]["reflect"]["outcome"] == "succeeded"
+
+
+def test_a_reflection_that_failed_last_is_named_because_the_ledger_kept_it(store):
+    """A pinned capability is not a working route; the failed dispatch is the evidence."""
+    doctor = dispatched(store, moment=1_000.0, answers={"retain": "succeeded",
+                                                        "reflect": "failed"})
+    finding = doctor.inference_outcomes()
+    assert finding.severity == WARN
+    assert finding.evidence["stalled"] == ["reflect"]
+    assert "reflect last answered failed" in finding.detail
+    assert "a served route is not a working one" in finding.remedy
+
+
+def test_a_route_nobody_has_dispatched_says_so_instead_of_passing_as_healthy(store):
+    finding = Doctor(store).inference_outcomes()
+    assert finding.severity == OK
+    assert finding.evidence["observed"] == {}
+    assert "no dispatch has settled" in finding.detail
+
+
+def test_an_unsettled_dispatch_is_not_counted_as_an_answer(store):
+    doctor = dispatched(store, moment=1_000.0, answers={"retain": None})
+    finding = doctor.inference_outcomes()
+    assert finding.severity == WARN
+    assert finding.evidence["stalled"] == ["retain"]
+    assert finding.evidence["observed"]["retain"]["state"] == "uncertain"
+
+
+def test_supported_is_read_together_with_the_answer_it_produced(store):
+    """`supported` must not be the whole story: pair the census with the observed dispatch."""
+    from hermes_memory.backend.capabilities import CAPABILITIES, PINNED_VERSION, capabilities_for
+    from hermes_memory.operations.status import StatusReporter
+    from hermes_memory.processing.resource_gate import ResourceGate
+
+    routed = {cap.name for cap in CAPABILITIES}
+    clock = {"now": 1_000.0}
+    gate = ResourceGate(store, clock=lambda: clock["now"])
+    reservation = gate.try_acquire(route="reflect", holder="worker-1", priority=3,
+                                   resource="remote-9b")
+    gate.release(reservation, outcome="failed")
+
+    class Census:
+        def health(self):
+            return {"version": PINNED_VERSION}
+
+        def negotiate(self, *, probe_routes=True):
+            return capabilities_for(PINNED_VERSION, route_names=routed)
+
+    finding = Doctor(store, backend=lambda: Census(),
+                     status=StatusReporter(store, settings=None, gate=gate)
+                     ).backend_connectivity()
+    assert finding.evidence["not_routed"] == [], "the backend does route it"
+    assert finding.severity == WARN, "and it still did not work"
+    assert finding.evidence["last_observed"] == {"reflect": "failed"}
+    assert finding.evidence["observed_failing"] == ["reflect"]
+    assert "reflect last answered failed" in finding.detail
 
 
 # -- probes ------------------------------------------------------------------
