@@ -408,25 +408,50 @@ def test_a_mental_model_needs_the_owner_and_says_which_one(installation):
                         client=Reflects())
 
 
-def test_an_unconfirmed_reflection_leaves_the_slot_quarantined(installation):
-    """We cannot claim the backend did not run this, so the device stays held."""
+def test_an_unconfirmed_reflection_leaves_the_backend_to_answer_for_the_device(installation):
+    """The outer request never runs on the device, so it has no slot to quarantine.
+
+    The backend's own admissions hold it, and they mark themselves uncertain when the
+    transport goes away — which is the honest place for that record, because that is the
+    request whose completion is genuinely unknown.
+    """
     approve(installation, Answers(HindsightUnavailable("connection reset mid-request")),
             scope="project:survey")
     with instance_gate(installation) as gate:
-        states = [row["state"] for row in gate.db.execute(
-            "SELECT state FROM gate_reservations")]
-    assert "uncertain" in states, "freeing the slot would let a request overlap one that " \
-        "may still be running"
-    assert "held" not in states
+        rows = gate.db.execute("SELECT state, route FROM gate_reservations").fetchall()
+    assert [dict(row) for row in rows] == [], \
+        "a reflection that took no slot must leave no quarantine of its own"
 
 
-def test_the_gate_holds_the_slot_for_the_one_request_and_no_longer(installation):
+def test_a_reflection_never_holds_the_slot_the_backend_asks_for_itself(installation):
+    """A reflect claim starves the very calls that would answer it: the gate said 429.
+
+    The device is charged for what the answer reports, which is what the day's budget needs;
+    holding a slot for a request that only carries a question is the self-inflicted deadlock.
+    """
     approve(installation, Reflects(), scope="project:survey")
     with instance_gate(installation) as gate:
-        states = [row["state"] for row in gate.db.execute(
-            "SELECT state FROM gate_reservations")]
-        assert not gate.held() and "uncertain" not in states, \
-            "the reflection released what it took"
+        rows = gate.db.execute("SELECT 1 FROM gate_reservations").fetchall()
+        usage = gate.usage()
+    assert rows == [], "the reflection admitted nothing it did not need"
+    assert usage, "what the reflection spent is still charged to the device"
+    assert sum(int(item["tokens"]) for item in usage.values()) > 0
+
+
+def test_a_paused_device_still_refuses_a_reflection_that_would_queue_behind_it(installation):
+    """A blocked device is refused by name, with the door that frees it."""
+    plan = summarize_plan(installation, scope="project:survey")
+    client = Reflects()
+    with instance_gate(installation) as gate:
+        held = gate.try_acquire(route="retain", holder="somebody-else",
+                               resource=plan["resource"], priority=0, ttl=120.0)
+        gate.mark_uncertain(held, reason="test: the connection went away mid-request")
+        outcome = summarize_apply(installation, scope="project:survey",
+                                  review=plan["review_digest"], actor=OWNER, client=client)
+    assert outcome["ok"] is False
+    assert "blocked by a request nobody has answered for" in outcome["refused"]
+    assert "--resolve" in outcome["refused"], "the refusal names the door that frees it"
+    assert client.calls == [], "a blocked device is not worth a request into it"
 
 
 # -- the invalidator ----------------------------------------------------------
@@ -616,11 +641,17 @@ def test_a_paused_gate_refuses_the_reflection_instead_of_ignoring_the_pause(inst
     assert client.calls == [], "a paused stage is not a suggestion"
 
 
-def test_an_occupied_device_refuses_rather_than_standing_in_the_queue(installation):
+def test_a_device_busy_with_somebody_else_still_gets_the_question(installation):
+    """Occupation is no reason to refuse: the outer request carries a question, not work.
+
+    Refusing on occupation was the deadlock wearing the costume of caution — the one caller
+    that could free the device is the reflection being refused, and the backend queues its
+    own tool calls on that slot regardless of anything this process holds.
+    """
     plan = summarize_plan(installation, scope="project:survey")
     client = Reflects()
     with instance_gate(installation) as holder:
-        reservation = holder.try_acquire(route="reflect", holder="somebody-else",
+        reservation = holder.try_acquire(route="retain", holder="somebody-else",
                                         resource=plan["resource"], priority=0, ttl=120.0)
         assert reservation is not None, "the fixture must actually occupy the slot"
         try:
@@ -628,8 +659,8 @@ def test_an_occupied_device_refuses_rather_than_standing_in_the_queue(installati
                                       review=plan["review_digest"], actor=OWNER, client=client)
         finally:
             holder.release(reservation, outcome="succeeded", tokens=0, seconds=0.1)
-    assert outcome["ok"] is False and "occupied" in outcome["refused"]
-    assert client.calls == []
+    assert outcome["ok"] is True, outcome.get("refused")
+    assert client.calls, "the question was asked despite the busy device"
 
 
 def _window_end(store):

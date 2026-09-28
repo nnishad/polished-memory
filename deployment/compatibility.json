@@ -1,5 +1,5 @@
 {
-  "framework_digest": "cb985d935afde1c99135315a3e4f0c443175dcd94821a5d3a17ddf207cbe1172",
+  "framework_digest": "556794723dc73657b78079ca6820e3d8062146e9f75f700841a7563c3ad8e407",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",

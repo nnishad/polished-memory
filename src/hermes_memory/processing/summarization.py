@@ -298,8 +298,7 @@ def summarize_apply(settings, *, scope: str, kind: str | None = None, review: st
             budgets = Budgets(gate.store, daily={route.resource: Budget(
                 tokens=proposal["token_budget"])}, scope=BUDGET_SCOPE)
             habits = SummaryStore(store, owner_principal=settings.owner_principal)
-            outcome, failure = _reflect(gate, route, proposal, budgets=budgets,
-                                        holder=holder, actor=actor)
+            outcome, failure = _reflect(gate, route, proposal, budgets=budgets, holder=holder)
             if failure:
                 # The promise stays in the ledger as a failed refresh rather than
                 # vanishing: the reason it did not happen is the thing an operator
@@ -369,12 +368,14 @@ def client_for(settings) -> Any:
 
 # -- internals ---------------------------------------------------------------
 
-def _reflect(gate, route, proposal, *, budgets, holder, actor: str) -> tuple[dict[str, Any], str]:
-    """One bounded reflection, with the instance slot held and always given back.
+def _reflect(gate, route, proposal, *, budgets, holder) -> tuple[dict[str, Any], str]:
+    """One bounded reflection, asked without claiming the device it is answered on.
 
-    Contention, a pause and an unaffordable budget are reported as refusals rather than
-    attempted anyway: the physical device is shared, and a request that goes out while
-    the operator has paused inference is not a small procedural slip.
+    A pause and an unaffordable budget are refusals rather than something to attempt anyway,
+    and so is a device blocked by a request nobody has answered for: the physical device is
+    shared, and a request that goes out while the operator has paused inference is not a
+    small procedural slip. Occupation by a *live* request is not a refusal — see the note
+    below on why the outer claim was the deadlock.
     """
     import time
 
@@ -387,29 +388,30 @@ def _reflect(gate, route, proposal, *, budgets, holder, actor: str) -> tuple[dic
         budgets.admit(route.resource, estimated_tokens=proposal["per_call_tokens"])
     except BudgetExhausted as error:
         return {}, str(error)
-    reservation = gate.try_acquire(route=route.name, holder=actor.strip()[:120],
-                                   resource=route.resource, priority=route.priority_rank(),
-                                   ttl=max(60.0, gate.default_ttl))
-    if reservation is None:
-        return {}, f"{route.resource} is occupied; nothing was sent"
+    if gate.unresolved_for(route.resource):
+        return {}, (f"{route.resource} is blocked by a request nobody has answered for, and "
+                    "waiting would not free it — `hermes-memory gate --resolve` settles it")
+    # No device reservation is taken here, and that is the whole point. The reflection is
+    # produced by the backend, which asks this same gate for this same device once per tool
+    # call; the outer request only carries a question. Claiming the single slot across a run
+    # that needs admission on it is not caution but a self-inflicted deadlock — the live
+    # machine answered its own nested calls with HTTP 429 "blocked by a request whose
+    # outcome nobody has established", which is how a stage comes to look permanently broken.
     started = time.monotonic()
     outcome: dict[str, Any] = {}
-    tokens, uncertain, failure = 0, False, ""
+    tokens, failure = 0, ""
     try:
         outcome = holder.reflect(_question(proposal),
                                  max_tokens=int(route.max_output_tokens), budget="low")
         tokens = _used(outcome)
     except HindsightUnavailable as error:
-        # The backend may have run it; the slot is quarantined, not freed.
-        uncertain, failure = True, str(error)
+        # The backend's own admissions say whether the device is free; nothing here holds it.
+        failure = str(error)
     except (HindsightError, SummarizeError) as error:
         failure = str(error)
-    finally:
-        if uncertain:
-            gate.mark_uncertain(reservation, reason=failure[:400])
-        else:
-            gate.release(reservation, outcome="succeeded" if outcome else "failed",
-                         tokens=tokens, seconds=time.monotonic() - started)
+    if tokens:
+        gate.charge(route.resource, tokens=tokens, seconds=time.monotonic() - started,
+                    note=f"reflect {proposal['scope']}")
     return outcome, failure
 
 

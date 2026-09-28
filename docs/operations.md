@@ -461,11 +461,18 @@ principal may write one.
 
 A reflection is a generation rather than a lookup, so the backend call is given a
 generation's deadline: answering after a lookup's would be reported as an unconfirmed
-submission, which quarantines the device slot over a call that was merely slow. And
-whatever the reason — a timeout, a paused gate, a busy device, an exhausted budget, a
-backend that answers HTTP 500 because the configured model will not make the tool call
-`reflect` needs — a summary that was approved and did not happen exits non-zero with the
-reason in its body. The code is for the timer that ran it; the JSON is for the person.
+submission, which quarantines the device slot over a call that was merely slow. A
+reflection takes no slot of its own, and that is deliberate: the answer is produced by the
+backend, which asks this installation's own gate for the same device once per tool call, so
+a claim held across the run starves exactly the calls that would answer it — the live
+machine reported the result as HTTP 429 from its own gate, while the model behind it had
+answered a tool call in 0.6s when asked directly. What the reflection does keep is the
+accounting: the tokens the answer reports are charged to the device. So a pause, an
+unaffordable budget and a device blocked by a request nobody has answered for are refusals,
+while a device merely busy with somebody else's live work is not. A summary that was
+approved and did not happen exits non-zero with the reason in its body, whether that reason
+is a timeout, a pause, a blocked device or an exhausted budget. The code is for the timer
+that ran it; the JSON is for the person.
 
 **Reading them** happens in every context packet. The broker takes the scopes the
 authorized evidence already belongs to and quotes the current reading of each — labelled
