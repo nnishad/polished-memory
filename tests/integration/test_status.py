@@ -414,9 +414,36 @@ def test_records_the_backend_has_never_been_asked_about_are_said_not_gone(store)
     report = StatusReporter(store, settings=settings()).observations()
 
     assert report.evidence["unprojected"] == 2
+    assert report.evidence["formation_owed"] is True
     assert report.state == CONFIGURED
     assert "2 live record(s) have no backend projection" in report.detail
     assert "hermes-memory form" in report.detail
+
+
+def test_formation_that_is_actually_running_is_not_called_a_debt(store):
+    """The same records with a lease on them are work in progress, not work unwed.
+
+    Without this half the reading would cry wolf at every pass that is mid-flight: the debt is
+    owed only while nothing is being formed and nothing is waiting.
+    """
+    recorded(store)
+    a_job(store, state="leased")
+    report = StatusReporter(store, settings=settings()).observations()
+
+    assert report.evidence["unprojected"] == 1
+    assert report.evidence["formation_owed"] is False
+    assert report.state == OPERATIONAL
+
+
+def test_a_finished_queue_leaves_the_unformed_records_owed(store):
+    """Five succeeded jobs say the queue was worked, not that everything was offered."""
+    recorded(store)
+    a_job(store, state="succeeded")
+    report = StatusReporter(store, settings=settings()).observations()
+
+    assert report.evidence["queue"] == {"succeeded": 1}
+    assert report.evidence["formation_owed"] is True
+    assert report.state == CONFIGURED
 
 
 def test_a_record_the_backend_has_answered_for_is_not_still_owed(store):

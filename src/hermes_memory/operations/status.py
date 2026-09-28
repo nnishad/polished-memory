@@ -310,6 +310,9 @@ class StatusReporter:
             "observations", state, detail,
             {"assertions": dict(counts), "queue": dict(queue), "stuck": stuck,
              "unprojected": unprojected,
+             # Asked of the queue as it stands, not as a row count: five finished jobs are a
+             # busy-looking queue and an unformable record is still unformed.
+             "formation_owed": bool(unprojected) and not waiting and not running,
              "paused_sources": sorted(paused), "instance_hold": held,
              "instance_hold_by": (hold or {}).get("actor"),
              "instance_hold_reason": (hold or {}).get("reason"),

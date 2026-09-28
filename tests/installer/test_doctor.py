@@ -18,7 +18,7 @@ import pytest
 
 from hermes_memory.backend.hindsight_client import HindsightError
 from hermes_memory.config import load_settings
-from hermes_memory.ids import document_id_is_ambiguous
+from hermes_memory.ids import document_id_is_ambiguous, now
 from hermes_memory.operations.doctor import (FAIL, OK, PROBE_DOCUMENT_ID, PROBE_QUERY,
                                             PROBE_SETTLE_READS, PROBE_SETTLE_WAIT_S,
                                             PROBE_TEXT, WARN, Doctor, Finding)
@@ -358,19 +358,30 @@ def test_a_spool_the_host_filled_and_nobody_opened_names_the_door_that_drains_it
 
 def test_records_nobody_has_offered_to_formation_are_warned_with_the_door_that_prices_them(
         installed):
-    """The queue is empty, and that is the finding.
+    """The queue is empty of live work, and that is the finding.
 
     Nothing may form a record without a plan somebody read, so an installation can stay
-    captured-but-unformed forever while every queue reading says there is no work waiting.
+    captured-but-unformed forever while a queue of finished jobs looks worked off — which is
+    what the live installation showed, and why this branch cannot key on an empty queue.
     """
     store, settings = installed
     evidence(store, "Weight is 77.1kg")
+    _job(store, state="succeeded")
 
     finding = Doctor(store, settings=settings, backend=Tripwire()).queue()
     assert finding.severity == WARN
     assert "1 live record(s) have no backend projection" in finding.detail
     assert "hermes-memory form" in finding.remedy
     assert finding.evidence["unprojected"] == 1
+
+
+def test_formation_in_flight_is_not_reported_as_a_debt_the_owner_owes(installed):
+    """The same records, with somebody's lease on them, are work rather than an omission."""
+    store, settings = installed
+    evidence(store, "Weight is 77.1kg")
+    _job(store, state="leased", created_at=now())
+
+    assert Doctor(store, settings=settings, backend=Tripwire()).queue().severity == OK
 
 
 def test_a_quarantined_job_names_the_work_that_will_not_retry_itself(store):

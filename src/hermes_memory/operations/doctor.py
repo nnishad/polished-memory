@@ -267,11 +267,11 @@ class Doctor:
                            # that word for the opposite claim, and two meanings in one key is
                            # how a reader ends up certain of the wrong thing.
                            {"queue": counts, "age": age, "operator_needed": True})
-        unprojected = observations.evidence.get("unprojected")
-        if unprojected and not counts:
-            # The queue is empty and that is exactly the finding: formation is an approved act,
-            # so nothing queues itself, and records can sit captured and unasked forever while
-            # every queue reading says there is no work.
+        if observations.evidence.get("formation_owed"):
+            unprojected = observations.evidence.get("unprojected")
+            # The queue holds no live work, and that is exactly the finding: formation is an
+            # approved act, so nothing queues itself, and records can sit captured and unasked
+            # forever while a queue of finished jobs looks worked off.
             return Finding("queue", WARN,
                            f"{unprojected} live record(s) have no backend projection and "
                            "nothing is queued to form them",
