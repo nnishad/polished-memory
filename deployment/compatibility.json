@@ -1,5 +1,5 @@
 {
-  "framework_digest": "d2904740ea8a0af1fe729351cfb9f5d5529f0b9330b9286c24be6b7c6a1a5efc",
+  "framework_digest": "b054a296e63010c8bff93decddc7dad36b6d117b37154a427951bfbe0cce1007",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",
@@ -128,10 +128,11 @@
   "plugin": {
     "checkpoint_api_version": 2,
     "files": {
-      "__init__.py": "8931936a44bad9848d154532b2b1ac868d6a0c3c27a953f4bbe69d3fef2488ba",
+      "__init__.py": "f0a4ef9ed9ee5b157dd39ff837365026ff0418b8dbb82283b91daa4e85aabf90",
       "client.py": "c37f5472fe01d7fe1f4bb0fea46c4566865cb2e937dbef8ddc3c237ac6ace9ab",
       "delivery.py": "0fa5477cca13be8760af4f7ce49738ae96e62a3a5853b1293a91df8d4db2e235",
-      "provider.py": "31943778abb3144ed84235e5eec8ba10d55f3406419625c641f699ba584325a3",
+      "provider.py": "c0b32526ce81abe18067553091b20210b6e03e0db4e3d349cc1be002ea7cef2b",
+      "runtime.py": "84ed13bb3a80680a41c931913a2cfad7daee1f81a8721c92b96ef4695d7a5ab2",
       "setup.py": "cff5daa30cc556beb239fd94230e54f47636d7920930faca10eee4017a098454",
       "spool.py": "121ec110eb8bb0fff0710ca1fbac088815d1429c6c09ffa158a5458591c48abf"
     },

@@ -6,7 +6,15 @@ name must stay within the loader's first-8192-byte scan window of this file.
 """
 from __future__ import annotations
 
-from .provider import PROVIDER_NAME, HermesMemoryProvider, post_setup, write_env_file
+from .runtime import adopt
+
+# Before anything below imports `hermes_memory`: the copy the host must run is the one the
+# installation's release pointer names, not whichever copy the host's environment happens to
+# hold. Import order here is the whole mechanism, so it is written out.
+RUNTIME = adopt()
+
+from .provider import (PROVIDER_NAME, HermesMemoryProvider, post_setup,  # noqa: E402
+                       write_env_file)
 
 
 def register(ctx) -> None:

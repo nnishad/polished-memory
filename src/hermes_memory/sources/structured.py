@@ -197,13 +197,14 @@ class StructuredSource(SourceAdapter):
                                 moments=[item["occurred_at"] for item in samples])
             placed = [item["occurred_at"] for item in samples if item["occurred_at"]]
             unplaced = len(samples) - len(placed)
+            named = f" in {unit}" if unit else ""
+            middle = f", median {summary['median']}" if summary["median"] is not None else ""
+            span = (f", range {summary['min']} to {summary['max']}"
+                    if summary["min"] is not None else "")
             out.append(self.envelope(
                 source_id=f"{key}#series:{device}:{measure}:{unit}", revision="1",
                 kind="measurement_series",
-                text=f"{measure} from {device}: {summary['count']} samples"
-                     f"{f' in {unit}' if unit else ''}"
-                     f"{f', median {summary['median']}' if summary['median'] is not None else ''}"
-                     f"{f', range {summary['min']} to {summary['max']}' if summary['min'] is not None else ''}",
+                text=f"{measure} from {device}: {summary['count']} samples{named}{middle}{span}",
                 observed_at=now(),
                 occurred_at=placed[0] if placed else None,
                 occurred_precision="second" if placed else "unknown",

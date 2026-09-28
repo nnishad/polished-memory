@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -423,6 +424,39 @@ def test_the_package_claim_survives_packaging(tmp_path, monkeypatch):
     from_source = compatibility.facts(root=compatibility.REPO)["package"]
     from_installed = compatibility.facts(root=root)["package"]
     assert from_installed == from_source
+
+
+def test_every_module_parses_on_the_python_the_package_declares():
+    """``requires-python`` is a promise about somebody else's interpreter.
+
+    The host imports this framework with the Python its own environment has while a release is
+    built with a newer one, and PEP 701 lets 3.12 reuse a quote inside an f-string where 3.11
+    calls that a SyntaxError — which on a live installation is a plugin that fails to load and
+    a memory that looks absent rather than broken. ``ast.parse(feature_version=...)`` does not
+    see the difference, so the check runs on an interpreter at the floor itself.
+    """
+    declared = compatibility.facts(root=compatibility.REPO)["package"]["requires_python"]
+    floor = declared.split(">=")[-1].strip()
+    interpreter = shutil.which(f"python{floor}")
+    if interpreter is None:
+        pytest.skip(f"no python{floor} on PATH to check the declared floor with")
+    check = (
+        "import pathlib, sys\n"
+        "bad = []\n"
+        "for name in sys.argv[1:]:\n"
+        "    for path in sorted(pathlib.Path(name).rglob('*.py')):\n"
+        "        try:\n"
+        "            compile(path.read_text(encoding='utf-8'), str(path), 'exec')\n"
+        "        except SyntaxError as error:\n"
+        "            bad.append(f'{path}: line {error.lineno}: {error.msg}')\n"
+        "print('\\n'.join(bad))\n"
+        "sys.exit(1 if bad else 0)\n")
+    trees = [str(REPO_ROOT / "src" / "hermes_memory"), str(PLUGIN)]
+    done = subprocess.run([interpreter, "-c", check, *trees],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, (
+        f"python{floor} cannot read this build (it is the floor the package claims):\n"
+        + done.stdout + done.stderr)
 
 
 def test_the_framework_digest_describes_the_running_code_not_a_source_layout(tmp_path,

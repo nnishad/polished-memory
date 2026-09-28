@@ -278,3 +278,15 @@ The reading of that warning is the same one the manifest exists to support: a re
 ships no manifest of its own is not vouched for by whichever checkout happens to be on the
 disk.
 
+The host resolves the framework the same way, and that has to be said out loud because the two
+environments are different interpreters. Hermes imports the plugin with its own `sys.path`, and
+the engine is never installed into it, so the plugin loads `hermes_memory` from the release the
+installation names — `HERMES_MEMORY_RELEASE`, or `<instance home>/runtime/current` — by path,
+before anything imports it, and only that package: the framework depends on nothing outside the
+standard library, which is what makes loading it into somebody else's interpreter safe. What was
+resolved is reported rather than assumed: `memory_status` carries `runtime` with the release, the
+commit it was cut at, the file that answered and whether that file is inside the release, and a
+`warning` naming the copy in every case where the release could not be adopted. A copy already
+loaded in that process is left in place and reported — running the host's own copy is worse than
+two module trees of one name in one interpreter, but it is not something to discover later.
+

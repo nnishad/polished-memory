@@ -60,6 +60,7 @@ except Exception:  # pragma: no cover
 
 
 from .client import BindingError, bind, unenrolled_reason
+from .runtime import report as runtime_report
 from .spool import CaptureSpool
 
 PROVIDER_NAME = "hermes-memory"
@@ -956,6 +957,10 @@ class HermesMemoryProvider(_MemoryProvider):
         capture_only = bool(settings.capture_only) if settings else True
         return {
             "provider": PROVIDER_NAME,
+            # Which copy of the framework this answer comes from, and whether it is the release
+            # the installation points at. An operator asking why memory behaves like an older
+            # build reads this first.
+            "runtime": runtime_report(),
             "configured": settings is not None,
             # Whose memory this is, and whether the answer was looked up rather
             # than assumed. An unbound provider reports itself as such instead of

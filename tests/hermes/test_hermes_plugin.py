@@ -329,6 +329,13 @@ def test_the_identity_schema_declares_both_account_shapes(provider):
         assert "namespace" in properties[field]["description"], field
 
 
+def test_status_says_which_copy_of_the_framework_is_answering(provider):
+    """A release switch that the host does not obey is not a switch, so the host reports it."""
+    payload = json.loads(provider.handle_tool_call("memory_status", {}))
+    assert payload["runtime"]["loaded_from"], "the host is told what it runs"
+    assert "matches_release" in payload["runtime"]
+
+
 def test_a_goal_proposal_is_a_candidate_and_reminds_for_nothing(provider):
     """The tool can propose; only the owner's door makes it an obligation."""
     recorded = json.loads(provider.handle_tool_call(
