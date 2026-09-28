@@ -1968,6 +1968,23 @@ def test_measure_lists_the_series_the_import_created(home, samples):
                 ("heart_rate", "watch-a", "bpm", 2),
                 ("weight", "unattributed", "kg", 4)]
     assert "--what" in report["ask"]
+    # The hint is where an operator learns the door's shape, and `--unit` is the filter a
+    # refusal sends them to: a hint that omits one points at a door that has it.
+    assert all(flag in report["ask"] for flag in
+               ("--device", "--source", "--unit", "--since", "--until")), report["ask"]
+
+
+def test_the_reading_names_the_unit_it_averaged_in(home, samples):
+    """A census that says "kg" and a reading that says null cannot both be describing this store."""
+    run("init")
+    run("import", "--source", "structured", "--granularity", "sample", "--path", str(samples))
+    code, report = run("measure", "--what", "weight")
+    assert code == 0
+    assert report["unit"] == "kg", "the mean below is in kg and the reading will not say so"
+    assert report["units_seen"] == {"kg": 4}
+    code, heart = run("measure", "--what", "heart_rate")
+    assert heart["unit"] == "bpm", "two devices that agree on the unit read in it"
+    assert heart["units_seen"] == {"bpm": 3}
 
 
 def test_measure_answers_a_window_the_operator_chose(home, samples):

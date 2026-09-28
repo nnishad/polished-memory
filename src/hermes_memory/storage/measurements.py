@@ -210,8 +210,14 @@ class Measurements:
             report["statistics"] = None
             report["refused"] = ("the stored samples name more than one unit "
                                  f"({', '.join(repr(name) for name in conflicting)}); "
-                                 "name one with unit= and the excluded count is reported")
+                                 "name one with --unit and the excluded count is reported")
             return report
+        seen = {name for name, count in units.items() if count}
+        if unit is None and len(seen) == 1 and seen != {""}:
+            # `--list` already names the unit of every series it holds, so a reading that
+            # answered null knew less than the census about the same rows — and the mean
+            # below is in that unit whether anybody named it or not.
+            report["unit"] = next(iter(seen))
         report["statistics"] = summarise(values, moments=moments)
         report["first_at"] = min((item for item in moments), default=None)
         report["last_at"] = max((item for item in moments), default=None)

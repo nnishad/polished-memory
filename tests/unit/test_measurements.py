@@ -93,6 +93,8 @@ def test_a_series_that_changed_units_refuses_to_be_averaged(store, readings):
     assert report["unit_conflict"] == ["", "kg", "lb"] or \
         report["unit_conflict"] == ["kg", "lb"], report["unit_conflict"]
     assert "kg" in report["refused"] and "lb" in report["refused"]
+    assert "--unit" in report["refused"], \
+        "a remedy that names a library keyword is not something the door can act on"
     assert report["units_seen"] == {"kg": 2, "lb": 1}
 
 
@@ -111,6 +113,7 @@ def test_a_bare_number_series_is_still_a_series(store, readings):
     report = readings.series("weight")
     assert report["statistics"]["mean"] == 70.0
     assert report["units_seen"] == {"": 2}
+    assert report["unit"] is None, "a source that never named a unit is not given one"
 
 
 def test_the_citations_are_of_the_samples_that_were_read(store, readings):

@@ -2170,6 +2170,7 @@ def _measure_command(settings, args) -> int:
         if args.listing:
             return {"series": subject.available(),
                     "ask": "hermes-memory measure --what <measure> [--device D] "
+                           "[--source S] [--unit U] "
                            "[--since <timestamp> --until <timestamp>]"}
         if not args.what:
             raise EvidenceError("measure has to say what to read; --list names what is held")

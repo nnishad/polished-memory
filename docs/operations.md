@@ -582,9 +582,12 @@ all and were dropped by the window (`unplaced_excluded`), how many named a diffe
 and were left out (`units_seen`), and the record ids of exactly the rows that were
 averaged. A series whose stored samples disagree about units returns `statistics: null`
 and names both units — a mean across kg and lb is a number that only looks like a
-measurement. `--list` answers "what can I ask?" before anything is asked, and refuses to
-be combined with a question. Bounds have to carry a timezone: `2026-03-01` sorts below
-every timestamp of that day and would quietly drop the samples it was written to keep.
+measurement. When nobody named a unit and the samples all agree on one, the reading names
+that unit anyway, because the mean is in it whether the question asked or not; a source
+that never named a unit is not given one. `--list` answers "what can I ask?" before
+anything is asked, and refuses to be combined with a question. Bounds have to carry a
+timezone: `2026-03-01` sorts below every timestamp of that day and would quietly drop the
+samples it was written to keep.
 
 ## Whose memory is being read
 
