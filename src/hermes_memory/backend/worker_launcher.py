@@ -38,8 +38,10 @@ from ..processing.instance_gate import GateStore, gate_path
 from ..processing.routes import build_routes
 from .capabilities import PINNED_VERSION
 
-__all__ = ["LAUNCHER_VERSION", "REQUIRED_IMPORTS", "HOLD_POLL_SECONDS", "LauncherRefused",
+__all__ = ["LAUNCHER_VERSION", "REQUIRED_IMPORTS", "HOLD_POLL_SECONDS", "DB_WAIT_SECONDS",
+           "DB_POLL_SECONDS", "LauncherRefused",
            "version_contract", "slot_contract", "inference_hold", "wait_for_inference",
+           "database_not_listening",
            "bring_up", "OperationLedger", "attribute_tasks", "compose", "check", "main"]
 
 LAUNCHER_VERSION = "worker-launcher-v1"
@@ -73,6 +75,20 @@ CANCELLATION_OWED = "cancellation='requested'"
 # How often a worker that is waiting out an operator hold looks again. It spends nothing
 # while it waits, so the only cost of asking often is a wakeup.
 HOLD_POLL_SECONDS = 15.0
+
+# The engine's database belongs to the backend process, and a unit order says only that the
+# backend was started before this one, not that its database is accepting connections yet.
+# Restarting into the same refusal costs a start limit, so the wait happens here.
+DB_WAIT_SECONDS = 60.0
+DB_POLL_SECONDS = 5.0
+
+# What "not listening yet" looks like, from the shapes the pinned stack really raises:
+# asyncio's multi-address connect, a plain refusal, and a database that answers on the port
+# while it is still coming up. Anything else propagates — a wrong host or a missing table is
+# not something to retry until it looks healthy.
+_NOT_LISTENING = ("connect call failed", "connection refused", "connection failed",
+                  "network is unreachable", "no route to host",
+                  "the database system is starting up")
 
 # The hold is one row in the admission ledger, for the whole machine.
 INFERENCE_STAGE = ("global", "inference")
@@ -136,6 +152,8 @@ async def wait_for_inference(store, *, sleep: Callable[[float], Any],
 async def bring_up(build: Callable[[], Mapping[str, Any]], store, *,
                    sleep: Callable[[float], Any],
                    poll_s: float = HOLD_POLL_SECONDS,
+                   db_wait_s: float = DB_WAIT_SECONDS,
+                   db_poll_s: float = DB_POLL_SECONDS,
                    announce: Callable[[dict], Any] = _announce) -> dict[str, Any]:
     """Build and initialize the engine, but never against a hold and never fatally because of one.
 
@@ -146,33 +164,58 @@ async def bring_up(build: Callable[[], Mapping[str, Any]], store, *,
     whatever its failing task managed to open, and asking it to initialize twice is not a
     thing this launcher is willing to assume is safe.
 
+    A database that is not listening yet is waited out the same bounded way. It is the
+    backend's own child, and the unit order only says the backend was started first, so every
+    cold start of all three units races it; exiting over that is a journal full of failures
+    that mean nothing. The wait has an end, though: a host that never answers is a broken
+    installation, and it is reported as one.
+
     Any other startup failure propagates untouched: a real misconfiguration still exits.
     """
+    waiting_for_db = 0.0
     while True:
         await wait_for_inference(store, sleep=sleep, poll_s=poll_s, announce=announce)
         built = build()
         try:
             await built["memory"].initialize()
         except Exception as error:
-            if inference_hold(store) is None:
-                raise
-            await _discard(built["memory"], error=error, announce=announce)
-            continue
+            if inference_hold(store) is not None:
+                await _discard(built["memory"], error=error, announce=announce)
+                continue
+            if waiting_for_db < db_wait_s and database_not_listening(error):
+                await _discard(built["memory"], error=error, announce=announce,
+                               worker="database not accepting connections yet")
+                await sleep(db_poll_s)
+                waiting_for_db += db_poll_s
+                continue
+            raise
         return dict(built)
 
 
 async def _discard(memory: Any, *, error: BaseException,
-                   announce: Callable[[dict], Any]) -> None:
-    """Tear down an engine a hold stopped half-started. Its shutdown gets no veto."""
-    announcement = {"worker": "held during startup", "attempt": 1,
+                   announce: Callable[[dict], Any],
+                   worker: str = "held during startup") -> None:
+    """Tear down an engine a wait stopped half-started. Its shutdown gets no veto."""
+    announcement = {"worker": worker, "attempt": 1,
                     "error": f"{type(error).__name__}: {str(error)[:200]}",
-                    "next": "waiting for the hold to lift, then building a fresh engine"}
+                    "next": "waiting, then building a fresh engine"}
     try:
         await memory.shutdown()
     except Exception as shutdown_error:
         announcement["shutdown_error"] = (
             f"{type(shutdown_error).__name__}: {str(shutdown_error)[:200]}")
     announce(announcement)
+
+
+def database_not_listening(error: BaseException) -> bool:
+    """Is this the engine's database being up still, rather than the installation being wrong?
+
+    Matched on what the pinned stack puts in the message rather than on the exception type:
+    the same refusal arrives as ``ConnectionRefusedError`` from one address and a bare
+    ``OSError`` listing several, and neither is distinguishable from a real fault by class.
+    """
+    message = f"{type(error).__name__}: {error}".lower()
+    return any(marker in message for marker in _NOT_LISTENING)
 
 
 # -- the two contracts -------------------------------------------------------

@@ -21,8 +21,9 @@ import pytest
 from hermes_memory.backend.worker_launcher import (HOLD_POLL_SECONDS, LAUNCHER_VERSION,
                                                    OPERATION_KEY, RETRY_KEY,
                                                    LauncherRefused, OperationLedger,
-                                                   attribute_tasks, bring_up, check,
-                                                   compose, inference_hold, main,
+                                                   attribute_tasks, bring_up,
+                                                   check, compose, database_not_listening,
+                                                   inference_hold, main,
                                                    memory_arguments, poller_arguments,
                                                    slot_contract, version_contract,
                                                    wait_for_inference)
@@ -678,11 +679,92 @@ def test_a_startup_failure_that_is_not_the_hold_still_exits(ledger):
         async def initialize(self):
             raise RuntimeError("no such table: banks")
 
+    slept = []
     with pytest.raises(RuntimeError, match="no such table"):
         run(bring_up(a_build(engines, first=Broken), ledger.store,
-                     sleep=a_ticker(ledger.store, [])))
+                     sleep=a_ticker(ledger.store, slept)))
+    assert slept == [], "a broken installation is not waited out; waiting is for a race"
     assert len(engines) == 1
     assert engines[0].shutdown_called is False, "nothing was torn down behind a retry loop"
+
+
+# -- the engine's own database ------------------------------------------------
+# The database on the engine's port is the backend's child, and a unit order says only that
+# the backend was *started* first. Restarting all three units together put this exact refusal
+# in the journal three times before systemd's own restart caught up with the database, and a
+# worker that exits over a race it was never going to win is a machine that looks broken
+# every time it is booted.
+
+REFUSED = OSError("Multiple exceptions: [Errno 111] Connect call failed ('::1', 5432, 0, 0), "
+                  "[Errno 111] Connect call failed ('127.0.0.1', 5432)")
+
+
+def an_always_build(engines, cls):
+    """Like ``a_build``, except every attempt gets the same class, for a fault that persists."""
+    def build():
+        engine = an_engine(cls)
+        engines.append(engine)
+        return {"memory": engine, "poller_factory": Poller, "poller_arguments": {}}
+    return build
+
+
+def test_a_refusal_to_connect_is_told_apart_from_a_broken_installation():
+    assert database_not_listening(REFUSED)
+    assert database_not_listening(ConnectionRefusedError(111, "Connection refused"))
+    assert database_not_listening(RuntimeError("connection failed: the database system is "
+                                               "starting up"))
+    assert not database_not_listening(RuntimeError("no such table: banks"))
+    assert not database_not_listening(RuntimeError("password authentication failed for "
+                                                   "user \"hindsight\"")), (
+        "a wrong secret is not something to wait out")
+
+
+def test_a_worker_that_starts_before_its_database_waits_for_it(ledger, capsys):
+    engines = []
+    ticks = 0
+
+    class NotUpYet(Engine):
+        async def initialize(self):
+            nonlocal ticks
+            ticks += 1
+            if ticks <= 2:
+                raise REFUSED
+            self.initialized = True
+
+    def build():
+        engine = an_engine(NotUpYet)
+        engines.append(engine)
+        return {"memory": engine, "poller_factory": Poller, "poller_arguments": {}}
+
+    slept = []
+    built = run(bring_up(build, ledger.store, sleep=a_ticker(ledger.store, slept),
+                         db_wait_s=20.0, db_poll_s=5.0))
+    assert slept == [5.0, 5.0], "the wait is the launcher's own, not systemd's restart timer"
+    assert len(engines) == 3, "a fresh engine per attempt, as with a hold"
+    assert [engine.shutdown_called for engine in engines[:2]] == [True, True]
+    assert built["memory"] is engines[2] and engines[2].initialized is True
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    waits = [line for line in lines
+             if line["worker"] == "database not accepting connections yet"]
+    assert len(waits) == 2, "each failed attempt is said, not sat on"
+    assert "Connect call failed" in waits[0]["error"]
+
+
+def test_a_database_that_never_answers_is_still_a_failure(ledger):
+    """The wait has an end, because a host that never answers is a broken installation."""
+    engines = []
+
+    class NeverThere(Engine):
+        async def initialize(self):
+            raise ConnectionRefusedError(111, "Connection refused")
+
+    slept = []
+    with pytest.raises(ConnectionRefusedError):
+        run(bring_up(an_always_build(engines, NeverThere), ledger.store,
+                     sleep=a_ticker(ledger.store, slept), db_wait_s=10.0, db_poll_s=5.0))
+    assert slept == [5.0, 5.0], "two waits at this ceiling, and then the refusal is the answer"
+    assert len(engines) == 3
+    assert engines[-1].shutdown_called is False, "the last attempt is not torn down twice"
 
 
 def test_an_unclean_teardown_of_a_half_started_engine_is_said_not_swallowed(ledger, capsys):
