@@ -408,8 +408,12 @@ class IdentityStore:
                     stale.append(row["id"])
                 else:
                     needs_review.append(row["id"])
-            self.store._audit("identity_invalidate", "identity_candidates",
-                              {"stale": len(stale), "needs_review": len(needs_review)})
+            if stale or needs_review:
+                # Only a change is an event. The background pass calls this every period, and a
+                # ledger that records a sweep of nothing fills with rows that look like
+                # decisions and say none.
+                self.store._audit("identity_invalidate", "identity_candidates",
+                                  {"stale": len(stale), "needs_review": len(needs_review)})
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")

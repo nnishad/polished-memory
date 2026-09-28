@@ -83,9 +83,10 @@ refuses to move backwards through them; it never parses one.
   mailbox is a larger authorization question than a connector should answer by itself. Until
   an authorized reader exists, `hermes-memory summarize` and the context packet can say what
   an attachment *was*, never what it said.
-- **No adapter is enabled by discovery.** `hermes-memory sources --connect` and the import
-  door record a source's declared policy (`local-only`, `private-api`, `disabled`) before
-  anything is read, and nothing reads a source the owner has not named.
+- **No adapter is enabled by discovery.** `hermes-memory sources reconfigure --source …
+  --policy …` and the import door record a source's declared policy (`local-only`,
+  `private-api`, `disabled`) before anything is read, and nothing reads a source the owner has
+  not named.
 - **Deletion events are not faked.** Where a source cannot report them, an erasure
   obligation for that source is verified against the local tombstone and the derived
   backend, and the source-side limit stays visible in the erasure ledger.

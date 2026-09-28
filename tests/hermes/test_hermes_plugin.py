@@ -4,7 +4,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import sys
+import threading
 import tokenize
 
 import pytest
@@ -1301,3 +1303,135 @@ def test_the_config_schema_is_the_shape_the_host_parses():
         assert str(spec.get("type", "")).lower() in accepted, \
             f"{name} declares type {spec.get('type')!r}, which the host cannot type-check"
 
+
+
+# -- the thread the host calls the tool on -----------------------------------
+
+def recall(provider, query="the survey cadence"):
+    return json.loads(provider.handle_tool_call("memory_recall", {"query": query, "limit": 3}))
+
+
+def in_thread(provider, query="the survey cadence"):
+    """Ask for a recall on a thread of its own, the way the host's tool runner does."""
+    box: dict[str, dict] = {}
+
+    def worker():
+        box["answer"] = recall(provider, query)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(30)
+    assert not thread.is_alive(), "the recall never returned on the worker thread"
+    return box["answer"]
+
+
+def test_a_recall_on_a_host_worker_thread_gets_a_connection_it_may_use(provider):
+    """Hermes runs tool handlers on worker threads, and a SQLite connection has an owner.
+
+    The provider caches one store and one broker because the packet is reused across turns —
+    which is only sound while the same thread does the asking. Measured on a live
+    installation: every `memory_recall` raised "SQLite objects created in a thread can only be
+    used in that same thread", so the host's main read path failed non-deterministically,
+    depending on which thread had warmed the broker.
+    """
+    assert recall(provider)["ok"] is True
+    answer = in_thread(provider)
+    assert answer["ok"] is True, answer.get("error")
+
+
+def test_the_warm_cache_does_not_make_a_second_thread_share_a_connection(provider):
+    """Two turns may be served by two different threads, and neither gets the other's file."""
+    assert recall(provider)["ok"] is True
+    assert in_thread(provider)["ok"] is True
+    assert in_thread(provider, "a different question")["ok"] is True
+    assert recall(provider)["ok"] is True, "and the thread that started still answers"
+
+
+def test_a_session_boundary_releases_the_connection_it_claims_to(provider):
+    """Saying the cache was dropped, while the file handle stays open, is the leak.
+
+    A gateway that flips sessions without tearing the provider down would otherwise accumulate
+    an open reader of the profile's database per boundary.
+    """
+    assert recall(provider)["ok"] is True
+    held = provider._local.cache["store"]
+    provider.on_session_switch("sess-2")
+    with pytest.raises(sqlite3.ProgrammingError):
+        held.db.execute("SELECT 1")
+    assert recall(provider)["ok"] is True
+    assert provider._local.cache["store"] is not held, \
+        "the next ask made itself a new one rather than using a closed handle"
+
+
+def test_a_thread_releases_its_own_stale_connection_when_it_is_next_asked(provider):
+    """The session moved on another thread, which cannot close this thread's handle for it.
+
+    SQLite refuses a close from a thread that did not open the connection, so the generation is
+    the notice and the next call is the collection. A cache that ignored the generation would
+    hand back a connection whose session — and whose warmed packet — is somebody else's.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def ask(pool, query):
+        def work():
+            answer = recall(provider, query)
+            return answer, provider._local.cache["store"]
+        return pool.submit(work).result()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first_answer, first_store = ask(pool, "the survey cadence")
+        assert first_answer["ok"] is True
+        provider.on_session_switch("sess-2")
+        second_answer, second_store = ask(pool, "a different question")
+
+        def reuse_held_handle() -> str:
+            """Ask the owning thread to use the handle it left behind, and report what it says.
+
+            Only that thread can tell a closed connection from another thread's connection, so
+            this is where the release is actually measured.
+            """
+            try:
+                first_store.db.execute("SELECT 1")
+            except sqlite3.ProgrammingError as error:
+                return str(error)
+            return "still open"
+
+        note = pool.submit(reuse_held_handle).result()
+    assert second_answer["ok"] is True
+    assert second_store is not first_store, "the stale entry was kept, not rebuilt"
+    assert "closed database" in note, \
+        f"the thread that owned the handle abandoned it instead of releasing it ({note})"
+
+
+def test_two_threads_hold_two_connections_and_both_answer(provider):
+    """The isolation is the fix: shared would mean one of them is always the wrong thread."""
+    seen = []
+
+    def collect():
+        answer = recall(provider)
+        seen.append(provider._local.cache["store"])
+        return answer
+
+    threads = [threading.Thread(target=collect) for _ in range(2)]
+    assert recall(provider)["ok"] is True
+    main_store = provider._local.cache["store"]
+    for thread in threads:
+        thread.start()
+        thread.join(30)
+        assert not thread.is_alive()
+    assert len(seen) == 2 and seen[0] is not seen[1]
+    assert main_store not in seen, "and neither worker borrowed the main thread's handle"
+
+
+def test_a_practice_read_reuses_the_connection_this_thread_holds(provider):
+    """Retrieval happens every turn; an open per turn is a leak with a normal-looking face."""
+    opened: list[int] = []
+    real = provider._open_store
+    provider._open_store = lambda: (opened.append(1), real())[1]
+    try:
+        assert recall(provider)["ok"] is True
+        warmed = len(opened)
+        assert provider._lessons({"topic": "invoices"}) == []
+        assert len(opened) == warmed, "the habit read opened a second store"
+    finally:
+        provider._open_store = real

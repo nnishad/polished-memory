@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -208,8 +209,8 @@ class HermesMemoryProvider(_MemoryProvider):
         self._agent_context = "primary"
         self._last_injected = 0
         self._unavailable = ""
-        self._context: Any = None
-        self._store: Any = None
+        # A connection and a packet cache per thread, not per provider: see `_thread_cache`.
+        self._local = threading.local()
         # One warmed packet per session, keyed to the question it answers.
         self._queued: dict[str, tuple[str, int, str, int]] = {}
         self._generation = 0
@@ -481,12 +482,42 @@ class HermesMemoryProvider(_MemoryProvider):
                          "an agent cannot confirm its own forgetting request."),
             }
 
+    def _thread_cache(self) -> dict[str, Any]:
+        """This thread's connection and packet cache, rebuilt when the session moved.
+
+        A SQLite connection belongs to the thread that opened it — and so does closing it,
+        which is why the cache is per thread and released by the thread that owns it. Hermes
+        runs tool handlers on whichever worker it likes: one connection cached on the provider
+        was measured on a live installation failing *every* `memory_recall` with "SQLite objects
+        created in a thread can only be used in that same thread". Per-thread caches keep the
+        one thing the cache was bought for — many turns on one open — and give up the thing it
+        could never have been: a handle shared between threads that do not own it.
+
+        A thread that is not the one switching sessions finds its entry stale on its next call
+        and releases it there, because no other thread can do it for it.
+        """
+        cached = getattr(self._local, "cache", None)
+        if cached is not None and cached["generation"] == self._generation:
+            return cached
+        if cached is not None:
+            _release(cached)
+        cached = {"generation": self._generation, "store": None, "context": None}
+        self._local.cache = cached
+        return cached
+
+    def _thread_store(self) -> Any:
+        cached = self._thread_cache()
+        if cached["store"] is None:
+            cached["store"] = self._open_store()
+        return cached["store"]
+
     def _open_store(self):
         """The canonical store of the profile this activity was bound to.
 
         Deliberately not the instance configuration's own: a gateway that resolved
         its home once at startup would keep serving the first profile's archive to
-        every later conversation.
+        every later conversation. This is the per-call open; a caller that keeps the
+        connection across a turn uses :meth:`_thread_store` instead.
         """
         from hermes_memory.storage.evidence import EvidenceStore
 
@@ -530,37 +561,38 @@ class HermesMemoryProvider(_MemoryProvider):
         from hermes_memory.learning.outcomes import OutcomeLog
 
         settings = self._bound().settings
-        habits = LessonStore(self._store,
-                             outcomes=OutcomeLog(self._store,
+        habits = LessonStore(self._thread_store(),
+                             outcomes=OutcomeLog(self._thread_store(),
                                                  owner_principal=settings.owner_principal),
                              owner_principal=settings.owner_principal)
         return [item.as_dict() for item in habits.applicable(given, limit=4)]
 
     def _broker(self):
-        """One broker per provider instance: a cache only pays off across turns.
+        """One broker per thread: a cache only pays off across the turns one thread serves.
 
         The derived channel is the *profile's* bank, named by the instance ledger.
         Until a profile was resolvable there was no honest value to pass: a guessed
         bank reads exactly like a working semantic channel while answering out of
         nobody's data, and a shared bank answers out of somebody else's.
         """
-        if self._context is None:
+        cached = self._thread_cache()
+        if cached["context"] is None:
             activity = self._bound()
             settings = activity.settings
             from hermes_memory.context import ContextBroker
             from hermes_memory.knowledge.assertions import AssertionStore
             from hermes_memory.knowledge.summaries import SummaryStore
 
-            self._store = self._open_store()
-            self._context = ContextBroker(
-                self._store, client=self._derived_client(activity),
+            store = self._thread_store()
+            cached["context"] = ContextBroker(
+                store, client=self._derived_client(activity),
                 budget_tokens=_PREFETCH_TOKENS,
-                assertions=AssertionStore(self._store,
+                assertions=AssertionStore(store,
                                           owner_principal=settings.owner_principal),
-                summaries=SummaryStore(self._store,
+                summaries=SummaryStore(store,
                                        owner_principal=settings.owner_principal),
                 derived_timeout_s=settings.foreground_deadline_s)
-        return self._context
+        return cached["context"]
 
     def _derived_client(self, activity):
         """A configured backend for this profile, or None. Never a network probe."""
@@ -831,22 +863,25 @@ class HermesMemoryProvider(_MemoryProvider):
         return paths
 
     def shutdown(self) -> None:
+        # Only this thread's cache: a connection cannot be closed by a thread that did not
+        # open it, and any other thread releases its own on its next call or with the process.
         self._close_context()
         self._close_spool()
 
     def _close_context(self) -> None:
-        """Release the read connection and the packet cache with it."""
+        """Release this thread's read connection and the packet cache with it.
+
+        The other threads' entries are not closed from here: SQLite refuses to let a
+        connection be operated on — or closed — by a thread that does not own it, so the only
+        honest options were to break those threads on their next recall or to let each release
+        its own. They rebuild when the generation they were made under is past, which this
+        method is what moves.
+        """
         self._queued.clear()
-        if self._context is not None:
-            self._context.close()
-            self._context = None
-        if self._store is not None:
-            try:
-                self._store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            self._store.close()
-            self._store = None
+        cached = getattr(self._local, "cache", None)
+        if cached is not None:
+            _release(cached)
+            self._local.cache = None
 
     def _close_spool(self) -> None:
         if self._spool is not None:
@@ -926,6 +961,25 @@ class HermesMemoryProvider(_MemoryProvider):
             "writes_enabled": self._capturing,
             "model_config_untouched": True,
         }
+
+
+def _release(cached: dict[str, Any]) -> None:
+    """Close the packet cache and the connection one thread opened, in that order.
+
+    Only the thread that made them may do this, which is why the caller is
+    :meth:`HermesMemoryProvider._close_context` and not whatever thread happens to run
+    `shutdown`.
+    """
+    if cached["context"] is not None:
+        cached["context"].close()
+        cached["context"] = None
+    if cached["store"] is not None:
+        try:
+            cached["store"].db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        cached["store"].close()
+        cached["store"] = None
 
 
 def write_env_file(hermes_home: Path, values: dict[str, Any]) -> Path:

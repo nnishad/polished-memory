@@ -1,6 +1,8 @@
 """C7 identity: deterministic candidates, owner-only decisions, confirmed-only traversal."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from hermes_memory.storage.evidence import EvidenceError
@@ -428,6 +430,39 @@ def test_a_confirmed_edge_on_vanished_evidence_is_flagged_not_silently_revoked(s
     assert outcome["stale"] == []
     assert outcome["confirmed_needing_review"] == [proposal["candidate_id"]]
     assert identity.same_person(first, second) is True, "still believed until the owner decides"
+
+
+def test_a_sweep_that_changed_nothing_is_not_recorded_as_a_decision(store, identity,
+                                                                    evidence):
+    """The background pass calls this every period, and the audit ledger is not its heartbeat.
+
+    112 `identity_invalidate` rows on a live installation, 108 of them `{"stale": 0,
+    "needs_review": 0}`, is the failure: the one act worth recording — a candidate whose
+    evidence went away — becomes a line in a log of visits.
+    """
+    from hermes_memory.lifecycle.erasure import ErasureManager
+
+    first, second = accounts(identity)
+    identity.propose(account_a=first, account_b=second, rule="email-thread-participant",
+                     basis="thread", evidence=[evidence], proposed_by=AGENT)
+
+    def rows():
+        return store.db.execute("SELECT metadata FROM audit WHERE "
+                                "action='identity_invalidate'").fetchall()
+
+    assert identity.invalidate_stale()["stale"] == []
+    assert rows() == [], "a sweep over nothing is not an event"
+    assert identity.invalidate_stale()["stale"] == []
+    assert rows() == [], "and calling it on a timer must not accumulate one row per period"
+
+    manager = ErasureManager(store, owner_principal=OWNER)
+    preview = manager.preview(record_ids=[evidence], actor=OWNER, reason="withdrawn")
+    manager.confirm(intent_id=preview["intent_id"], preview_digest=preview["preview_digest"],
+                    actor=OWNER)
+    assert len(identity.invalidate_stale()["stale"]) == 1
+    assert len(rows()) == 1, "the change is written down, once"
+    assert json.loads(rows()[0]["metadata"]) == {"stale": 1, "needs_review": 0}, \
+        "and says what it moved, so the ledger answers the question a reviewer asks"
 
 
 # -- topics ------------------------------------------------------------------
