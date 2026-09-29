@@ -295,10 +295,7 @@ def command_sink(command: str | Sequence[str], *, destination: str | None = None
             raise RuntimeError(f"{Path(argv[0]).name} exited {finished.returncode}: "
                                f"{finished.stderr.decode('utf-8', 'replace').strip()[:200]}")
         receipt: dict[str, Any] = {"sent": True}
-        try:
-            answered = json.loads(text.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            answered = None
+        answered = _answered(text)
         if isinstance(answered, dict):
             reported = str(answered.get("chat_id") or "").strip()
             if address and reported and reported != address:
@@ -320,6 +317,29 @@ def command_sink(command: str | Sequence[str], *, destination: str | None = None
         return receipt
 
     return send
+
+
+def _answered(text: str) -> Any:
+    """The one JSON object a transport program answered with, if it answered with one.
+
+    Read the whole stdout first: `hermes send --json` pretty-prints, so the last line is a
+    closing brace, and a parser that only looks there finds no receipt and records a real
+    send as though the transport had said nothing at all.
+    """
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        return json.loads(candidate)
+    except ValueError:
+        pass
+    start, stop = candidate.find("{"), candidate.rfind("}")
+    if start >= 0 and stop > start:
+        try:
+            return json.loads(candidate[start:stop + 1])
+        except ValueError:
+            return None
+    return None
 
 
 def _proof(receipt: Any) -> Any:

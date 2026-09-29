@@ -228,6 +228,27 @@ sys.exit(1)
     assert "exited 1" in store.db.execute("SELECT reason FROM outbox").fetchone()[0]
 
 
+def test_a_transport_that_answers_in_pretty_printed_json_is_still_read(store, queue,
+                                                                        tmp_path):
+    """`hermes send --json` indents. Reading only the last line reads a closing brace."""
+    queue()
+    command = a_transport(tmp_path, """
+import json, sys
+sys.stdin.read()
+print(json.dumps({"success": True, "platform": "telegram", "chat_id": "787655730",
+                  "message_id": 44}, indent=2))
+""")
+
+    deliver_ready(store, policy=allowed("telegram:787655730"),
+                  sink=command_sink([command], destination="telegram:787655730"),
+                  limit=1, at=EPOCH)
+
+    proof = json.loads(store.db.execute("SELECT proof FROM outbox").fetchone()[0])
+    assert proof["chat_id"] == "787655730" and proof["message_id"] == 44
+    assert "destination_unconfirmed" not in proof, \
+        "the transport named the chat; the receipt must not say nobody did"
+
+
 # -- what refuses --------------------------------------------------------------
 
 def test_an_installation_with_no_destination_says_why_rather_than_showing_an_empty_queue(
