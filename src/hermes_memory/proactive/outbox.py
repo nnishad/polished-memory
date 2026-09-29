@@ -233,7 +233,16 @@ class Outbox:
             if not check.ok:
                 if check.retry_at is not None:
                     continue  # not yet, not never: leave it prepared for a later lease
-                self.suppress(artifact.id, reason=check.reason)
+                # The list above is a snapshot taken a moment ago. Another drain may have
+                # claimed this one in between, and an artifact that is mid-flight somewhere
+                # else is not this lease's to close: suppressing it would both throw here
+                # and unsend a delivery somebody else already carried out.
+                if artifact.state != "prepared":
+                    continue
+                try:
+                    self.suppress(artifact.id, reason=check.reason)
+                except EvidenceError:
+                    continue  # lost that race by a heartbeat, so there is nothing to close
                 continue
             token = new_id("send")
             self.db.execute("BEGIN IMMEDIATE")

@@ -10,6 +10,7 @@ sink that reports only what it can prove about itself.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -247,6 +248,44 @@ print(json.dumps({"success": True, "platform": "telegram", "chat_id": "787655730
     assert proof["chat_id"] == "787655730" and proof["message_id"] == 44
     assert "destination_unconfirmed" not in proof, \
         "the transport named the chat; the receipt must not say nobody did"
+
+
+def test_concurrent_drains_never_close_each_other_s_delivery(store, queue, tmp_path):
+    """A lease must not suppress a row another drain already took.
+
+    Eight drains over twelve artifacts reproduce the window wide open: the candidate list
+    is a snapshot, so a row can be claimed between the SELECT and the revalidation that
+    follows it. Before the guard the losing drain died with "already attempted", and the
+    artifact it was trying to close had already been delivered to the owner.
+    """
+    identifiers = [queue(payload=f"reminder {index}") for index in range(12)]
+    outcomes, errors = [], []
+
+    def drain(worker: int) -> None:
+        try:
+            from hermes_memory.storage.evidence import EvidenceStore
+
+            with EvidenceStore(store.path) as own:
+                outcomes.append(deliver_ready(own, policy=allowed(),
+                                              sink=local_sink(tmp_path / f"h{worker}"),
+                                              limit=12, holder=f"drain-{worker}"))
+        except Exception as error:
+            errors.append(f"{type(error).__name__}: {str(error)[:160]}")
+
+    threads = [threading.Thread(target=drain, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, errors[:3]
+    handed = sum(item["delivered"] for item in outcomes)
+    states = store.db.execute("SELECT state, count(*) FROM outbox GROUP BY state").fetchall()
+    assert handed == len(identifiers), (handed, len(identifiers))
+    assert dict(states).get("accepted_unverified") == len(identifiers), dict(states)
+    landed = len(list((tmp_path).rglob("*.md")))
+    assert landed == len(identifiers), \
+        f"{landed} files for {len(identifiers)} artifacts: something was sent twice"
 
 
 # -- what refuses --------------------------------------------------------------

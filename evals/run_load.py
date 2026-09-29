@@ -464,7 +464,7 @@ def main() -> int:
     total = time.perf_counter() - started
     print(f"\n{len(FAILURES)} invariant failure(s) in {total:.1f}s"
           + (f" — {', '.join(FAILURES)}" if FAILURES else "")
-          + ("" if args.keep or FAILURES else f"   (kept: {root})"))
+          + (f"   (kept: {root})" if args.keep else ""))
     return 1 if FAILURES else 0
 
 
