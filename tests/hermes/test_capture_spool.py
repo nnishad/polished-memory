@@ -71,6 +71,32 @@ def test_the_reader_derives_the_same_path_the_plugin_writes_to(tmp_path):
     assert spool_beside(tmp_path / "canonical.db") == tmp_path / SPOOL_RELATIVE
 
 
+def test_a_turn_written_on_another_thread_reaches_the_same_spool(tmp_path):
+    """Hermes calls `sync_turn` on whichever worker it likes, and the spool is the durability.
+
+    Measured on the live installation: one connection cached on the spool object made every
+    turn after the first one fail with "SQLite objects created in a thread can only be used in
+    that same thread", so the boundary that is supposed to be the proof a chat answer was
+    kept was not keeping anything, once per message.
+    """
+    import threading
+
+    path = tmp_path / SPOOL_RELATIVE
+    spool = plugin_spool(path)
+    assert spool.append(event_id="e1", session_id="s", payload={"kind": "conversation_turn"},
+                        created_at=AT) is True
+
+    def later():
+        spool.append(event_id="e2", session_id="s", payload={"kind": "conversation_turn"},
+                     created_at=AT)
+
+    worker = threading.Thread(target=later)
+    worker.start()
+    worker.join(30)
+    assert not worker.is_alive(), "the second thread raised instead of writing"
+    assert [row["event_id"] for row in spool.pending()] == ["e1", "e2"]
+
+
 def test_a_spool_is_read_in_its_own_insertion_order(tmp_path):
     path = write_spool(tmp_path / SPOOL_RELATIVE,
                         turn("e1", user="first", assistant="a", at="2026-09-26T09:00:00+00:00"),

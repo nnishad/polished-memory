@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -30,20 +31,46 @@ _MAXIMUM_BATCH = 500
 
 
 class CaptureSpool:
+    """A queue of turns to capture, one SQLite connection per thread.
+
+    Hermes calls ``sync_turn`` on whichever worker it likes, so a connection opened on the
+    thread that happened to construct this object is a failure on every later turn: measured on
+    the live installation as ``SQLite objects created in a thread can only be used in that same
+    thread`` in the gateway log, once per message, with the turn never reaching the spool. WAL
+    is what makes more than one connection to this file an ordinary thing rather than a race.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=10)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        self._local = threading.local()
+        self._open()
+
+    def _open(self) -> sqlite3.Connection:
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            return db
+        db = sqlite3.connect(self.path, timeout=10)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
         # FULL, not NORMAL: WAL with NORMAL does not fsync on commit, so a
         # power loss could drop accepted turns.
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(SCHEMA)
-        self.db.commit()
+        db.execute("PRAGMA synchronous=FULL")
+        db.executescript(SCHEMA)
+        db.commit()
+        self._local.db = db
+        return db
 
     def close(self) -> None:
-        self.db.close()
+        """Release this thread's connection. The others go when the spool does."""
+        db = getattr(self._local, "db", None)
+        if db is not None:
+            self._local.db = None
+            db.close()
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        return self._open()
 
     def append(self, *, event_id: str, session_id: str, payload: dict[str, Any], created_at: str) -> bool:
         """Record one capture event. Returns False if it was already present."""
