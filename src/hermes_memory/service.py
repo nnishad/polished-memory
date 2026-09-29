@@ -16,6 +16,12 @@ reported: the pass writes down each time it runs, and status and doctor read tha
 There is no dependency on an ASGI server here on purpose. ``dependencies`` in this
 package is empty, and an installer that quietly pulled a web framework into a memory
 runtime would own the CVEs that came with it.
+
+A second timer runs beside the pass: the drain that hands prepared artifacts to a transport.
+It is a separate loop because the pass may not touch a transport at all, and it is started
+only where the owner's own configuration says both *to this destination* and *this often* —
+a process that begins messaging a person on an opinion it formed itself has stopped being a
+memory service and become a notification service nobody authorised.
 """
 from __future__ import annotations
 
@@ -262,7 +268,8 @@ class _Handler(BaseHTTPRequestHandler):
 def serve(settings, *, store_factory: Callable[[], Any] | None = None,
           upstream: Callable | None = None, host: str | None = None,
           port: int | None = None, report: Callable[[dict], Any] | None = None,
-          maintenance: Ticker | None = None) -> int:
+          maintenance: Ticker | None = None,
+          delivery: Ticker | None = None) -> int:
     """Bind, announce readiness, then block until the manager stops us.
 
     Binding before printing anything is the point: a unit that announced itself and then
@@ -290,12 +297,21 @@ def serve(settings, *, store_factory: Callable[[], Any] | None = None,
     ticker = maintenance or Ticker(runner=lambda: maintenance_run(settings),
                                    interval_s=getattr(settings, "maintenance_interval_s", 0))
     ticker.start()
+    # The pass above only *prepares* artifacts; this is the loop that sends them. It is a
+    # second timer rather than a section of the first because the pass takes the rule that
+    # it touches no transport, and it is started only when the owner's own configuration
+    # names both a destination and a period — nothing in this process may put a message in
+    # front of a person on an opinion it formed itself.
+    loop, delivery_line = _delivery_loop(settings, ticker=delivery)
+    if loop is not None:
+        loop.start()
+        delivery_line = {"scheduled": True, **loop.state()}
     try:
         bound_host, bound_port = server.bound
         ready = {"ok": True, "service": "hermes-memory-gate",
                  "listening_on": [bound_host, bound_port], "health_path": HEALTH_PATH,
                  "routes": routes, "routes_withheld": withheld,
-                 "maintenance": ticker.state()}
+                 "maintenance": ticker.state(), "delivery": delivery_line}
         (report or (lambda payload: print(json.dumps(payload, sort_keys=True))))(ready)
         server.serve_forever()
     except KeyboardInterrupt:
@@ -304,5 +320,34 @@ def serve(settings, *, store_factory: Callable[[], Any] | None = None,
         # Whatever ended the loop — a signal, a stopped server or a failed announcement —
         # the scheduler stops with it, so a process that is leaving cannot keep writing.
         ticker.stop()
+        if loop is not None:
+            loop.stop()
         server.server_close()
     return 0
+
+
+def _delivery_loop(settings,
+                   ticker: Ticker | None = None) -> tuple[Ticker | None, dict[str, Any]]:
+    """The drain timer this installation's configuration entitles it to, which may be none.
+
+    Returns the loop alongside the line a reader wants, because the process has to stop what
+    it started and report what it chose not to start: an installation whose reminders are
+    sitting in the outbox must say *why* in the same breath, whether the reason is that the
+    owner never switched delivery on, that they kept the timer, or that the loop is running.
+    """
+    from .proactive.delivery import drain_installed, drain_line
+
+    if not bool(getattr(settings, "delivery_enabled", False)):
+        return None, {"scheduled": False, "running": False,
+                      "reason": "delivery is switched off, so no transport is started from "
+                                "this process; `hermes-memory owner --switch-delivery on` is "
+                                "the owner's door and `hermes-memory deliver` sends by hand"}
+    poll = int(getattr(settings, "delivery_poll_s", 0) or 0)
+    if poll <= 0:
+        return None, {"scheduled": False, "running": False,
+                      "reason": "HERMES_MEMORY_DELIVERY_POLL_S=0 hands the timer back: the "
+                                "owner runs `hermes-memory deliver` when they want artifacts "
+                                "sent"}
+    return (ticker or Ticker(runner=lambda: drain_installed(settings), interval_s=poll,
+                             name="hermes-memory-delivery", summarize=drain_line),
+            {"scheduled": True, "interval_s": poll})

@@ -130,6 +130,7 @@ class StatusReporter:
             waiting = self.pending_confirmations()
             queue = self.queue_age()
             background = self.background_pass()
+            sending = self.delivery_loop()
             epoch = self.store.epoch()
         states = {stage.name: stage.state for stage in stages}
         return {
@@ -144,8 +145,9 @@ class StatusReporter:
             "awaiting_owner": waiting,
             "queue": queue,
             "background_pass": background,
+            "delivery_loop": sending,
             "notes": _notes(stages, erasure=erasure, waiting=waiting, queue=queue,
-                            background=background),
+                            background=background, delivery_loop=sending),
         }
 
     def stage(self, name: str) -> StageReport:
@@ -677,6 +679,41 @@ class StatusReporter:
                          "scheduler is not running" if behind else
                          "the background pass is running on schedule")}
 
+    def delivery_loop(self) -> dict[str, Any]:
+        """Whether anything on this machine sends what the pass prepared, and what it saw.
+
+        The drain is a thread in another process, so its heartbeat is not evidence here. Two
+        readings carry it: the line the drain wrote when it had something to say, and the
+        backlog. A drain that finds nothing to send writes nothing — recording 1440 identical
+        no-ops a day would bury the audit and prove nothing more — so an old line is not a
+        dead loop. An artifact that stays *prepared* past three periods is, and telling those
+        two apart is the whole of what this exists to do.
+        """
+        from ..proactive.delivery import last_drain
+
+        last = last_drain(self.store)
+        poll = int(getattr(self.settings, "delivery_poll_s", 0) or 0)
+        enabled = bool(getattr(self.settings, "delivery_enabled", False))
+        row = self.db.execute("SELECT count(*) AS n, min(created_at) AS oldest FROM outbox "
+                              "WHERE state='prepared'").fetchone()
+        waiting = int(row["n"] or 0)
+        age = None if not row["oldest"] else _age_from_text(str(row["oldest"]))
+        behind = bool(waiting and poll and age is not None and age > poll * 3)
+        return {"scheduled": bool(enabled and poll > 0), "interval_seconds": poll,
+                "enabled": enabled, "waiting": waiting,
+                "oldest_seconds": None if age is None else round(age, 1),
+                "last_drain_at": None if last is None else last["created_at"],
+                "last_report": None if last is None else {
+                    key: value for key, value in last.items() if key != "created_at"},
+                "behind": behind,
+                "note": ("delivery is switched off, so prepared artifacts wait for "
+                         "`hermes-memory deliver`" if not enabled else
+                         "no drain is scheduled (HERMES_MEMORY_DELIVERY_POLL_S=0), so the "
+                         "owner sends by hand" if poll <= 0 else
+                         f"{waiting} artifact(s) have been prepared for longer than three "
+                         "periods: the runtime's drain loop is not sending them" if behind
+                         else "the runtime drains the outbox on its own, on schedule")}
+
     # -- primitives ----------------------------------------------------------
 
     @property
@@ -900,7 +937,8 @@ def _overall(states: dict[str, str]) -> str:
 
 def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
            waiting: dict[str, Any], queue: dict[str, Any],
-           background: dict[str, Any] | None = None) -> list[str]:
+           background: dict[str, Any] | None = None,
+           delivery_loop: dict[str, Any] | None = None) -> list[str]:
     """What an operator would ask next, from the stages that already answered."""
     notes = [f"{stage.name}: {stage.detail}" for stage in stages if stage.state == DEGRADED]
     if queue.get("stale"):
@@ -929,9 +967,18 @@ def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
         notes.append(f"owner: {deciding} decision(s) are yours alone; "
                      "`hermes-memory owner --list` shows them")
     delivery = next((stage for stage in stages if stage.name == "delivery"), None)
-    if delivery is not None and delivery.evidence.get("in_flight"):
-        notes.append("delivery: the framework prepared artifacts that the host transport "
-                     "has not claimed")
+    if delivery_loop is not None and delivery_loop.get("waiting") and (
+            delivery_loop.get("behind") or not delivery_loop.get("scheduled")):
+        # The artifact was prepared by the pass and nothing has claimed it. Saying "the host
+        # transport has not claimed" would send the reader to another machine: on this one
+        # the runtime drains its own outbox, so the question is whether that loop is running
+        # at all, and the note answers it from the period the owner configured. An artifact
+        # prepared a moment ago under a drain that is running is not a stall, and reporting
+        # one every time would make the note worth ignoring.
+        notes.append(f"delivery: {delivery_loop['waiting']} artifact(s) are prepared and "
+                     f"unsent — {delivery_loop['note']}")
+    elif delivery is not None and delivery.evidence.get("in_flight"):
+        notes.append("delivery: the framework prepared artifacts that no drain has claimed")
     if background is not None and background.get("behind") and background.get("waiting"):
         # Only said when something is actually waiting: a loop that has never run on an
         # installation with nothing due is not a problem an operator has to fix tonight.

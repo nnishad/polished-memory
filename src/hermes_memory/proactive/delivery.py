@@ -26,12 +26,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
-from ..ids import digest
+from ..ids import digest, now
+from ..storage.evidence import EvidenceError
 from .outbox import Outbox
 from .policy import AttentionPolicy
 
 __all__ = ["DeliveryPolicy", "bounded_drain", "command_sink", "correlation",
-           "deliver_once", "deliver_ready", "local_sink"]
+           "deliver_once", "deliver_ready", "drain_installed", "drain_line", "last_drain",
+           "local_sink", "sink_for"]
 
 # What a transport program is allowed to see. `hermes send` finds the gateway's bot
 # credential through HOME, and nothing in this list is a secret the memory process holds.
@@ -317,6 +319,132 @@ def command_sink(command: str | Sequence[str], *, destination: str | None = None
         return receipt
 
     return send
+
+
+def sink_for(settings, hermes_home: str | Path) -> tuple[Callable | None, str | None]:
+    """The transport this installation's owner configured, and how to name it in a report.
+
+    Returns ``(None, None)`` when the destination names a transport nobody provided — and
+    the caller must then refuse rather than fall back to writing a file, because a local
+    artifact is not the message the owner asked to be sent.
+    """
+    destination = str(getattr(settings, "delivery_target", None) or "")
+    command = tuple(getattr(settings, "delivery_command", ()) or ())
+    if command:
+        return command_sink(command, destination=destination), " ".join(command)
+    if destination.lower().startswith("local:"):
+        home = Path(hermes_home)
+        return local_sink(home), str(home / "memory" / "delivered")
+    return None, None
+
+
+def drain_installed(settings, *, limit: int = 10,
+                    holder: str = "hermes-memory-runtime") -> dict[str, Any]:
+    """Drain every enrolled profile's outbox through the transport its owner named.
+
+    This is what makes a delivered reminder arrive without anybody typing a command: the
+    runtime's own timer, not a section of the background pass — the pass takes the rule
+    that it touches no transport, and starting a transport from inside it would be the
+    quiet way to break that rule.
+
+    One profile's failure is kept to that profile. A store that cannot be opened, or a
+    transport that has gone missing since it was configured, must not stop the other
+    memories on the machine from telling their owner things.
+    """
+    from ..install.profiles import InstallationError, ProfileRegistry
+    from ..storage.evidence import EvidenceStore
+
+    per_profile, delivering = [], 0
+    try:
+        registry = ProfileRegistry.reading(settings)
+    except (InstallationError, OSError) as error:
+        return {"ok": False, "at": now(), "delivered": 0, "profiles": [],
+                "reason": str(error)[:200]}
+    try:
+        profiles = list(registry.profiles())
+    finally:
+        registry.db.close()
+    for item in profiles:
+        scoped = item.scoped(settings)
+        policy = DeliveryPolicy.from_settings(scoped)
+        summary = {"profile": item.profile, "delivered": 0, "transport": None}
+        if policy.refusal() is None:
+            try:
+                sink, transport = sink_for(scoped, item.hermes_home)
+                with EvidenceStore(scoped.db_path) as store:
+                    if sink is None:
+                        # The owner approved an address this installation has no way to
+                        # reach. Not sending is right; saying so once, in the archive it
+                        # belongs to, is what makes it findable.
+                        summary["reason"] = (f"{policy.destination!r} names no local "
+                                             "destination and no transport program is "
+                                             "configured")
+                    else:
+                        held = ("delivery is paused for this installation by the owner"
+                                if store.stage_is_paused("global", "delivery") else None)
+                        outcome = deliver_ready(store, policy=policy, sink=sink,
+                                                limit=limit, held=held, holder=holder)
+                        summary.update({"delivered": outcome["delivered"],
+                                        "transport": transport,
+                                        "reason": outcome["reason"]})
+                        delivering += outcome["delivered"]
+                    _note(store, summary)
+            except (EvidenceError, InstallationError, ValueError, OSError) as error:
+                # A drain that cannot be started is a fact about this installation, and the
+                # loop that found it is still healthy: keep going, but say who else is waiting.
+                summary["reason"] = f"{type(error).__name__}: {str(error)[:180]}"
+        else:
+            summary["reason"] = policy.refusal()
+        per_profile.append(summary)
+    return {"ok": True, "at": now(), "delivered": delivering, "profiles": per_profile}
+
+
+def _changed(line: dict[str, Any], previous: dict[str, Any] | None) -> bool:
+    """Whether this drain has anything the last recorded one did not already say."""
+    if previous is None:
+        return True
+    key = ("delivered", "reason")
+    return any(line.get(name) != previous.get(name) for name in key)
+
+
+def _note(store, summary: dict[str, Any]) -> None:
+    """Write the drain down, but only when it changed the story.
+
+    `status` and `doctor` read this from another process, so without a line the difference
+    between a loop that is running and one that stopped is invisible. Writing every period
+    would bury the audit in no-ops — a minute-long poll is 1440 identical lines a day — so
+    what gets recorded is each *change*: the first quiet drain, then the first one that sent
+    something, then the first that met an error. A loop that has nothing to say since
+    Tuesday is told by the backlog reading, which counts prepared artifacts rather than
+    trusting this one.
+    """
+    line = {"profile": summary.get("profile"), "delivered": summary.get("delivered"),
+            "transport": summary.get("transport"),
+            "reason": str(summary.get("reason") or "")[:200]}
+    previous = last_drain(store)
+    if not _changed(line, previous):
+        return
+    store._audit("delivery_drain", f"delivery:{line['profile']}", line)
+
+
+def last_drain(store) -> dict[str, Any] | None:
+    """The last thing this archive's drain loop had to say, or None if it never said one."""
+    row = store.db.execute(
+        "SELECT created_at, metadata FROM audit WHERE action=? ORDER BY created_at DESC, "
+        "rowid DESC LIMIT 1", ("delivery_drain",)).fetchone()
+    if row is None:
+        return None
+    return {"created_at": str(row["created_at"]), **json.loads(str(row["metadata"] or "{}"))}
+
+
+def drain_line(report: dict[str, Any]) -> dict[str, Any]:
+    """The line the runtime keeps in memory for one drain, shaped for `state()`."""
+    return {"ok": bool(report.get("ok")), "at": report.get("at"),
+            "delivered": report.get("delivered"),
+            "profiles": [{"profile": item.get("profile"),
+                          "delivered": item.get("delivered"),
+                          "reason": str(item.get("reason") or "")[:200]}
+                         for item in report.get("profiles") or []]}
 
 
 def _answered(text: str) -> Any:

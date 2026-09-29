@@ -402,19 +402,36 @@ class Doctor:
     def delivery(self) -> Finding:
         report = self.status.delivery()
         evidence = report.evidence
+        # The outbox says what is waiting; this says whether anything on this machine is
+        # scheduled to send it. Without the second half, a stalled artifact and an
+        # installation whose owner kept the timer by design read identically.
+        loop = self.status.delivery_loop()
         if evidence.get("unproven"):
             return Finding("delivery", FAIL,
                            f"{evidence['unproven']} artifact(s) have no delivery proof",
                            "correlate the host receipts, or suppress what cannot be proved",
-                           {"by_state": evidence.get("by_state")})
+                           {"by_state": evidence.get("by_state"), "loop": loop})
         if evidence.get("past_expiry"):
+            # An artifact that aged out says the outbox was never claimed, and there are two
+            # reasons for that which need different answers: nothing is scheduled to drain it,
+            # or something is scheduled and is not doing it.
             return Finding("delivery", FAIL,
                            f"{evidence['past_expiry']} artifact(s) aged out unsent",
-                           "the host transport is not claiming the outbox; start it",
-                           {"by_state": evidence.get("by_state")})
+                           (loop["note"] if not loop["scheduled"] else
+                            "the runtime is scheduled to drain the outbox and has not, so the "
+                            "unit is not running or every send is failing — check "
+                            "`systemctl --user status hermes-memory`, or send these once with "
+                            "`hermes-memory deliver`"),
+                           {"by_state": evidence.get("by_state"), "loop": loop})
+        if loop.get("behind"):
+            return Finding("delivery", WARN,
+                           f"{loop['waiting']} artifact(s) have been prepared and unsent for "
+                           f"{loop['oldest_seconds']}s, past three drain periods",
+                           loop["note"] + "; `hermes-memory deliver` sends them now",
+                           {"by_state": evidence.get("by_state"), "loop": loop})
         return Finding("delivery", _severity_for(report.state), report.detail,
                        evidence={"state": report.state,
-                                 "in_flight": evidence.get("in_flight")})
+                                 "in_flight": evidence.get("in_flight"), "loop": loop})
 
     def gate(self) -> Finding:
         report = self.status.resource_gate()

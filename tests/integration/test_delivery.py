@@ -28,9 +28,13 @@ MORNING = "2026-09-15T09:00:00+00:00"
 EPOCH = 1_789_462_800.0
 
 
-@pytest.fixture()
-def queue(store):
-    """A real decision path — goal, due event, recorded decision — and one artifact on it."""
+def a_ready_pipeline(store, *, moment=MORNING, at=EPOCH):
+    """goal -> due event -> intent -> decision -> artifact, as the pipeline writes it.
+
+    The clock is an argument because a drain revalidates against the time it runs at: an
+    artifact prepared for one fixed September morning is refused as expired by a loop
+    running in a different year, and the test would then prove nothing about the loop.
+    """
     policy = AttentionPolicy(store, owner_principal=OWNER)
     # An artifact only leases out of a memory whose owner has agreed to be told: shadow
     # mode is the default, and a drain that ignored it would be the switch nobody pulled.
@@ -41,13 +45,13 @@ def queue(store):
     subject = Outbox(store, policy=policy, owner_principal=OWNER)
 
     def ready(payload="The client is still waiting on the invoice."):
-        decision = policy.decide(topic="general", at=MORNING)
+        decision = policy.decide(topic="general", at=moment)
         goal_id = goals.propose(title="Send the invoice", statement="Client waiting.",
-                                timezone_name=UTC, due=timestamp(MORNING),
+                                timezone_name=UTC, due=timestamp(moment),
                                 proposed_by=OWNER, proposed_kind="owner")["id"]
         event_id = store.db.execute("SELECT id FROM due_events WHERE goal_id=?",
                                     (goal_id,)).fetchone()[0]
-        claim = events.claim(event_id, holder="worker", at=EPOCH)
+        claim = events.claim(event_id, holder="worker", at=at)
         intent = events.ack(event_id=event_id, token=claim.token,
                             decision="awaiting_analysis",
                             policy_version=POLICY_VERSION)["intent"]
@@ -57,6 +61,12 @@ def queue(store):
         return artifact["id"]
 
     return ready
+
+
+@pytest.fixture()
+def queue(store):
+    """A real decision path — goal, due event, recorded decision — and one artifact on it."""
+    return a_ready_pipeline(store)
 
 
 def allowed(destination="local:jugaadu"):
@@ -375,15 +385,30 @@ def test_the_door_refuses_to_guess_whose_memory_it_is_draining(installed):
     assert code == 2 and "--hermes-home or --profile" in message
 
 
-def test_the_door_reports_the_transport_it_would_have_used(installed):
-    """Named, enrolled, and still nothing sent: the report says which of those it is at."""
+def test_the_door_reports_the_transport_it_would_have_used(installed, monkeypatch):
+    """Named, enrolled, and still nothing sent: the report says which of those it is at.
+
+    The transport comes from the destination the owner configured. It is not assumed: a
+    door that named a local directory on an installation that never asked for one would be
+    reporting a destination nobody approved.
+    """
     from hermes_memory.cli import main
 
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_TARGET", f"local:{OWNER}")
     code, report = _run(main, "deliver", "--hermes-home", str(installed))
     assert code == 0
     assert report["profile"] == "work" and report["delivered"] == 0
     assert "disabled by default" in report["reason"]
     assert report["transport"] == str(installed / "memory" / "delivered")
+
+
+def test_a_door_with_no_destination_names_no_transport_rather_than_the_nearest_folder(
+        installed):
+    from hermes_memory.cli import main
+
+    code, report = _run(main, "deliver", "--hermes-home", str(installed))
+    assert code == 0 and report["transport"] is None
+    assert "disabled by default" in report["reason"]
 
 
 def test_the_door_refuses_to_write_a_file_and_call_it_a_telegram_message(installed,
@@ -420,3 +445,118 @@ def _errors(main, *argv):
     finally:
         patch.undo()
     return code, "".join(written)
+
+
+# -- the timer that sends without a caller -------------------------------------
+
+def _profile_db(installed):
+    """The enrolled profile's own database, resolved the way the runtime resolves it."""
+    from hermes_memory.config import load_settings
+    from hermes_memory.install.profiles import ProfileRegistry
+
+    registry = ProfileRegistry.reading(load_settings())
+    try:
+        return registry.resolve(installed).scoped(load_settings()).db_path
+    finally:
+        registry.db.close()
+
+
+def _owner_said_yes(monkeypatch, destination=None):
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_ENABLED", "true")
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_TARGET", destination or f"local:{OWNER}")
+
+
+def test_the_installed_drain_sends_what_the_pass_prepared(installed, monkeypatch):
+    """Nothing types `deliver`: this is the half that makes a reminder actually arrive.
+
+    The drain is run against a real enrolled installation rather than a hand-made policy,
+    because the thing under test is the resolution from *installation* to *profile* to
+    *transport* — the part that had no caller at all.
+    """
+    import time
+
+    from hermes_memory.config import load_settings
+    from hermes_memory.ids import now
+    from hermes_memory.proactive.delivery import drain_installed, last_drain
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    _owner_said_yes(monkeypatch)
+    with EvidenceStore(_profile_db(installed)) as store:
+        identifier = a_ready_pipeline(store, moment=now(), at=time.time())()
+        outcome = drain_installed(load_settings(), limit=3)
+
+        assert outcome["delivered"] == 1, outcome
+        assert [item["profile"] for item in outcome["profiles"]] == ["work"]
+        assert store.db.execute("SELECT state FROM outbox WHERE id=?",
+                                (identifier,)).fetchone()[0] == "accepted_unverified"
+        assert last_drain(store)["delivered"] == 1
+    assert len(list((installed / "memory" / "delivered").glob("*.md"))) == 1
+
+
+def test_a_drain_with_nothing_to_say_writes_one_line_rather_than_one_a_period(
+        installed, monkeypatch):
+    """A minute-long poll is 1440 drains a day; the audit is not where that belongs.
+
+    The line exists so `status` can see the loop from another process. Recording every
+    no-op would bury the evidence the audit is supposed to be, so only a *change* is
+    written — and a loop that is quietly idle is proved by the backlog reading instead.
+    """
+    from hermes_memory.config import load_settings
+    from hermes_memory.proactive.delivery import drain_installed
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    _owner_said_yes(monkeypatch)
+    with EvidenceStore(_profile_db(installed)) as store:
+        for _ in range(5):
+            assert drain_installed(load_settings(), limit=3)["delivered"] == 0
+        assert store.db.execute("SELECT count(*) FROM audit WHERE action='delivery_drain'"
+                                ).fetchone()[0] == 1
+
+
+def test_a_send_and_then_a_quiet_drain_are_two_different_lines(installed, monkeypatch):
+    import time
+
+    from hermes_memory.config import load_settings
+    from hermes_memory.ids import now
+    from hermes_memory.proactive.delivery import drain_installed, last_drain
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    _owner_said_yes(monkeypatch)
+    with EvidenceStore(_profile_db(installed)) as store:
+        a_ready_pipeline(store, moment=now(), at=time.time())()
+        drain_installed(load_settings(), limit=3)
+        drain_installed(load_settings(), limit=3)
+        lines = store.db.execute(
+            "SELECT metadata FROM audit WHERE action='delivery_drain'").fetchall()
+        assert len(lines) == 2, lines
+        assert last_drain(store)["delivered"] == 0
+
+
+def test_a_destination_with_no_transport_program_is_said_once_instead_of_silently(
+        installed, monkeypatch):
+    """The owner named Telegram, nobody named the program that speaks it: not a file, and
+    not silence either."""
+    from hermes_memory.config import load_settings
+    from hermes_memory.proactive.delivery import drain_installed, last_drain
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    _owner_said_yes(monkeypatch, "telegram:787655730")
+    with EvidenceStore(_profile_db(installed)) as store:
+        outcome = drain_installed(load_settings(), limit=3)
+        assert outcome["delivered"] == 0
+        assert "no transport program is configured" in outcome["profiles"][0]["reason"]
+        assert "no transport program" in last_drain(store)["reason"]
+
+
+def test_an_installation_that_never_switched_delivery_on_records_no_drain(installed):
+    """Refusal by configuration is not an event; it is the state of the machine."""
+    from hermes_memory.config import load_settings
+    from hermes_memory.proactive.delivery import drain_installed
+    from hermes_memory.storage.evidence import EvidenceStore
+
+    with EvidenceStore(_profile_db(installed)) as store:
+        outcome = drain_installed(load_settings(), limit=3)
+        assert outcome["delivered"] == 0 and "disabled by default" in (
+            outcome["profiles"][0]["reason"])
+        assert store.db.execute("SELECT count(*) FROM audit WHERE action='delivery_drain'"
+                                ).fetchone()[0] == 0

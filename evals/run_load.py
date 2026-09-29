@@ -249,6 +249,46 @@ def phase_delivery(inst: dict, goals: int = 250) -> None:
         "accepted_unverified", 0))
     check("no duplicate artifact rows", duplicates == 0, duplicates=duplicates)
 
+    # The runtime's own path, last: it resolves installation → profile → transport instead
+    # of being handed one home, which is the difference between a door and a timer. This is
+    # the code the service starts on a period, so it is worth running at the same scale.
+    from hermes_memory.config import load_settings
+    from hermes_memory.proactive.delivery import drain_installed
+
+    saved = {key: os.environ.get(key) for key in inst["env"]
+             if key.startswith("HERMES_MEMORY_")}
+    os.environ.update({key: str(value) for key, value in inst["env"].items()
+                       if key.startswith("HERMES_MEMORY_")})
+    try:
+        started = time.perf_counter()
+        outcome = drain_installed(load_settings(), limit=25)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    with EvidenceStore(inst["db"]) as store:
+        lines = int(store.db.execute(
+            "SELECT count(*) FROM audit WHERE action='delivery_drain'").fetchone()[0])
+        after = dict(store.db.execute("SELECT state, count(*) FROM outbox GROUP BY state"))
+    landed = len(list(written.glob("*.md"))) if written.is_dir() else 0
+    report("runtime drain", ok=outcome["ok"], delivered=outcome["delivered"],
+           profiles=[item["profile"] for item in outcome["profiles"]],
+           reason=[item.get("reason") for item in outcome["profiles"]],
+           seconds=round(time.perf_counter() - started, 2), audit_lines=lines)
+    check("the installed drain reaches every enrolled profile",
+          [item["profile"] for item in outcome["profiles"]] == ["load"],
+          profiles=[item["profile"] for item in outcome["profiles"]])
+    check("a drain loop does not flood the audit", lines <= 2, lines=lines)
+    check("the files on disk still equal the artifacts handed over",
+          landed == after.get("accepted_unverified", 0), landed=landed,
+          handed_over=after.get("accepted_unverified", 0))
+    check("the installed drain leaves nothing unaccounted for",
+          sum(count for state, count in after.items() if state in
+              ("accepted_unverified", "prepared")) == prepared,
+          prepared=prepared, states=after)
+
 
 # -- 4. identity ---------------------------------------------------------------
 

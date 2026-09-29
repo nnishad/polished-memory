@@ -289,6 +289,15 @@ class Maintenance:
         return datetime.fromtimestamp(self.clock(), tz=timezone.utc).isoformat()
 
 
+def _maintenance_line(report: dict[str, Any]) -> dict[str, Any]:
+    """What a reader of `state()` needs from a pass: that it ran, and what it did."""
+    proactive = report.get("proactive") or {}
+    return {"ok": bool(report.get("ok")), "at": report.get("at"),
+            "prepared": proactive.get("prepared"),
+            "deferred": proactive.get("deferred"),
+            "suppressed": proactive.get("suppressed")}
+
+
 class Ticker:
     """The pass on a period, in the process that owns the memory.
 
@@ -298,17 +307,26 @@ class Ticker:
     it stops when told: the sleep is interruptible, so a unit being reloaded does not wait
     on a period it has already been asked to leave.
     """
-
     # A restart should not have to wait a full period to deliver what came due while the
     # process was down, and should not race the startup either.
     FIRST_DELAY_S = 15.0
 
     def __init__(self, *, runner: Callable[[], dict[str, Any]], interval_s: float,
-                 first_delay_s: float | None = None):
+                 first_delay_s: float | None = None, name: str = "hermes-memory-maintenance",
+                 summarize: Callable[[dict[str, Any]], dict[str, Any]] | None = None):
+        """A loop that is not the maintenance pass names itself and how to describe a run.
+
+        ``name`` matters because a thread that lies in a stack trace is worse than no
+        thread: a delivery loop shown as `maintenance` sends people looking at the wrong
+        code. ``summarize`` is the same problem one level down — the line kept for whoever
+        asks is shaped by what the run returns, and only the pass knows that.
+        """
         if not isinstance(interval_s, (int, float)) or not 0 <= float(interval_s) <= 86_400:
             raise EvidenceError("the maintenance interval must be between 0 and 86400 seconds")
         self.runner = runner
         self.interval_s = float(interval_s)
+        self.name = str(name)
+        self._summarize = summarize or _maintenance_line
         self.first_delay_s = float(first_delay_s if first_delay_s is not None else
                                    min(Ticker.FIRST_DELAY_S, self.interval_s))
         self._stop = threading.Event()
@@ -324,8 +342,7 @@ class Ticker:
         if self._thread is not None and self._thread.is_alive():
             return self
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run,
-                                        name="hermes-memory-maintenance", daemon=True)
+        self._thread = threading.Thread(target=self._run, name=self.name, daemon=True)
         self._thread.start()
         return self
 
@@ -346,11 +363,7 @@ class Ticker:
             self.last = {"ok": False, "error": f"{type(error).__name__}: {str(error)[:200]}"}
             return self.last
         self.passes += 1
-        proactive = report.get("proactive") or {}
-        self.last = {"ok": bool(report.get("ok")), "at": report.get("at"),
-                     "prepared": proactive.get("prepared"),
-                     "deferred": proactive.get("deferred"),
-                     "suppressed": proactive.get("suppressed")}
+        self.last = self._summarize(report)
         return self.last
 
     def stop(self, *, timeout: float = 5.0) -> dict[str, Any]:

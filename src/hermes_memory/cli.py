@@ -2104,16 +2104,17 @@ def _delivery_target(settings, *, hermes_home: str | None, profile: str | None):
 
 
 def _deliver_command(settings, args) -> int:
-    """The outbox's only caller: take what is ready, hand it over, record what came back.
+    """The outbox's hand door: take what is ready, hand it over, record what came back.
 
     The pass that decides a reminder is due deliberately does not send it — that decision
-    spends nothing and runs unattended, and a transport is not nothing. So the artifact
-    waits in the outbox until somebody runs this, and what it reports is the receipt the
-    transport actually gave, not an assumption that a file appearing means it was read.
+    spends nothing and runs unattended, and a transport is not nothing. The sending has a
+    timer of its own in the runtime unit, which is what makes a reminder arrive without
+    anybody typing this; the door stays because an owner sometimes wants the next artifact
+    out *now*, and because what it reports is the receipt the transport actually gave, not
+    an assumption that a file appearing means it was read.
     """
     from .install.profiles import InstallationError
-    from .proactive.delivery import (DeliveryPolicy, command_sink, deliver_ready,
-                                     local_sink)
+    from .proactive.delivery import DeliveryPolicy, deliver_ready, sink_for
 
     try:
         scoped, home, profile = _delivery_target(settings, hermes_home=args.hermes_home,
@@ -2122,24 +2123,20 @@ def _deliver_command(settings, args) -> int:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     policy = DeliveryPolicy.from_settings(scoped)
-    local = str(policy.destination or "").lower().startswith("local:")
+    try:
+        sink, transport = sink_for(scoped, home)
+    except ValueError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     # Writing a file and calling it the telegram message the owner asked to be sent is the
     # one report worse than not sending — but only once a send is actually authorized. With
     # delivery switched off the honest answer is the policy's own reason, not a complaint
     # about a transport nobody is asking for.
-    if policy.refusal() is None and not scoped.delivery_command and not local:
-        print(f"refused: {policy.destination!r} is not a local destination and no "
+    if sink is None and policy.refusal() is None:
+        print(f"refused: {policy.destination!r} names no local destination and no "
               "HERMES_MEMORY_DELIVERY_COMMAND names a program that speaks it; the host's "
               "own bridge is the other caller, and this command will not write a file and "
               "call it the message you asked to be sent", file=sys.stderr)
-        return 2
-    try:
-        sink = (command_sink(scoped.delivery_command, destination=policy.destination)
-                if scoped.delivery_command else local_sink(home))
-        transport = (" ".join(scoped.delivery_command) if scoped.delivery_command
-                     else str(home / "memory" / "delivered"))
-    except ValueError as error:
-        print(f"refused: {error}", file=sys.stderr)
         return 2
     try:
         with EvidenceStore(scoped.db_path) as store:

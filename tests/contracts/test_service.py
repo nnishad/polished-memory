@@ -545,6 +545,125 @@ def test_a_process_that_is_leaving_takes_its_scheduler_with_it(settings):
     assert ticker.state()["running"] is False
 
 
+# -- the drain that reaches a transport -----------------------------------------
+
+def sending(tmp_path, monkeypatch, **extra):
+    """An installation whose owner said *send, and this often*."""
+    base = dict(DELIVERY_ENABLED="true", DELIVERY_TARGET=f"local:{OWNER}",
+                DELIVERY_POLL_S="60")
+    base.update(extra)
+    for name in ROUTES:
+        monkeypatch.delenv(f"HERMES_MEMORY_ROUTE_CREDENTIAL_{name.upper()}", raising=False)
+    return installed(tmp_path / "sending", monkeypatch, **base)
+
+
+def test_the_drain_loop_this_configuration_entitles_names_itself(tmp_path, monkeypatch):
+    """A thread that lies in a stack trace is worse than no thread.
+
+    `hermes-memory-maintenance` for a loop that touches a transport would send whoever read
+    the trace to the code that is forbidden from doing exactly that.
+    """
+    from hermes_memory.service import _delivery_loop
+
+    loop, line = _delivery_loop(sending(tmp_path, monkeypatch))
+    assert loop.name == "hermes-memory-delivery"
+    assert line == {"scheduled": True, "interval_s": 60}
+
+
+def test_no_transport_is_started_on_an_installation_that_never_switched_delivery_on(
+        settings):
+    """The consent half of the timer: an unconfigured owner means no thread at all.
+
+    The pass above the drain prepares artifacts and touches no transport; a drain started by
+    a process with no approved destination would be the framework messaging a person on an
+    opinion it formed itself.
+    """
+    from hermes_memory.processing.maintenance import Ticker
+
+    calls: list[int] = []
+    loop = Ticker(runner=lambda: (calls.append(1), {"ok": True})[1], interval_s=0.02,
+                  first_delay_s=0.0)
+    printed = announced_by(
+        lambda report: serve(settings, upstream=boom, host="127.0.0.1", port=0,
+                             report=report, delivery=loop))
+
+    assert printed[0]["delivery"]["scheduled"] is False
+    assert printed[0]["delivery"]["running"] is False
+    assert "switched off" in printed[0]["delivery"]["reason"]
+    time.sleep(0.15)
+    assert calls == [], "a drain ran where delivery was never approved"
+
+
+def test_a_zero_poll_hands_the_sending_back_without_starting_a_thread(tmp_path,
+                                                                     monkeypatch):
+    from hermes_memory.processing.maintenance import Ticker
+
+    calls: list[int] = []
+    loop = Ticker(runner=lambda: (calls.append(1), {"ok": True})[1], interval_s=0.02,
+                  first_delay_s=0.0)
+    printed = announced_by(
+        lambda report: serve(sending(tmp_path, monkeypatch, DELIVERY_POLL_S="0"),
+                             upstream=boom, host="127.0.0.1", port=0, report=report,
+                             delivery=loop))
+
+    assert printed[0]["delivery"]["scheduled"] is False
+    assert "DELIVERY_POLL_S=0" in printed[0]["delivery"]["reason"]
+    time.sleep(0.15)
+    assert calls == []
+
+
+def test_the_drain_sends_on_the_period_the_owner_configured(tmp_path, monkeypatch):
+    """A reminder that only arrives when somebody types the command is not delivered."""
+    from hermes_memory.processing.maintenance import Ticker
+    from hermes_memory.proactive.delivery import drain_line
+
+    calls: list[int] = []
+    loop = Ticker(runner=lambda: (calls.append(1),
+                                  {"ok": True, "at": "now", "delivered": 1,
+                                   "profiles": [{"profile": "work", "delivered": 1,
+                                                 "reason": "sent"}]})[1],
+                  interval_s=0.02, first_delay_s=0.0, name="hermes-memory-delivery",
+                  summarize=drain_line)
+    printed = announced_by(
+        lambda report: serve(sending(tmp_path, monkeypatch), upstream=boom,
+                             host="127.0.0.1", port=0, report=report, delivery=loop))
+
+    assert printed[0]["delivery"]["scheduled"] is True
+    assert printed[0]["delivery"]["running"] is True
+    deadline = time.monotonic() + 5
+    while len(calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(calls) >= 2, "the process was up and nothing was ever drained"
+    # The line a reader of `status` sees is the drain's own shape: how many left, and which
+    # memory they left from.
+    assert loop.state()["last"]["delivered"] == 1
+    assert loop.state()["last"]["profiles"] == [{"profile": "work", "delivered": 1,
+                                                 "reason": "sent"}]
+    loop.stop()
+
+
+def test_a_drain_that_raises_is_counted_and_the_service_stays_up(tmp_path, monkeypatch):
+    """A transport vanishing must not take the memory process down with it."""
+    from hermes_memory.processing.maintenance import Ticker
+
+    def gone():
+        raise RuntimeError("the transport program is gone")
+
+    loop = Ticker(runner=gone, interval_s=0.02, first_delay_s=0.0,
+                  name="hermes-memory-delivery")
+    printed = announced_by(
+        lambda report: serve(sending(tmp_path, monkeypatch), upstream=boom,
+                             host="127.0.0.1", port=0, report=report, delivery=loop))
+
+    deadline = time.monotonic() + 5
+    while loop.state()["failures"] < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert loop.state()["failures"] >= 1, printed
+    assert loop.state()["running"] is True, "the drain died on the first bad transport"
+    assert loop.state()["last"]["ok"] is False
+    loop.stop()
+
+
 def test_the_queue_the_owner_configures_is_the_queue_requests_get(tmp_path, monkeypatch):
     """A setting nobody passes on is a knob that does nothing.
 

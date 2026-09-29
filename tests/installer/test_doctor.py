@@ -450,9 +450,37 @@ def test_an_unproven_send_is_a_failure(store):
 def test_artifacts_that_aged_out_unsent_indicate_a_transport_that_stopped(store):
     _handoff(store)
     store.db.execute("UPDATE outbox SET expires_at='2000-01-01T00:00:00+00:00'")
+    draining = Doctor(store, settings=configured(delivery_enabled=True, delivery_poll_s=60),
+                     backend=Tripwire())
+    finding = draining.delivery()
+    assert finding.severity == FAIL
+    assert "scheduled to drain the outbox and has not" in finding.remedy
+
+
+def test_an_aged_out_artifact_with_nothing_scheduled_names_the_door_not_the_unit(store):
+    """Two reasons an outbox goes unsent, and only one of them is a broken runtime.
+
+    An installation whose owner kept the timer needs `hermes-memory deliver`, not a
+    systemctl lecture — and the doctor tells them apart because the configuration, not a
+    guess, decides which remedy is true.
+    """
+    _handoff(store)
+    store.db.execute("UPDATE outbox SET expires_at='2000-01-01T00:00:00+00:00'")
     finding = Doctor(store).delivery()
     assert finding.severity == FAIL
-    assert "not claiming the outbox" in finding.remedy
+    assert "switched off" in finding.remedy and "hermes-memory deliver" in finding.remedy
+    assert "systemctl" not in finding.remedy
+
+
+def test_artifacts_prepared_past_three_drain_periods_are_a_warning(store):
+    """Not a failure: nothing was lost. But the loop that owns them is not running."""
+    _handoff(store)
+    store.db.execute("UPDATE outbox SET state='prepared', created_at="
+                     "'2000-01-01T00:00:00+00:00'")
+    draining = Doctor(store, settings=configured(delivery_enabled=True, delivery_poll_s=60))
+    finding = draining.delivery()
+    assert finding.severity == WARN
+    assert "prepared and unsent" in finding.detail
 
 
 def test_a_proactivity_pause_is_reported_as_a_decision_in_force(store, sync):

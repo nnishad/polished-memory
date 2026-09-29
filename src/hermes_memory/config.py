@@ -43,6 +43,13 @@ DEFAULT_FOREGROUND_DEADLINE_S = 4.0
 DEFAULT_EVALUATOR_TIMEOUT_S = 120.0
 DEFAULT_MAINTENANCE_INTERVAL_S = 900
 MAX_MAINTENANCE_INTERVAL_S = 86_400
+# How often the runtime drains what the background pass prepared. A minute, because a
+# reminder that said "at nine" means nine and not "somewhere before the next quarter
+# hour"; the drain itself is one indexed read when nothing is ready, so asking often costs
+# nothing. The ceiling is an hour: a queue drained slower than that is a queue the owner
+# might as well drain by hand, which is what DELIVERY_POLL_S=0 is for.
+DEFAULT_DELIVERY_POLL_S = 60
+MAX_DELIVERY_POLL_S = 3_600
 # How long a background request may wait for a physical model that one other caller holds.
 # One slot per device means the device is serialised, not that its callers are turned away:
 # the engine presents several sub-calls of one operation at a time, each within its own
@@ -69,21 +76,33 @@ def _gate_queue(value: str | None) -> float:
     return seconds
 
 
-def _maintenance_interval(value: str | None) -> int:
-    """The scheduler's own period, or zero for "nothing runs by itself here"."""
+def _period(value: str | None, env: str, limit: int, zero_note: str) -> int:
+    """A loop's period: whole seconds, or zero for "nothing runs by itself here".
+
+    Both schedulers answer to the same shape of refusal. A period that cannot be meant —
+    negative, absurd, or not a number at all — is the owner's typo, and guessing one would
+    put a transport on a timer nobody asked for.
+    """
     try:
         seconds = int(str(value).strip())
     except (TypeError, ValueError):
+        raise SettingError(f"{env} must be a whole number of seconds, got {value!r}") from None
+    if not 0 <= seconds <= limit:
         raise SettingError(
-            "HERMES_MEMORY_MAINTENANCE_INTERVAL_S must be a whole number of seconds, "
-            f"got {value!r}"
-        ) from None
-    if not 0 <= seconds <= MAX_MAINTENANCE_INTERVAL_S:
-        raise SettingError(
-            f"HERMES_MEMORY_MAINTENANCE_INTERVAL_S={value} is outside the admissible range "
-            f"(0 to {MAX_MAINTENANCE_INTERVAL_S}); 0 means the pass never runs unattended"
+            f"{env}={value} is outside the admissible range (0 to {limit}); {zero_note}"
         )
     return seconds
+
+
+def _maintenance_interval(value: str | None) -> int:
+    """The scheduler's own period, or zero for "nothing runs by itself here"."""
+    return _period(value, "HERMES_MEMORY_MAINTENANCE_INTERVAL_S", MAX_MAINTENANCE_INTERVAL_S,
+                   "0 means the pass never runs unattended")
+
+
+def _delivery_poll(value: str | None) -> int:
+    return _period(value, "HERMES_MEMORY_DELIVERY_POLL_S", MAX_DELIVERY_POLL_S,
+                   "0 means the runtime never hands anything to a transport by itself")
 
 
 def _deadline(value: str | None) -> float:
@@ -225,6 +244,11 @@ class Settings:
     # is for. Unset means the only thing a drain can do is write the artifact into the
     # owner's own home, where nobody is interrupted by it.
     delivery_command: tuple[str, ...] = ()
+    # How often the runtime unit drains the outbox on its own. The background pass only
+    # *prepares* artifacts; this is the timer that sends them, and it is a separate setting
+    # because it is the one that touches a transport. Zero means the owner runs
+    # `hermes-memory deliver` themselves.
+    delivery_poll_s: int = DEFAULT_DELIVERY_POLL_S
     # The runtime unit owns the background pass, per §4: proactive state and scheduling
     # live in the framework process, not in a fourth unit. Zero hands the timer back to
     # the owner, who then runs `hermes-memory maintain` from wherever they choose.
@@ -343,6 +367,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
     delivery_target = (get("DELIVERY_TARGET") or "").strip() or None
     delivery_enabled = flag("DELIVERY_ENABLED")
     delivery_command = _command(get, "DELIVERY_COMMAND")
+    delivery_poll = _delivery_poll(get("DELIVERY_POLL_S", str(DEFAULT_DELIVERY_POLL_S)))
     if delivery_enabled and not delivery_target:
         raise SettingError(
             "HERMES_MEMORY_DELIVERY_ENABLED needs HERMES_MEMORY_DELIVERY_TARGET: an "
@@ -380,6 +405,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         delivery_enabled=delivery_enabled,
         delivery_target=delivery_target,
         delivery_command=delivery_command,
+        delivery_poll_s=delivery_poll,
         maintenance_interval_s=interval,
         evaluator_command=_command(get, "EVALUATOR_COMMAND"),
         evaluator_timeout_s=_seconds(get, "EVALUATOR_TIMEOUT_S", DEFAULT_EVALUATOR_TIMEOUT_S),

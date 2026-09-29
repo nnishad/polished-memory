@@ -172,10 +172,13 @@ hours and the daily cap are counted in a local day, and a reminder that arrives 
 hour is the harm this switch exists to authorize once, carefully. `--switch-delivery off`
 puts it back and asks for no clock, because nothing is being timed. Switching it on is not
 the same as sending: the pass that finds a reminder due deliberately does not hand anything
-to a transport, so `hermes-memory deliver --hermes-home ~/.hermes` is the one caller that
-drains the outbox, and an installation that never runs it will have a policy that allows
-delivery and an outbox that stays full. `status` reports the
-stage `unconfigured` while the switch is off and names this command beside it, so an empty
+to a transport. The sending is a second timer in the runtime unit,
+`HERMES_MEMORY_DELIVERY_POLL_S` (60 seconds by default), which drains every enrolled
+profile's outbox through the transport the owner named; `0` hands it back, and then
+`hermes-memory deliver --hermes-home ~/.hermes` is the only way an artifact ever leaves —
+an installation that switches delivery on, sets the poll to zero and never runs the command
+has a policy that allows delivery and an outbox that stays full. `status` reports the stage
+`unconfigured` while the switch is off and names this command beside it, so an empty
 outbox says which of the two silences it is. A release record also carries the instant it was
 staged, so a hold
 written before that instant is reported as possibly a decision about the machine this release
@@ -382,7 +385,10 @@ unclaimable, and what an erasure owed the derived backend was counted but never 
 `maintain` is the pass
 that runs them, and the runtime unit runs it on a period
 (`HERMES_MEMORY_MAINTENANCE_INTERVAL_S`, 900 seconds by default, `0` to hand the timer back to
-you).
+you). It prepares and never sends: the artifact it leaves in the outbox is picked up by the
+unit's other timer, `HERMES_MEMORY_DELIVERY_POLL_S`, which is the only loop in this process
+that touches a transport and the only one that starts on the owner's configuration rather
+than on the pass's schedule.
 
 The `erasure` section is the one that reaches outside the process, and it does so only on an
 owner's already-given instruction: a confirmed forgetting *is* the authorization to delete the
@@ -433,6 +439,15 @@ have eaten every reminder on a new installation before anyone had agreed to be i
 `status` reports the pass as `background_pass` (the last one recorded, its age, what is
 waiting) and `doctor` checks it as `background`, because a dead scheduler is indistinguishable
 from a machine with nothing to do unless the pass writes down that it ran.
+
+The drain beside it is reported as `delivery_loop` and checked under `delivery`. It keeps a
+different kind of evidence on purpose: a drain that found nothing to send writes no line,
+because 1440 identical no-ops a day would bury the audit and prove no more than the one line
+that is written instead — each *change* in the story, so the first quiet drain, the first that
+sent something, and the first that met an error. What tells a stalled loop from an idle one is
+the backlog: an artifact still `prepared` after three periods is the failure, and `status` and
+`doctor` both say so, naming whether the reason is that the switch is off, that the poll is
+`0`, or that a loop scheduled to send is not sending.
 
 The heartbeat carries a failure too. The sections run in order, so a raise halfway through
 would leave nothing recorded and the loop would report exactly like one that stopped — which
@@ -848,7 +863,7 @@ share, so no surface can talk to a memory it was not bound to.
 | `POST /v1/feedback` | outcome log behind `owner --confirm-lesson / --contradict-lesson / --retract-lesson` | owner, with the receipt it cites |
 | `POST /v1/forget-requests` | provider `memory_forget_request` — preview and impact manifest, erases nothing | scoped agent |
 | `POST /v1/owner/forget-confirmations` | `owner --confirm-forgetting --digest …` — the fence plus a durable obligation | owner only |
-| `hermes-memory deliver` — a command, not a route | the outbox's only caller: one bounded drain, with lease and attempt correlation and the receipt the transport actually gave | this installation's own scheduler |
+| `hermes-memory deliver` — a command, not a route | the outbox's hand door: one bounded drain, with lease and attempt correlation and the receipt the transport actually gave. The runtime unit runs the same drain on its own timer (`HERMES_MEMORY_DELIVERY_POLL_S`); this is for the moment you want it sent now | this installation's own scheduler, or you |
 | `POST /v1/owner/controls` | `pause` / `start` / `stop`, with actor and policy version recorded | owner only |
 | `GET /v1/jobs/{id}` | `form`, `maintain`, `cancel --job`, and the queue stage of `status` | scoped agent, operator |
 
@@ -870,8 +885,10 @@ is in the stores and the broker, not in whichever transport reaches them.
   the point: it runs by itself precisely because it dispatches no inference — it reports the
   queue's age and what is ready to retry, and claims none of it.
 - **The background pass does not deliver anything.** It prepares artifacts into the outbox.
-  A transport claiming them is the host's decision, and the queue sitting unread is a normal
-  state, reported as one.
+  The sending is a separate timer in the same process, and it starts only where the owner's
+  own configuration names both a destination and a period — so the pass keeps the rule that it
+  touches no transport, and the transport is still not something the framework has on its own.
+  A queue sitting unread is a normal state, reported as one.
 - **Guarded delivery is not available yet.** The host facts report
   `guarded_delivery_supported: false` until the host change (H1, §9.5) lands, because a
   pre-dispatch revocation check cannot be performed by a framework that is not consulted at

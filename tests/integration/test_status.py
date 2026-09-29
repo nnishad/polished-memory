@@ -669,8 +669,11 @@ def test_an_artifact_waiting_on_a_transport_is_reported_as_work_in_flight(store)
     report = StatusReporter(store).delivery()
     assert report.state == OPERATIONAL
     assert report.evidence["in_flight"] == 1
-    assert any("has not claimed" in note for note in StatusReporter(store).report()
-               ["notes"])
+    # The note names the drain that owns the artifact, because "the host has not claimed
+    # it" sends the reader to another machine: on this one the runtime drains its own outbox,
+    # and this installation has no drain switched on.
+    assert any("prepared and unsent" in note and "hermes-memory deliver" in note
+               for note in StatusReporter(store).report()["notes"])
 
 
 def test_an_artifact_sent_without_a_proof_stays_unresolved(store):
