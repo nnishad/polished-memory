@@ -75,6 +75,23 @@ def allowed(destination="local:jugaadu"):
 
 # -- the drain -----------------------------------------------------------------
 
+def test_a_drain_that_sent_something_leads_its_reason_with_that(store, queue, tmp_path):
+    """The reason is what reaches the audit line, weeks before anybody reads it in person.
+
+    A productive drain ends on an empty queue, so the last report's reason is "nothing is
+    ready" — and a record that led with that would read as an idle poll that happened to
+    message somebody.
+    """
+    queue()
+
+    report = deliver_ready(store, policy=allowed(), sink=local_sink(tmp_path), limit=3,
+                           at=EPOCH)
+
+    assert report["delivered"] == 1
+    assert report["reason"].startswith("1 artifact(s) reached the transport")
+    assert "nothing is ready" in report["reason"]
+
+
 def test_a_ready_artifact_leaves_and_is_recorded_as_having_left(store, queue, tmp_path):
     identifier = queue()
     home = tmp_path / "homes" / "default"
@@ -489,7 +506,9 @@ def test_the_installed_drain_sends_what_the_pass_prepared(installed, monkeypatch
         assert [item["profile"] for item in outcome["profiles"]] == ["work"]
         assert store.db.execute("SELECT state FROM outbox WHERE id=?",
                                 (identifier,)).fetchone()[0] == "accepted_unverified"
-        assert last_drain(store)["delivered"] == 1
+        recorded = last_drain(store)
+        assert recorded["delivered"] == 1
+        assert "1 artifact(s) reached the transport" in recorded["reason"]
     assert len(list((installed / "memory" / "delivered").glob("*.md"))) == 1
 
 

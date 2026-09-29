@@ -223,9 +223,14 @@ def deliver_ready(store, *, policy: DeliveryPolicy,
         # the same run: the queue is empty, or this one is refused.
         if not report.get("attempted"):
             break
+    sent = sum(1 for item in reports if item.get("delivered"))
+    # The last report explains why the run stopped, which on a productive drain is "the queue
+    # is now empty" — and a record that led with that would read as though nothing had been
+    # sent at all. Say what went out first, then why it stopped.
+    tail = reports[-1].get("reason") if reports else "nothing was tried"
     return {"ok": all(item.get("ok") for item in reports),
-            "delivered": sum(1 for item in reports if item.get("delivered")),
-            "reason": reports[-1].get("reason") if reports else "nothing was tried",
+            "delivered": sent,
+            "reason": f"{sent} artifact(s) reached the transport; {tail}" if sent else tail,
             "reports": reports}
 
 
