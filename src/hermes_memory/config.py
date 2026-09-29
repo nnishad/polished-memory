@@ -220,6 +220,11 @@ class Settings:
     # destination. Nothing else can authorise it, and no default is "on".
     delivery_enabled: bool = False
     delivery_target: str | None = None
+    # The program that puts a message in front of the owner: argv, no shell, scrubbed
+    # environment, same rule as the evaluator. `hermes send -t telegram:…` is what this
+    # is for. Unset means the only thing a drain can do is write the artifact into the
+    # owner's own home, where nobody is interrupted by it.
+    delivery_command: tuple[str, ...] = ()
     # The runtime unit owns the background pass, per §4: proactive state and scheduling
     # live in the framework process, not in a fourth unit. Zero hands the timer back to
     # the owner, who then runs `hermes-memory maintain` from wherever they choose.
@@ -337,12 +342,16 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
                                          str(DEFAULT_MAINTENANCE_INTERVAL_S)))
     delivery_target = (get("DELIVERY_TARGET") or "").strip() or None
     delivery_enabled = flag("DELIVERY_ENABLED")
+    delivery_command = _command(get, "DELIVERY_COMMAND")
     if delivery_enabled and not delivery_target:
         raise SettingError(
             "HERMES_MEMORY_DELIVERY_ENABLED needs HERMES_MEMORY_DELIVERY_TARGET: an "
             "approved destination is what makes delivery an owner's decision rather "
             "than a capability the runtime has on its own"
         )
+    # A target with no command here is not a contradiction: the host can carry the message
+    # itself, and does — the plugin hands `deliver_for_home` its own sink. Only the
+    # standalone `deliver` command needs a program, and it is the one that says so.
 
     return Settings(
         home=home,
@@ -370,6 +379,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         gate_token=(get("GATE_TOKEN") or "").strip() or None,
         delivery_enabled=delivery_enabled,
         delivery_target=delivery_target,
+        delivery_command=delivery_command,
         maintenance_interval_s=interval,
         evaluator_command=_command(get, "EVALUATOR_COMMAND"),
         evaluator_timeout_s=_seconds(get, "EVALUATOR_TIMEOUT_S", DEFAULT_EVALUATOR_TIMEOUT_S),

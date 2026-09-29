@@ -14,7 +14,7 @@ import json
 import pytest
 
 from hermes_memory.ids import timestamp
-from hermes_memory.proactive.delivery import (DeliveryPolicy, bounded_drain,
+from hermes_memory.proactive.delivery import (DeliveryPolicy, bounded_drain, command_sink,
                                               deliver_ready, local_sink)
 from hermes_memory.proactive.outbox import Outbox
 from hermes_memory.proactive.policy import POLICY_VERSION, AttentionPolicy
@@ -130,6 +130,104 @@ def test_a_transport_that_dies_mid_send_is_uncertain_and_not_replayed(store, que
         f"{identifier} was already handed over once; a second copy is the worse failure"
 
 
+# -- a transport that is another program ---------------------------------------
+
+def a_transport(tmp_path, body: str) -> str:
+    """Write a transport program and hand back the argv that runs it."""
+    script = tmp_path / "transport.py"
+    script.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_a_transport_that_reads_the_correlation_back_proves_the_send(store, queue,
+                                                                     tmp_path):
+    """The one receipt that earns `confirmed` without knowing the digest out of band."""
+    queue()
+    command = a_transport(tmp_path, """
+import json, sys
+body = sys.stdin.read()
+print(json.dumps({"success": True, "platform": "telegram", "chat_id": "787655730",
+                  "message_id": 42, "echo": body.splitlines()[0]}))
+""")
+
+    report = deliver_ready(store, policy=allowed("telegram:787655730"),
+                           sink=command_sink([command], destination="telegram:787655730"),
+                           limit=1, at=EPOCH)
+
+    assert report["reports"][0]["state"] == "confirmed", report
+    proof = json.loads(store.db.execute("SELECT proof FROM outbox").fetchone()[0])
+    assert proof["message_id"] == 42 and proof["chat_id"] == "787655730", \
+        "the transport's own answer is stored beside the artifact, not thrown away"
+    assert store.db.execute("SELECT state FROM outbox").fetchone()[0] == "confirmed"
+
+
+def test_a_transport_that_only_says_sent_is_believed_as_far_as_it_says(store, queue,
+                                                                       tmp_path):
+    queue()
+    command = a_transport(tmp_path, """
+import json, sys
+sys.stdin.read()
+print(json.dumps({"success": True, "platform": "telegram", "chat_id": "787655730",
+                  "message_id": 43}))
+""")
+
+    report = deliver_ready(store, policy=allowed("telegram:787655730"),
+                           sink=command_sink([command], destination="telegram:787655730"),
+                           limit=1, at=EPOCH)
+
+    assert report["reports"][0]["state"] == "accepted_unverified"
+    assert report["delivered"] == 1, "it did go out; nobody proved the owner was shown it"
+
+
+def test_a_transport_that_messaged_somebody_else_is_not_a_delivery(store, queue,
+                                                                    tmp_path):
+    """The approved destination is checked against where the program says it actually went."""
+    queue()
+    command = a_transport(tmp_path, """
+import json, sys
+sys.stdin.read()
+print(json.dumps({"success": True, "chat_id": "999999999"}))
+""")
+
+    report = deliver_ready(store, policy=allowed("telegram:787655730"),
+                           sink=command_sink([command], destination="telegram:787655730"),
+                           limit=1, at=EPOCH)
+
+    assert report["delivered"] == 0
+    assert report["reports"][0]["state"] == "uncertain", \
+        "bytes left this machine toward a stranger's chat; that is not retryable quietly"
+    assert "not the approved destination" in store.db.execute(
+        "SELECT reason FROM outbox").fetchone()[0]
+
+
+def test_a_transport_program_that_does_not_exist_is_refused_before_anything_is_leased(
+        store, queue):
+    """A misspelled command must not spend the owner's reminders as `uncertain`."""
+    queue()
+    with pytest.raises(ValueError, match="not a program this installation can run"):
+        command_sink(["/no/such/hermes-send"], destination="telegram:787655730")
+    assert store.db.execute("SELECT state FROM outbox").fetchone()[0] == "prepared"
+
+
+def test_a_failing_transport_leaves_the_artifact_uncertain_and_says_the_exit(store, queue,
+                                                                             tmp_path):
+    queue()
+    command = a_transport(tmp_path, """
+import sys
+sys.stderr.write("bot token rejected\\n")
+sys.exit(1)
+""")
+
+    report = deliver_ready(store, policy=allowed("telegram:787655730"),
+                           sink=command_sink([command], destination="telegram:787655730"),
+                           limit=1, at=EPOCH)
+
+    assert report["delivered"] == 0
+    assert report["reports"][0]["state"] == "uncertain"
+    assert "exited 1" in store.db.execute("SELECT reason FROM outbox").fetchone()[0]
+
+
 # -- what refuses --------------------------------------------------------------
 
 def test_an_installation_with_no_destination_says_why_rather_than_showing_an_empty_queue(
@@ -226,6 +324,17 @@ def test_the_door_reports_the_transport_it_would_have_used(installed):
     assert report["profile"] == "work" and report["delivered"] == 0
     assert "disabled by default" in report["reason"]
     assert report["transport"] == str(installed / "memory" / "delivered")
+
+
+def test_the_door_refuses_to_write_a_file_and_call_it_a_telegram_message(installed,
+                                                                         monkeypatch):
+    """A destination that needs a transport, and no transport named, is not a send."""
+    from hermes_memory.cli import main
+
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_ENABLED", "true")
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_TARGET", "telegram:787655730")
+    code, message = _errors(main, "deliver", "--hermes-home", str(installed))
+    assert code == 2 and "HERMES_MEMORY_DELIVERY_COMMAND" in message
 
 
 def _run(main, *argv):

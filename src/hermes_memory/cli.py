@@ -2112,7 +2112,8 @@ def _deliver_command(settings, args) -> int:
     transport actually gave, not an assumption that a file appearing means it was read.
     """
     from .install.profiles import InstallationError
-    from .proactive.delivery import DeliveryPolicy, deliver_ready, local_sink
+    from .proactive.delivery import (DeliveryPolicy, command_sink, deliver_ready,
+                                     local_sink)
 
     try:
         scoped, home, profile = _delivery_target(settings, hermes_home=args.hermes_home,
@@ -2121,19 +2122,41 @@ def _deliver_command(settings, args) -> int:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     policy = DeliveryPolicy.from_settings(scoped)
+    local = str(policy.destination or "").lower().startswith("local:")
+    # Writing a file and calling it the telegram message the owner asked to be sent is the
+    # one report worse than not sending — but only once a send is actually authorized. With
+    # delivery switched off the honest answer is the policy's own reason, not a complaint
+    # about a transport nobody is asking for.
+    if policy.refusal() is None and not scoped.delivery_command and not local:
+        print(f"refused: {policy.destination!r} is not a local destination and no "
+              "HERMES_MEMORY_DELIVERY_COMMAND names a program that speaks it; the host's "
+              "own bridge is the other caller, and this command will not write a file and "
+              "call it the message you asked to be sent", file=sys.stderr)
+        return 2
+    try:
+        sink = (command_sink(scoped.delivery_command, destination=policy.destination)
+                if scoped.delivery_command else local_sink(home))
+        transport = (" ".join(scoped.delivery_command) if scoped.delivery_command
+                     else str(home / "memory" / "delivered"))
+    except ValueError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     try:
         with EvidenceStore(scoped.db_path) as store:
             held = ("delivery is paused for this installation by the owner"
                     if store.stage_is_paused("global", "delivery") else None)
-            report = deliver_ready(store, policy=policy, sink=local_sink(home),
+            report = deliver_ready(store, policy=policy, sink=sink,
                                    limit=args.limit, held=held)
     except (EvidenceError, ValueError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
-    return _emit({"ok": report["ok"], "profile": profile,
-                  "target": policy.destination,
-                  "transport": str(home / "memory" / "delivered"), **report},
-                 0 if report["ok"] else 2)
+    # A send that left and came back unproven is not a failure of this command: retrying
+    # it would be the duplicate the state machine exists to prevent. Only a handover that
+    # did not result in a message is an error a caller should hear about.
+    failed = [item for item in report["reports"]
+              if item.get("attempted") and not item.get("delivered")]
+    return _emit({"ok": not failed, "profile": profile, "target": policy.destination,
+                  "transport": transport, **report}, 2 if failed else 0)
 
 
 # The stop door. Unlike the background pass this one names a person: a cancelled job is a

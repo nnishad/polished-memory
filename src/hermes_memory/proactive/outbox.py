@@ -485,6 +485,18 @@ def _receipt(proof: Any, artifact: Artifact) -> tuple[str, str]:
             return "confirmed", "the host echoed this artifact's own digest back"
         return "uncertain", ("the host reported a send for a different digest, so something "
                              "reached the owner that is not this artifact")
+    if (isinstance(proof, dict) and proof.get("correlation") and proof.get("verified")):
+        # A transport that read the message back off its own wire and found this artifact's
+        # correlation in it. The claim of read-back is what earns the difference: an echo of
+        # the bytes it was handed proves the transport got them, not that anyone was shown
+        # them, so without `verified` this falls through to accepted_unverified below.
+        parts = str(proof["correlation"]).split()
+        if (len(parts) == 3 and parts[0] == "hermes-memory" and parts[1] == artifact.id
+                and artifact.payload_digest.startswith(parts[2])):
+            return "confirmed", ("the transport read this artifact's own correlation back "
+                                 "from what it sent")
+        return "uncertain", ("the correlation the transport read back is not this artifact's, "
+                             "so something else reached the owner")
     if isinstance(proof, dict) and proof.get("sent") is True:
         return "accepted_unverified", ("the host says it sent this and gave nothing to check "
                                        "it against")

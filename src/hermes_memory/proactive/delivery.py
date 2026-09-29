@@ -17,17 +17,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shlex
+import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Sequence, TextIO
 
 from ..ids import digest
 from .outbox import Outbox
 from .policy import AttentionPolicy
 
-__all__ = ["DeliveryPolicy", "bounded_drain", "correlation", "deliver_once",
-           "deliver_ready", "local_sink"]
+__all__ = ["DeliveryPolicy", "bounded_drain", "command_sink", "correlation",
+           "deliver_once", "deliver_ready", "local_sink"]
+
+# What a transport program is allowed to see. `hermes send` finds the gateway's bot
+# credential through HOME, and nothing in this list is a secret the memory process holds.
+_TRANSPORT_ENV = ("PATH", "LANG", "LC_ALL", "HOME", "PYTHONIOENCODING")
 
 # Destinations that are not a private channel to one person. ``bot-chat`` is refused on
 # the plan's own instruction: it creates an inbound agent turn, so "delivering" to it
@@ -241,6 +249,75 @@ def local_sink(hermes_home: str | Path, *, directory: str = "memory/delivered"):
             raise OSError(f"{path} did not read back as written")
         return {"sent": True, "path": str(path), "bytes": len(body.encode("utf-8")),
                 "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+
+    return send
+
+
+def command_sink(command: str | Sequence[str], *, destination: str | None = None,
+                 timeout_s: float = 90.0,
+                 env_extra: Sequence[str] = ()) -> Callable[[str], Any]:
+    """A transport that is somebody else's program: pipe the body in, read its answer out.
+
+    `hermes send -t telegram:<chat-id> --json` is what this exists for. The gateway already
+    holds the bot credential, and a second copy of it in the memory process would be a second
+    way to leak it, so this hands the bytes to a argv — no shell, a scrubbed environment — and
+    then believes only what that program reports back.
+
+    The reported chat is checked against the approved destination. A transport that answers
+    success for somewhere else has messaged a stranger on this installation's name, which is
+    not a delivery to retry quietly; the raise below leaves the artifact uncertain on purpose.
+
+    A command that names no program on disk is refused here, before anything is leased,
+    because a misspelled transport would otherwise mark every reminder the owner ever asked
+    for as uncertain without a single byte going out.
+    """
+    argv = shlex.split(command) if isinstance(command, str) else [str(item) for item in command]
+    argv = [item for item in argv if item.strip()]
+    if not argv:
+        raise ValueError("a delivery command names a program to run")
+    if shutil.which(argv[0]) is None and not Path(argv[0]).expanduser().is_file():
+        raise ValueError(f"{argv[0]!r} is not a program this installation can run")
+    _scheme, _separator, address = (destination or "").partition(":")
+    address = address.strip()
+
+    def send(body: str) -> dict[str, Any]:
+        correlation_line = body.splitlines()[0] if body.strip() else ""
+        finished = subprocess.run(argv, input=body.encode("utf-8"), capture_output=True,
+                                  timeout=timeout_s,
+                                  env={key: os.environ[key] for key in _TRANSPORT_ENV
+                                       if key in os.environ
+                                       and isinstance(os.environ.get(key), str)}
+                                  | {name: os.environ[name] for name in env_extra
+                                     if name.isidentifier()
+                                     and isinstance(os.environ.get(name), str)})
+        text = finished.stdout.decode("utf-8", "replace")
+        if finished.returncode != 0:
+            raise RuntimeError(f"{Path(argv[0]).name} exited {finished.returncode}: "
+                               f"{finished.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        receipt: dict[str, Any] = {"sent": True}
+        try:
+            answered = json.loads(text.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            answered = None
+        if isinstance(answered, dict):
+            reported = str(answered.get("chat_id") or "").strip()
+            if address and reported and reported != address:
+                raise RuntimeError(f"{Path(argv[0]).name} reported sending to {reported!r}, "
+                                   f"which is not the approved destination {address!r}")
+            for key in ("platform", "chat_id", "message_id"):
+                if answered.get(key) is not None:
+                    receipt[key] = answered[key]
+            if not answered.get("success", True):
+                raise RuntimeError(f"{Path(argv[0]).name} said it did not send: "
+                                   f"{str(answered.get('error'))[:200]}")
+        if address and not receipt.get("chat_id"):
+            # Nothing names where it went, so the destination is an assumption. Say that
+            # rather than recording a send to a chat nobody confirmed.
+            receipt["destination_unconfirmed"] = True
+        if correlation_line and correlation_line in text:
+            receipt["correlation"] = correlation_line
+            receipt["verified"] = True
+        return receipt
 
     return send
 
