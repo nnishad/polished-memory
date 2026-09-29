@@ -2778,6 +2778,48 @@ def test_an_agents_proposal_waits_for_the_owner_to_adopt_it(home):
     assert listed()[0]["status"] == "active"
 
 
+def asked_about(goal_id, *, decision="goal-activation", question="Is this promise yours?"):
+    """The same decision, already out on the owner's channel being asked of them."""
+    from hermes_memory.proactive.inquiries import InquiryStore
+
+    settings = load_settings()
+    with EvidenceStore(settings.db_path) as store:
+        inquiries = InquiryStore(store, owner_principal=OWNER)
+        inquiries.allow_replies(actor=OWNER, on=True, reason="a reply on my own channel")
+        return inquiries.ask(decision=decision, subject_id=goal_id, question=question)["id"]
+
+
+def test_a_goal_being_asked_about_is_not_decided_at_the_command_line(home):
+    """This door cannot tell a person from a model that has a shell and read the transcript.
+
+    Live proof: the gateway agent was asked to adopt a goal, never called the answer tool, and
+    ran `hermes-memory goal --activate` on itself with a reply code it made up. The answer
+    settled nothing and the archive read as if it had, which is the one disagreement between
+    these two records this framework is not allowed to have.
+    """
+    assert run("init")[0] == 0
+    goal_id = proposed()
+    inquiry = asked_about(goal_id)
+
+    code, message = errors("goal", "--id", goal_id, "--activate", "--reason",
+                           "owner acknowledged the goal via reply code D8VW3N")
+
+    assert code == 2 and inquiry in message and "asked of the owner" in message
+    assert listed()[0]["status"] == "candidate"
+
+
+def test_a_completion_being_asked_about_is_held_by_the_same_door(home):
+    assert run("init")[0] == 0
+    goal_id = reminded()
+    inquiry = asked_about(goal_id, decision="goal-completion",
+                          question="Did you renew the passport?")
+
+    code, message = errors("goal", "--id", goal_id, "--complete", "--reason", "call it done")
+
+    assert code == 2 and inquiry in message
+    assert listed()[0]["status"] == "active"
+
+
 def test_a_snooze_holds_the_reminder_and_says_until(home):
     assert run("init")[0] == 0
     goal_id = reminded()

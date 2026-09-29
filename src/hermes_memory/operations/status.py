@@ -753,6 +753,10 @@ class StatusReporter:
             "SELECT id, decision, subject_id, question, asked_at, expires_at, state, "
             "next_try_at FROM inquiries WHERE state IN ('open','sent') ORDER BY asked_at, id "
             "LIMIT 8").fetchall()
+        # A question still being asked about a state that has already moved: the decision was
+        # taken somewhere the asking never saw it, which is the one way this ledger can end up
+        # disagreeing with the archive it is supposed to be a reading of.
+        elsewhere = inquiries.settled_elsewhere()
         return {"replies_enabled": allowed, "why": who,
                 "stage": str((self.store.control("global", REPLIES_STAGE) or {}).get("state")
                              or "unset"),
@@ -762,6 +766,10 @@ class StatusReporter:
                 "queued": int(counts.get("open", 0)),
                 "answered": int(counts.get("answered", 0)),
                 "expired": int(counts.get("expired", 0)),
+                "decided_elsewhere": [{"inquiry": str(item.id),
+                                       "decision": str(item.decision),
+                                       "subject": str(item.subject_id),
+                                       "state": str(item.state)} for item in elsewhere],
                 "live": [{"id": str(row["id"]), "decision": str(row["decision"]),
                           "subject": str(row["subject_id"]), "state": str(row["state"]),
                           "asked_at": str(row["asked_at"]),
@@ -1036,6 +1044,12 @@ def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
     if questions is not None and questions["expired"]:
         notes.append(f"questions: {questions['expired']} question(s) expired unanswered; the "
                      "decisions behind them are still open at `hermes-memory owner --list`")
+    if questions is not None and questions["decided_elsewhere"]:
+        moved = questions["decided_elsewhere"]
+        names = ", ".join(sorted({str(item["decision"]) for item in moved}))
+        notes.append(f"questions: {len(moved)} question(s) are still being asked about a "
+                     f"decision that has already moved ({names}) — something decided it "
+                     "without waiting for the answer, and the audit says what")
     delivery = next((stage for stage in stages if stage.name == "delivery"), None)
     if delivery_loop is not None and delivery_loop.get("waiting") and (
             delivery_loop.get("behind") or not delivery_loop.get("scheduled")):

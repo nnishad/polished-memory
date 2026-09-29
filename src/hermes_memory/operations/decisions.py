@@ -66,13 +66,16 @@ def lesson_ref(value: str, version: int | None = None) -> tuple[str, int | None]
 def settle(store, *, owner_principal: str | None, name: str, subject_id: str,
            actor: str, reason: str | None = None, preview_digest: str | None = None,
            version: int | None = None, valid_from: str | None = None,
-           valid_until: str | None = None,
-           evidence: Sequence[str] = ()) -> dict[str, Any]:
+           valid_until: str | None = None, evidence: Sequence[str] = (),
+           via_inquiry: str | None = None) -> dict[str, Any]:
     """Take one owner decision, from whichever handle arrived.
 
     The refusals here are the ones the command line made first: an act that needs the digest
     of what was shown cannot be settled by a sentence, and an act that changes what the
     archive stands behind has to say why, because it outlives the conversation that asked.
+
+    ``via_inquiry`` is not a caller's claim of authority: it names the question that is
+    answering, and only that question's own reply is let past it.
     """
     if name not in ACTS:
         raise EvidenceError(f"unknown owner act {name!r}; the acts are {list(ACTS)}")
@@ -96,6 +99,20 @@ def settle(store, *, owner_principal: str | None, name: str, subject_id: str,
     subject = str(subject_id or "").strip()
     if not subject:
         raise EvidenceError(f"{name} needs the id of the thing it decides about")
+    # While a question about this exact state is out on the owner's channel, that question
+    # is the decision's only live handle. A second door that reaches the same row would let
+    # anybody who can open it answer for the person who was asked, and would leave the
+    # archive settled while the owner is still holding a message asking them. The answer
+    # handle is exempt only by naming the question it answers, so the exemption cannot be
+    # claimed against a different one.
+    from ..proactive.inquiries import InquiryStore
+
+    asking = InquiryStore(store, owner_principal=owner_principal).live_for(
+        decision=name, subject_id=subject)
+    if asking is not None and str(via_inquiry or "") != asking.id:
+        raise EvidenceError(
+            f"{asking.id} is being asked of the owner on their own channel, so this door "
+            "will not decide it: let the answer settle it, or withdraw the question first")
 
     if name == "forgetting":
         from ..lifecycle.erasure import ErasureManager

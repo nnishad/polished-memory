@@ -166,8 +166,8 @@ runtime timer are the only things that ask, and one run carries both halves:
 1 artifact(s) reached the transport; nothing is ready to send right now; 2 question(s) asked
 ```
 
-The message says what answering will do, who it reaches and until when. Then the owner's
-reply, relayed verbatim by `memory_clarify_answer`:
+The message says what answering will do, who it reaches and until when. The reply is then
+taken off the wire by the plugin, on the turn it arrives and before a model is shown it:
 
 ```
 yes K7Q2M4      settles it, through the same function the command line calls
@@ -175,12 +175,34 @@ no K7Q2M4       stops the asking and decides nothing — the candidate stays a c
 K7Q2M4          refused: a code proves who sent it, not what to do with it
 ```
 
-The code is the whole authority, and it is the one thing the archive cannot be read for: it
-is minted as the message goes out, stored only as a digest, and returned by nothing — not
-`owner --list`, not `status`, not `memory_recall`, not the store itself. An agent that can
-see every table has to guess six characters from an alphabet with no 0, 1, I or O in it, and
-every wrong guess is written to the audit as `inquiry_refused`. The channel the answer came
-from is read from the host's session binding and is not an argument the model may pass.
+`memory_clarify_answer` is the same door a turn may knock on, and it refuses a reply that is
+not the message the host delivered this turn. That refusal is load-bearing, and the reason is
+measured rather than theoretical. **A code is not secret from the conversation**: a messaging
+client answers by quoting, so the question — its wording and its code — comes back inside what
+the model can read. What makes a reply the owner's is therefore not the six characters but
+those characters arriving in text the host says the owner sent, with the quotation stripped
+off the front of it. Reading the whole message would be reading the framework's own question
+back and calling it an answer, which is how a `what is this?` from the owner became a settled
+decision.
+
+The other half of the same event: while a question is live, **no other door will decide what it
+is asking about.** `owner --confirm-…` and `hermes-memory goal --activate` both refuse, and say
+that the answer is what settles it. This is not paranoia about a lying model — it is the ordinary
+helpfulness of one. An agent was asked to adopt a goal, did not call the answer tool, and reached
+the identical result by running the command line through its terminal tool, quoting a code it had
+copied out of the quotation. The CLI cannot tell a person from a model with a shell on the same
+machine, and `actor = args.actor or settings.owner_principal` means it defaults to claiming the
+owner; on a host where the agent has a terminal, that door is only as private as the terminal is.
+The fence therefore has to sit on the decision, not on which handle was pulled:
+
+- asking is the only handle while the asking is live;
+- the answer handle is exempt, and only for the question whose code it carries;
+- a decline, an expiry or a void reopens every door, because the asking ended.
+
+And when something has decided a question anyway — an old installation, a hand-edited row, a
+restore from before the ask — `status` reports it as `decided_elsewhere` and `doctor` warns:
+a question still being asked about a state that has already moved is a ledger that disagrees
+with the archive, and the audit says who moved it.
 
 What a reply cannot do:
 
@@ -198,9 +220,11 @@ and `inquiry_replies_switch` in the audit, with the actor and the channel beside
 
 `status` answers the operator's question (`questions`: whether replies are on and who said
 so, how many are queued, with the owner, held back to a later hour, answered, declined,
-expired) and `doctor` fails quietly in the two cases that need doing tonight: a question that
-has outlived its own window, which means the pass has not run, and a queue of questions with
-no drain scheduled to ask them. `owner --list` shows both halves on one screen — the decision
+expired, decided elsewhere) and `doctor` fails quietly in the three cases that need doing
+tonight: a question still being asked about a decision that has already moved, which means
+something decided it without the answer; a question that has outlived its own window, which
+means the pass has not run; and a queue of questions with no drain scheduled to ask them.
+`owner --list` shows both halves on one screen — the decision
 and whether it has been asked about — because a listing that showed only the waiting is what
 made a silent archive indistinguishable from a finished one.
 
@@ -927,7 +951,7 @@ share, so no surface can talk to a memory it was not bound to.
 | `POST /v1/forget-requests` | provider `memory_forget_request` — preview and impact manifest, erases nothing | scoped agent |
 | `POST /v1/owner/forget-confirmations` | `owner --confirm-forgetting --digest …` — the fence plus a durable obligation | owner only |
 | `hermes-memory deliver` — a command, not a route | the outbox's hand door: one bounded drain, with lease and attempt correlation and the receipt the transport actually gave. The runtime unit runs the same drain on its own timer (`HERMES_MEMORY_DELIVERY_POLL_S`); this is for the moment you want it sent now | this installation's own scheduler, or you |
-| `POST /v1/questions` and its answer | provider `memory_clarify` (opens a question, sends nothing) and `memory_clarify_answer` (relays the owner's words, with the channel the host named); the asking itself is the drain's | scoped agent asks, owner answers |
+| `POST /v1/questions` and its answer | provider `memory_clarify` (opens a question, sends nothing) and the plugin's own read of the owner's reply on the turn it arrives, with `memory_clarify_answer` for a message the host delivered; the asking itself is the drain's | scoped agent asks, owner answers |
 | `POST /v1/owner/controls` | `pause` / `start` / `stop`, with actor and policy version recorded; the same door carries `owner --switch-delivery` and `--switch-replies` | owner only |
 | `GET /v1/jobs/{id}` | `form`, `maintain`, `cancel --job`, and the queue stage of `status` | scoped agent, operator |
 
@@ -938,6 +962,20 @@ a place to put private evidence, a credential to steal and a log to leak from, w
 caller that does not already have an in-process, profile-scoped one. If a non-Hermes client
 ever needs these, the route table belongs beside these same library calls — the authority rule
 is in the stores and the broker, not in whichever transport reaches them.
+
+**Those four rows are only as private as the terminal that runs them.** `hermes-memory owner
+--confirm-forgetting` and `goal --activate` take an actor and, with none given, record the
+owner's own principal: the door was built for a person standing at a keyboard, and on a machine
+where the agent has a shell, so does the agent. What measured behaviour looks like is not an
+attack but an errand — a gateway conversation that was asked to adopt a goal, never called the
+answer tool, and ran the command line at it instead, quoting a code it had read out of the
+question Telegram had handed back in the reply. So the boundary is not the door, it is the
+state: while a decision is being asked about, every handle but the answer refuses, and a
+decision that got moved anyway is reported by `status` and warned about by `doctor` rather than
+left for the owner to discover. A deployment that wants a stronger line than that has to draw it
+outside this framework — a separate user for the agent, or no terminal tool — and `owner
+--switch-replies off` is the setting for an owner who would rather the archive never held a door
+they did not walk through.
 
 ## What this build does not claim
 

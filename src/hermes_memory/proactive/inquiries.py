@@ -17,7 +17,11 @@ make impossible, and a transport is no place to reintroduce it.
 *The code is written down once, in the message.* Every question carries a fresh one-use code;
 only its digest is stored, so reading the database — including reading it as the agent, which
 may ask about anything — does not hand out the ability to answer. A reply without a code is
-nobody's decision, however much it reads like one.
+nobody's decision, however much it reads like one. What the code does *not* do is keep the
+answer away from the agent: a messaging client replies by quoting, so the question and its code
+come back in what the conversation can read. The code says the sender read the message; that it
+came from the owner rather than from the model is carried by the channel the host attests and by
+this module refusing to let any other door decide what it is asking about.
 
 *Nothing here is a default.* A reply settling an irreversible act needs the owner's switch,
 an approved *private* destination, and the same attention budget a reminder spends: a
@@ -367,6 +371,39 @@ class InquiryStore:
             (*wanted, _cap(limit))).fetchall()
         return [Inquiry.from_row(row) for row in rows]
 
+    def _pin(self, inquiry: Inquiry) -> dict[str, Any]:
+        """What the archive says now about the state the owner was shown."""
+        try:
+            return fence(self.store, decision=inquiry.decision,
+                         subject_id=inquiry.subject_id)
+        except EvidenceError as error:
+            return {"found": False, "awaiting": False, "digest": "", "reason": str(error)}
+
+    def stands_as_shown(self, inquiry: Inquiry) -> bool:
+        """Whether the row behind a question is still the row the owner was told about."""
+        pinned = self._pin(inquiry)
+        return bool(pinned["found"] and pinned["awaiting"]
+                    and pinned["digest"] == inquiry.subject_digest)
+
+    def live_for(self, *, decision: str, subject_id: str) -> Inquiry | None:
+        """The question being asked right now about this exact decision, if there is one."""
+        row = self.db.execute("SELECT * FROM inquiries WHERE decision=? AND subject_id=? "
+                              "AND state IN ('open','sent') ORDER BY state='sent' DESC, "
+                              "asked_at LIMIT 1",
+                              (str(decision), str(subject_id))).fetchone()
+        return Inquiry.from_row(row) if row is not None else None
+
+    def settled_elsewhere(self, *, limit: int = 20) -> list[Inquiry]:
+        """Live questions whose subject has already moved out from under them.
+
+        A reading, not a verdict, and deliberately not `_moved`: an answer voids its own
+        question on this evidence, while the doctor has to see the same thing without
+        erasing it. A `goal-activation` still marked `sent` over a goal that is already
+        `active` means somebody decided it through a door that never looked here.
+        """
+        return [item for item in self.list(states=("open", "sent"), limit=limit)
+                if not self.stands_as_shown(item)]
+
     # -- sending -------------------------------------------------------------
 
     def send_next(self, *, sink: Callable[[str], Any], destination: str, holder: str,
@@ -565,7 +602,8 @@ class InquiryStore:
                              actor=self.owner_principal or "",
                              reason=f"replied on {channel or 'the owner channel'}: "
                                     f"{text}"[:900],
-                             preview_digest=inquiry.subject_digest)
+                             preview_digest=inquiry.subject_digest,
+                             via_inquiry=inquiry.id)
         except EvidenceError as error:
             # The owner said yes and the door underneath still refused. That refusal is the
             # point, and the question stays live so the reason can be read and fixed.
@@ -607,13 +645,9 @@ class InquiryStore:
 
     def _moved(self, inquiry: Inquiry) -> bool:
         """Void the question if the archive no longer matches what was shown."""
-        try:
-            pinned = fence(self.store, decision=inquiry.decision,
-                           subject_id=inquiry.subject_id)
-        except EvidenceError as error:
-            pinned = {"found": False, "awaiting": False, "reason": str(error)}
-        if pinned["found"] and pinned["awaiting"] and pinned["digest"] \
-                == inquiry.subject_digest:
+        pinned = self._pin(inquiry)
+        if pinned["found"] and pinned["awaiting"] \
+                and pinned["digest"] == inquiry.subject_digest:
             return False
         self._void(inquiry.id, reason=f"it no longer stands as it was shown: "
                                       f"{pinned['reason'] or 'the row changed'}")

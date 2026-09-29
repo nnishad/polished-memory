@@ -289,6 +289,51 @@ def test_an_expired_question_cannot_be_answered_by_its_own_code(store, waiting, 
     assert refused["settled"] is False and "expired" in refused["reason"]
 
 
+# -- what a live question closes ----------------------------------------------
+
+def test_a_second_door_will_not_decide_what_the_owner_is_being_asked_about(store, waiting,
+                                                                          asking, outdir):
+    """The failure this closes is a real one: an agent with a terminal read the question,
+    answered itself, and left the owner holding a message that was still asking."""
+    from hermes_memory.operations.decisions import settle
+
+    inquiries, question, identifier = asked(store, waiting, asking, outdir)
+
+    with pytest.raises(EvidenceError, match=f"{question} is being asked of the owner"):
+        settle(store, owner_principal=OWNER, name="goal-activation", subject_id=identifier,
+               actor=OWNER, reason="the owner presumably wants it")
+
+    assert store.db.execute("SELECT status FROM goals WHERE id=?",
+                            (identifier,)).fetchone()[0] == "candidate"
+    assert inquiries.get(question).state == "sent", "a refusal does not end the asking"
+
+
+def test_the_exemption_belongs_to_the_question_rather_than_to_whoever_asks(
+        store, waiting, asking, outdir):
+    """`via_inquiry` names the reply that is answering; naming it is not the same as being it."""
+    from hermes_memory.operations.decisions import settle
+
+    inquiries, _question, identifier = asked(store, waiting, asking, outdir)
+
+    with pytest.raises(EvidenceError, match="being asked of the owner"):
+        settle(store, owner_principal=OWNER, name="goal-activation", subject_id=identifier,
+               actor=OWNER, reason="answered, more or less", via_inquiry="inq_other")
+
+
+def test_declining_a_question_gives_the_other_door_back(store, waiting, asking, outdir):
+    """A question the owner refused is not a fence around the decision forever after."""
+    from hermes_memory.operations.decisions import settle
+
+    inquiries, question, identifier = asked(store, waiting, asking, outdir)
+    code = code_of(outdir, question)
+    assert inquiries.answer(reply=f"no {code}")["declined"] is True
+
+    answer = settle(store, owner_principal=OWNER, name="goal-activation",
+                    subject_id=identifier, actor=OWNER, reason="decided it at the door instead")
+
+    assert answer["status"] == "active"
+
+
 # -- what the switch and the ladder decide ------------------------------------
 
 def test_a_question_is_not_asked_at_all_where_replies_are_not_allowed(store, waiting, asking):

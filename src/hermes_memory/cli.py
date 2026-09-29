@@ -2187,6 +2187,7 @@ def _cancel_command(settings, args) -> int:
 # revision of something already settled.
 def _goal_command(settings, args) -> int:
     from .install.profiles import InstallationError
+    from .proactive.inquiries import InquiryStore
     from .prospective.due_events import DueEventLog
     from .prospective.goals import GoalStore
     from .storage.evidence import EvidenceStore
@@ -2242,6 +2243,24 @@ def _goal_command(settings, args) -> int:
                 print("refused: every goal transition is written down with a reason, because "
                       "it outlives the conversation that made it", file=sys.stderr)
                 return 2
+            move = ("goal-activation" if args.activate else
+                    "goal-completion" if args.complete else
+                    "goal-cancellation" if args.cancel else None)
+            if move is not None:
+                # The agent on this host has a terminal, so this door cannot tell a person from
+                # a model that read the transcript. While the same decision is out being asked
+                # of the owner, asking is the only handle that may decide it: a goal activated
+                # past an unanswered question leaves the archive settled and the owner still
+                # holding a message that asks them.
+                asking = InquiryStore(store,
+                                      owner_principal=settings.owner_principal).live_for(
+                                          decision=move, subject_id=args.id)
+                if asking is not None:
+                    print(f"refused: {asking.id} is being asked of the owner about this goal "
+                          "right now, so this door will not decide it — say yes or no on the "
+                          "channel it was asked on, and it stops being asked once answered, "
+                          "declined or expired", file=sys.stderr)
+                    return 2
             if args.activate:
                 answer = goals.activate(goal_id=args.id, actor=actor, reason=args.reason)
             elif args.complete:

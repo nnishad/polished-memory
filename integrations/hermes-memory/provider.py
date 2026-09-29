@@ -12,6 +12,7 @@ cron transport to pick up.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -93,6 +94,18 @@ _OWNER_ACTS = ("forgetting", "identity", "identity-rejection", "edge-revocation"
                "assertion-retraction", "lesson-activation", "lesson-retraction",
                "lesson-confirmation", "lesson-contradiction", "goal-activation",
                "goal-completion", "goal-cancellation")
+
+#: What a messaging client puts in front of a reply: the message being answered, in full,
+#: written by us. It carries the question's own code in plaintext, which is the whole reason
+#: an answer is read out of what comes after this block and never out of the message as
+#: delivered. Parsing the quoted half is reading one's own question back and calling it a
+#: reply — and a model that can see a quote can copy a code out of one.
+_REPLY_TO = re.compile(r'^\s*\[Replying to:[\s\S]*?"\]\s*')
+
+
+def owner_words(text: str) -> str:
+    """Only what the person typed, with any reply-to quotation removed."""
+    return " ".join(_REPLY_TO.sub("", str(text or ""), count=1).split())
 
 
 def _account_field() -> dict[str, Any]:
@@ -259,12 +272,16 @@ _TOOLS = [
     {
         "name": "memory_clarify_answer",
         "description": (
-            "Relay the owner's reply to one of those questions. Pass their words exactly as "
-            "sent, code included: the code is the whole authority here, and it is what tells "
-            "the archive this came from the owner rather than from somebody who read the "
-            "listing. This settles real owner decisions — including a confirmed forgetting — "
-            "so it is refused unless the owner has switched replies on, and it decides "
-            "nothing when the thing asked about has moved since it was shown."
+            "Relay the owner's reply to one of those questions, exactly as the host delivered "
+            "it this turn, code included. The framework already reads that message itself when "
+            "it arrives, so the usual answer here is that it was already settled — which is the "
+            "good outcome, and means there is nothing left to activate, schedule or run at a "
+            "command line. A reply composed rather than delivered is refused: the code is "
+            "quoted back to any conversation that can see the channel, so it proves the sender "
+            "read the question and nothing about who typed the answer. This settles real owner "
+            "decisions — including a confirmed forgetting — so it is refused unless the owner "
+            "has switched replies on, and it decides nothing when the thing asked about has "
+            "moved since it was shown."
         ),
         "parameters": {
             "type": "object",
@@ -305,6 +322,9 @@ class HermesMemoryProvider(_MemoryProvider):
         # host knows this: an answer's channel is evidence about where the owner said it, so
         # it is read from the session binding and never taken from a tool argument.
         self._chat_id = ""
+        # The owner's own words, as the host delivered them on this turn. An answer is taken
+        # from text the host saw and never from text a conversation wrote.
+        self._owner_reply = ""
         self._agent_context = "primary"
         self._last_injected = 0
         self._unavailable = ""
@@ -642,12 +662,14 @@ class HermesMemoryProvider(_MemoryProvider):
             }
 
     def _clarify_answer(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Relay the owner's own words, with the channel the host says they came from.
+        """Relay the owner's message, which the host has to have actually delivered.
 
-        The code in the reply is the authority and this method never learns one: it is stored
-        as a digest, so a conversation cannot read a question back out of the archive and
-        answer it on the owner's behalf. What is left to a lying relay is a guess at six
-        characters, a switch the owner has to turn on first, and an audit line either way.
+        A code is not a secret from this conversation. The question goes out as a message the
+        owner replies to, and a reply-to carries the quoted question — code and all — straight
+        into what the model can read, which is how one was used at a command line that checks
+        no code at all. What makes a reply the owner's is therefore not the six characters but
+        those characters arriving in text the host says the owner sent; this door takes its
+        words from that delivered text or not at all.
         """
         from hermes_memory.proactive.inquiries import InquiryStore
 
@@ -657,10 +679,20 @@ class HermesMemoryProvider(_MemoryProvider):
         named = str(args.get("inquiry") or "").strip() or None
         channel = f"{self._platform or 'local'}:{self._chat_id}" if self._chat_id else \
             (self._platform or "local")
+        if not self._owner_reply:
+            return {"settled": False, "ok": False, "channel": channel,
+                    "reason": "no message from the owner is in front of me on this turn, and "
+                              "the framework takes their answer itself when one arrives — a "
+                              "reply written here would be words this conversation chose"}
+        if owner_words(reply) != self._owner_reply:
+            return {"settled": False, "ok": False, "channel": channel,
+                    "reason": "these are not the words the owner sent this turn, so they are "
+                              "not their answer"}
         settings = self._bound().settings
         with self._open_store() as store:
             inquiries = InquiryStore(store, owner_principal=settings.owner_principal)
-            answer = inquiries.answer(reply=reply, inquiry_id=named, channel=channel)
+            answer = inquiries.answer(reply=self._owner_reply, inquiry_id=named,
+                                      channel=channel)
         answer["channel"] = channel
         answer.setdefault("note", (
             "The owner's decision is recorded." if answer.get("settled") else
@@ -830,6 +862,10 @@ class HermesMemoryProvider(_MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return one bounded packet for the turn. Never blocks on the backend.
 
+        The one write this path makes is the owner's answer to a question the archive asked:
+        :meth:`_settle_from_turn` takes it off the delivered text before the model is shown
+        any of it. Everything else here reads.
+
         Hermes abandons an external prefetch after 8 seconds; the configured
         foreground deadline is validated to stay below that, and a derived
         channel that misses it is dropped rather than making the turn late.
@@ -841,21 +877,58 @@ class HermesMemoryProvider(_MemoryProvider):
         """
         if not query or not query.strip():
             return ""
+        answered = self._settle_from_turn(query)
         wanted = query.strip()
         warmed = self._consume_queued(wanted, session_id)
         if warmed is not None:
             self._last_injected = warmed[1]
-            return warmed[0]
+            return f"{answered}\n\n{warmed[0]}".strip()
         try:
             packet = self._broker().assemble(wanted, limit=8, lessons=self._lessons())
         except Exception as error:
             # A store we cannot read is not an empty archive, and the difference
             # is the whole reason the packet carries its channels.
             self._last_injected = 0
-            return (f"(Memory could not be consulted: {str(error)[:160]}. "
-                    "Treat this as retrieval failure, not as absence.)")
+            return (f"{answered}\n\n(Memory could not be consulted: {str(error)[:160]}. "
+                    "Treat this as retrieval failure, not as absence.)").strip()
         self._last_injected = len(packet.items)
-        return packet.render()
+        return f"{answered}\n\n{packet.render()}".strip()
+
+    def _settle_from_turn(self, query: str) -> str:
+        """Take the owner's answer off the wire, before anybody has to decide to look for one.
+
+        ``prefetch`` is the one place in Hermes where a message is read before a model sees it,
+        and that is where the asking has to end. What was measured on the live installation:
+        the owner replied ``yes`` with the code, the conversation never called the answer tool,
+        and it went instead to the command line — where it reached the same decision using a
+        code it had copied out of the quoted question. An answer taken here is the host's own
+        text, with the quotation stripped, so there is nothing left for a relay to compose.
+
+        What is left standing after this is the turn's own words, which is what
+        :meth:`_clarify_answer` will accept and nothing else.
+        """
+        from hermes_memory.proactive.inquiries import InquiryStore, code_in
+
+        self._owner_reply = ""
+        words = owner_words(query)
+        if not code_in(words) or not self._chat_id:
+            return ""
+        settings = self._bound().settings
+        channel = f"{self._platform or 'local'}:{self._chat_id}"
+        if channel != str(settings.delivery_target or ""):
+            # Somebody else's conversation, or a group: their ``yes`` answers their own thing.
+            return ""
+        with self._open_store() as store:
+            inquiries = InquiryStore(store, owner_principal=settings.owner_principal)
+            if not inquiries.replies_allowed()[0]:
+                return ""
+            answer = inquiries.answer(reply=words, channel=channel)
+        self._owner_reply = words
+        if not answer.get("settled"):
+            return ""
+        return (f"(The owner answered their own question just now, on {channel}: "
+                f"{str(answer['reason'])[:200]}. It is recorded, and there is nothing here left "
+                "for you to settle — do not go and decide it again somewhere else.)")
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Warm next turn's packet in the background; :meth:`prefetch` consumes it.

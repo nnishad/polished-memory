@@ -460,6 +460,15 @@ class Doctor:
         stale = int(self.db.execute(
             "SELECT count(*) FROM inquiries WHERE state IN ('open','sent') AND "
             "expires_at<=?", (now(),)).fetchone()[0])
+        if report["decided_elsewhere"]:
+            moved = report["decided_elsewhere"]
+            return Finding("questions", WARN,
+                           f"{len(moved)} question(s) are still being asked about a decision "
+                           "that has already moved",
+                           "something settled these through a door other than the answer "
+                           f"(`{'`, `'.join(sorted({str(item['inquiry']) for item in moved}))}`); "
+                           "the audit names who, and `owner --list` shows what still awaits",
+                           report)
         if stale:
             return Finding("questions", WARN,
                            f"{stale} question(s) are past the window they were asked in and "

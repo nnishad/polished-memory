@@ -435,9 +435,12 @@ def test_an_agent_cannot_confirm_the_erasure_it_opened(provider):
 def asking(plugin, tmp_path, monkeypatch):
     """A provider whose owner exists, has agreed to be asked, and speaks on Telegram."""
     from hermes_memory.proactive.inquiries import InquiryStore
+    from hermes_memory.proactive.policy import AttentionPolicy
 
     monkeypatch.setenv("HERMES_MEMORY_OWNER_PRINCIPAL", OWNER)
     monkeypatch.setenv("HERMES_MEMORY_HOME", str(tmp_path / "profile"))
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_ENABLED", "true")
+    monkeypatch.setenv("HERMES_MEMORY_DELIVERY_TARGET", "telegram:787655730")
     enroll(tmp_path / "profile", tmp_path / "profile")
     instance = plugin.HermesMemoryProvider()
     assert instance.is_available(), instance.unavailable_reason()
@@ -446,6 +449,10 @@ def asking(plugin, tmp_path, monkeypatch):
     with instance._open_store() as store:
         InquiryStore(store, owner_principal=OWNER).allow_replies(
             actor=OWNER, on=True, reason="a reply on my own channel, carrying a code")
+        # Awake and out loud, or the sending half of these tests holds everything it is given.
+        AttentionPolicy(store, owner_principal=OWNER).configure(
+            actor=OWNER, timezone_name="UTC", cooldown_minutes=0, max_immediate_per_day=5,
+            quiet_from="00:00", quiet_until="00:01", shadow=False)
     return instance
 
 
@@ -509,6 +516,7 @@ def test_a_reply_about_a_state_that_awaits_nobody_decides_nothing(asking):
     asking.handle_tool_call("memory_clarify", {
         "decision": "goal-activation", "subject": identifier,
         "question": "Should I start reminding you about the passport?"})
+    asking.prefetch("yes QQQQQQ")
 
     payload = json.loads(asking.handle_tool_call(
         "memory_clarify_answer", {"reply": "yes QQQQQQ"}))
@@ -543,6 +551,75 @@ def test_a_reply_is_not_taken_from_a_cron_context(asking):
                                                  {"reply": "yes XJ23KK"}))
 
     assert payload["ok"] is False and "cron context" in payload["error"]
+
+
+def a_question_on_the_wire(asking, tmp_path):
+    """One question the owner has actually been sent, and the code that answers it."""
+    import re
+
+    from hermes_memory.proactive.delivery import local_sink
+    from hermes_memory.proactive.inquiries import InquiryStore
+
+    identifier = a_proposed_goal(asking)
+    wire = tmp_path / "wire"
+    with asking._open_store() as store:
+        inquiries = InquiryStore(store, owner_principal=OWNER)
+        made = inquiries.ask(decision="goal-activation", subject_id=identifier,
+                             question="Should I remind you about the passport?")
+        sent = inquiries.send_next(sink=local_sink(wire), destination="telegram:787655730",
+                                   holder="test")
+    assert sent["sent"] == 1 and made["state"] == "open", sent
+    delivered = "\n".join(path.read_text(encoding="utf-8")
+                          for path in sorted((wire / "memory" / "delivered").glob("*.md")))
+    return identifier, re.search(r"`yes ([A-Z2-9]{6})`", delivered).group(1)
+
+
+def quoted(code, *, said):
+    """How a messaging client delivers a reply: our own question first, then their words."""
+    return ('[Replying to: "hermes-memory question\n'
+            'It would settle: goal-activation (gol_1394c60f29664e99bfb0bef17308616e).\n'
+            f"To settle it by reply, say so and give the code: `yes {code}`. "
+            f'`no` stops the asking and decides nothing."]\n\n{said}')
+
+
+def test_the_owners_reply_is_taken_off_the_wire_without_anybody_deciding_to_notice(
+        asking, tmp_path):
+    """What this replaces is measured: the owner said it, the conversation did not listen.
+
+    A good `yes CODE` arrived on the owner's channel, no tool was called, and the model went
+    and activated the goal at a command line that checks no code at all. The answer cannot be
+    left to a turn's discretion, because the turn has something better to do.
+    """
+    identifier, code = a_question_on_the_wire(asking, tmp_path)
+
+    said = asking.prefetch(quoted(code, said=f"yes {code}"))
+
+    assert "The owner answered their own question" in said
+    with asking._open_store() as store:
+        assert store.db.execute("SELECT status FROM goals WHERE id=?",
+                                (identifier,)).fetchone()[0] == "active"
+        assert tuple(store.db.execute("SELECT state, answer_channel FROM inquiries")
+                     .fetchone()) == ("answered", "telegram:787655730")
+
+
+def test_a_code_that_only_ever_came_back_in_the_quotation_is_not_an_answer(asking, tmp_path):
+    """The quotation is ours, and it carries our own code to whoever can read the channel.
+
+    So an answer is what follows the quotation. Without that rule the tool would be a way to
+    settle a decision by repeating a message the framework sent to somebody else.
+    """
+    identifier, code = a_question_on_the_wire(asking, tmp_path)
+
+    asking.prefetch(quoted(code, said="what is this?"))
+
+    payload = json.loads(asking.handle_tool_call("memory_clarify_answer",
+                                                 {"reply": f"yes {code}"}))
+    assert payload["settled"] is False
+    assert "no message from the owner" in payload["reason"]
+    with asking._open_store() as store:
+        assert store.db.execute("SELECT status FROM goals WHERE id=?",
+                                (identifier,)).fetchone()[0] == "candidate"
+        assert store.db.execute("SELECT state FROM inquiries").fetchone()[0] == "sent"
 
 
 def test_a_question_can_only_be_about_an_act_the_door_can_settle(asking):

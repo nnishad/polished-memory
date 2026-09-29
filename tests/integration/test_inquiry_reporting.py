@@ -128,6 +128,35 @@ def test_an_expired_question_is_still_reported_after_its_owner_stopped_being_ask
         StatusReporter(store, settings=settings()).report()["notes"])
 
 
+def test_a_question_still_being_asked_about_a_moved_state_is_named(store):
+    """The one disagreement this ledger is allowed to have, so it has to be able to say it.
+
+    Restated as the real event: a goal adopted through a door that never looked at the asking,
+    while the question about it sits `sent`.
+    """
+    from hermes_memory.prospective.due_events import DueEventLog
+    from hermes_memory.prospective.goals import GoalStore
+
+    identifier = a_candidate(store)
+    question = asked(store, identifier, state="sent")
+    GoalStore(store, events=DueEventLog(store),
+              owner_principal=OWNER).activate(goal_id=identifier, actor=OWNER,
+                                              reason="decided somewhere else")
+
+    report = StatusReporter(store, settings=settings()).questions()
+
+    assert [item["inquiry"] for item in report["decided_elsewhere"]] == [question]
+    assert report["decided_elsewhere"][0]["decision"] == "goal-activation"
+    assert "already moved" in " ".join(StatusReporter(store, settings=settings()).report()["notes"])
+
+
+def test_a_question_the_report_leaves_alone_is_one_still_asked_about_the_state_it_showed(store):
+    identifier = a_candidate(store)
+    asked(store, identifier, state="sent")
+
+    assert StatusReporter(store, settings=settings()).questions()["decided_elsewhere"] == []
+
+
 def a_question_finding(store):
     """The questions check on its own: the rest of the report belongs to another file."""
     return Doctor(store, settings=settings()).questions().as_dict()
@@ -166,6 +195,24 @@ def test_the_doctor_distinguishes_a_queued_question_from_one_being_held(store):
 
     assert stuck["severity"] == WARN and "nothing is scheduled to ask them" in stuck["detail"]
     assert "hermes-memory deliver" in stuck["remedy"]
+
+
+def test_the_doctor_says_out_loud_when_an_answer_was_not_what_decided_it(store):
+    """A `sent` question over a decided subject is evidence, not litter: it says who moved."""
+    from hermes_memory.prospective.due_events import DueEventLog
+    from hermes_memory.prospective.goals import GoalStore
+
+    identifier = a_candidate(store)
+    question = asked(store, identifier, state="sent")
+    GoalStore(store, events=DueEventLog(store),
+              owner_principal=OWNER).activate(goal_id=identifier, actor=OWNER,
+                                              reason="an agent with a terminal decided it")
+
+    finding = a_question_finding(store)
+
+    assert finding["severity"] == WARN and "already moved" in finding["detail"]
+    assert question in finding["remedy"] and "the audit names who" in finding["remedy"]
+    assert a_question_finding(store) == finding, "a reading that reports this erases it"
 
 
 # -- owner --list --------------------------------------------------------------
