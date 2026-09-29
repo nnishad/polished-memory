@@ -217,9 +217,10 @@ def test_a_store_on_a_newer_schema_blocks_the_switch(installation, monkeypatch):
     from hermes_memory.storage import migrations
 
     # Pretend this build is older than the one that wrote the store.
+    shipped = len(migrations.MIGRATIONS)
     monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:5])
     report = upgrade_plan(settings, release=release, environ=environ)
-    assert report["schema"] == {"state": "newer", "now": 12, "head": 5,
+    assert report["schema"] == {"state": "newer", "now": shipped, "head": 5,
                                "store": str(settings.db_path)}
     assert "older binary against a newer schema" in said(report)
 
@@ -230,7 +231,8 @@ def test_a_store_behind_head_is_said_but_not_blocked(installation, monkeypatch):
 
     monkeypatch.setattr(migrations, "MIGRATIONS",
                         (*migrations.MIGRATIONS,
-                         migrations.Migration("0013_probe", ("SELECT 1;",))))
+                         migrations.Migration(f"00{len(migrations.MIGRATIONS) + 1}_probe",
+                                              ("SELECT 1;",))))
     report = upgrade_plan(settings, release=release, environ=environ)
     assert report["schema"]["state"] == "behind"
     assert "rehearsal copy" in said(report)

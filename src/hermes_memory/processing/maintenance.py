@@ -36,7 +36,11 @@ __all__ = ["Maintenance", "Ticker", "DEFAULT_LIMIT", "MAX_LIMIT", "SECTIONS", "r
 
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 200
-SECTIONS = ("capture", "proactive", "summaries", "identity", "queue", "erasure")
+SECTIONS = ("capture", "proactive", "questions", "summaries", "identity", "queue", "erasure")
+#: Every question the pass opens lives under this one topic. Per-kind topics would give a
+#: backlog of proposals one interruption budget each, and the owner's limit on being
+#: interrupted is a limit on being interrupted, not on the kind of thing asked.
+QUESTION_TOPIC = "decisions"
 
 
 class Maintenance:
@@ -195,6 +199,44 @@ class Maintenance:
         swept = self.engine.sweep(at=moment, limit=limit)
         swept["open_intents"] = len(self.events.intents(state="awaiting_analysis"))
         return swept
+
+    def _questions(self, *, moment: str, limit: int) -> dict[str, Any]:
+        """Open a question for everything this archive is holding up on the owner.
+
+        Asking is not sending. This section writes rows and touches no transport — the drain
+        that owns the sink is what reaches the owner, on their budget and inside their quiet
+        hours — so the pass keeps the rule that it spends no model call and opens no channel.
+        Only what an agent proposed is asked about: an owner who typed a proposal themselves
+        does not need to be asked whether they meant it.
+        """
+        from ..proactive.inquiries import InquiryStore
+
+        inquiries = InquiryStore(self.store, owner_principal=self.owner_principal)
+        expired = inquiries.expire_due()["expired"]
+        allowed, who = inquiries.replies_allowed()
+        if not allowed:
+            return {"expired": expired, "asked": 0, "open": 0,
+                    "note": f"nothing is asked while replies are switched off: {who}"}
+        opened: list[str] = []
+        declined: list[str] = []
+        for decision, subject, question in _awaiting_owner(self.store, limit=limit):
+            made = inquiries.ask(decision=decision, subject_id=subject, question=question,
+                                 topic=QUESTION_TOPIC,
+                                 reason="opened by the maintenance pass")
+            if made.get("asked"):
+                opened.append(f"{decision}:{subject}")
+            elif made.get("note", "").startswith("asked again"):
+                # It was void or expired and the state still awaits the owner, so the same
+                # question goes out again rather than the row that recorded the failure
+                # quietly ending the matter.
+                opened.append(f"{decision}:{subject}")
+            elif not made.get("ok", True) or "nothing is awaited" in str(made.get("reason")):
+                declined.append(f"{decision}:{subject}")
+        waiting = len(inquiries.list(states=("open", "sent")))
+        return {"expired": expired, "asked": len(opened), "subjects": opened[:8],
+                "stale": declined[:8], "open": waiting,
+                "note": "the questions are queued, not sent: the delivery loop is what asks, "
+                        "and the owner's daily limit is what decides when"}
 
     def _summaries(self, *, moment: str, limit: int) -> dict[str, Any]:
         stale = self.summaries.needs_refresh(limit=limit)
@@ -447,3 +489,76 @@ def _retire_grants(gate, *, clock) -> list[str]:
     except sqlite3.OperationalError:
         # A gate database older than standing grants has none to retire.
         return []
+
+
+def _awaiting_owner(store, *, limit: int) -> list[tuple[str, str, str]]:
+    """``(decision, subject, question)`` for each state an agent put in front of the owner.
+
+    Only what an *agent* proposed is asked about. An owner who typed a proposal at the door
+    does not need to be asked by message whether they meant it, and a question that repeats a
+    decision they made in person is noise that spends their budget.
+
+    Oldest first and bounded per kind, so a week of proposals being read cannot push out the
+    one candidate that has waited longest — and whatever already carries a live question is
+    left out of the search rather than skipped after it. A bound spent re-reading the oldest
+    twenty-five of a longer backlog would never reach the rest, which is the difference
+    between a bounded pass and a stalled one. A `void` or `expired` question is deliberately
+    still offered: those are endings where the asking failed, and `ask` reopens them. A
+    withdrawn one is the owner's own "stop", and an answered one is a decision.
+
+    The question quotes the subject's own words rather than describing them: for a reminder
+    and a learned practice the sentence *is* the decision, and an owner cannot adopt what they
+    were not shown.
+    """
+    from ..lifecycle.erasure import AWAITING
+
+    bound = max(1, min(_bounded(limit), 25))
+    found: list[tuple[str, str, str]] = []
+    for row in store.db.execute(
+            "SELECT g.id, g.title FROM goals g WHERE g.status='candidate' AND "
+            "g.created_kind='agent' AND NOT EXISTS (SELECT 1 FROM inquiries q WHERE "
+            "q.decision='goal-activation' AND q.subject_id=g.id AND q.state IN "
+            "('open','sent','answered','withdrawn')) "
+            "ORDER BY g.created_at, g.id LIMIT ?", (bound,)).fetchall():
+        found.append(("goal-activation", str(row["id"]),
+                      f"May I put this on your list: “{str(row['title'])[:160]}”? It reminds "
+                      "for nothing until you say yes, and saying no decides nothing."))
+    for row in store.db.execute(
+            "SELECT l.id, l.version, l.text FROM lessons l WHERE l.status='candidate' AND "
+            "l.created_kind='agent' AND NOT EXISTS (SELECT 1 FROM inquiries q WHERE "
+            "q.decision='lesson-activation' AND q.subject_id=l.id || '@' || l.version AND "
+            "q.state IN ('open','sent','answered','withdrawn')) "
+            "ORDER BY l.created_at, l.id LIMIT ?", (bound,)).fetchall():
+        found.append(("lesson-activation", f"{row['id']}@{row['version']}",
+                      f"May I start following this: “{str(row['text'])[:220]}”? It is a "
+                      "candidate until you say so."))
+    for row in store.db.execute(
+            "SELECT c.id, c.rule, c.basis, a.identifier AS account_a, "
+            "b.identifier AS account_b FROM identity_candidates c "
+            "JOIN identity_accounts a ON a.id=c.account_a "
+            "JOIN identity_accounts b ON b.id=c.account_b "
+            "WHERE c.state='pending' AND c.proposed_kind='agent' AND NOT EXISTS ("
+            "SELECT 1 FROM inquiries q WHERE q.decision='identity' AND q.subject_id=c.id "
+            "AND q.state IN ('open','sent','answered','withdrawn')) "
+            "ORDER BY c.proposed_at, c.id LIMIT ?", (bound,)).fetchall():
+        found.append(("identity", str(row["id"]),
+                      f"Are {str(row['account_a'])[:80]} and {str(row['account_b'])[:80]} the "
+                      f"same person? The rule proposed was {str(row['rule'])[:80]}, because "
+                      f"{str(row['basis'])[:200]}"))
+    for row in store.db.execute(
+            "SELECT l.id, l.preview, l.preview_digest FROM erasure_ledger l WHERE "
+            "l.state=? AND l.requester_kind='agent' AND NOT EXISTS (SELECT 1 FROM inquiries q "
+            "WHERE q.decision='forgetting' AND q.subject_id=l.id AND q.state IN "
+            "('open','sent','answered','withdrawn')) "
+            "ORDER BY l.requested_at, l.id LIMIT ?", (AWAITING, bound)).fetchall():
+        # The preview's own counts, read off the JSON the intent was priced with — the same
+        # numbers `owner --list` prints, so the message and the door cannot disagree about how
+        # big a deletion is.
+        payload = json.loads(str(row["preview"] or "{}"))
+        found.append(("forgetting", str(row["id"]),
+                      f"Confirm this forgetting: {len(payload.get('records', []))} record(s), "
+                      f"{len(payload.get('dependents', []))} derived thing(s), and "
+                      f"{len(payload.get('obligations', []))} copies the backend has to be "
+                      f"told. The preview you would be signing is "
+                      f"{str(row['preview_digest'])[:12]}."))
+    return found

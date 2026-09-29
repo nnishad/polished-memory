@@ -84,6 +84,33 @@ class ErasureManager:
                      "this exact digest."),
         }
 
+    def preview_current(self, *, intent_id: str,
+                        preview_digest: str | None = None) -> dict[str, Any]:
+        """Is the preview this digest came from still the state of the archive?
+
+        The same re-measurement `confirm` performs, in a form that answers instead of
+        erasing. A question about a forgetting must not be asked — let alone answered —
+        about a blast radius that has since grown, and the only way to know is to measure it
+        again rather than trust what was written down when it was previewed.
+        """
+        row = self.db.execute("SELECT state, preview, preview_digest FROM erasure_ledger "
+                              "WHERE id=?", (intent_id,)).fetchone()
+        if row is None:
+            return {"awaiting": False, "current": False, "digest": None,
+                    "reason": f"no erasure intent {intent_id!r}"}
+        wanted = str(preview_digest or row["preview_digest"])
+        if row["state"] != AWAITING:
+            return {"awaiting": False, "current": False, "digest": wanted,
+                    "reason": f"the intent is already {row['state']}"}
+        record_ids = list(json.loads(str(row["preview"]))["records"])
+        rows, _dependents, _obligations, _attachments, _artifacts, current = \
+            self._radius(record_ids)
+        unchanged = current == wanted and len(rows) == len(record_ids)
+        return {"awaiting": True, "current": unchanged, "digest": wanted, "now": current,
+                "reason": "" if unchanged else
+                "the evidence, its derived copies or its attachments changed after the "
+                "preview was taken"}
+
     # -- phase two: confirm --------------------------------------------------
 
     def confirm(self, *, intent_id: str, preview_digest: str, actor: str) -> dict[str, Any]:

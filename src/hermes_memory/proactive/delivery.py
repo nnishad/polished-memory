@@ -210,7 +210,8 @@ def deliver_ready(store, *, policy: DeliveryPolicy,
     bounded_drain(limit)
     for blocked in (policy.refusal(), held):
         if blocked:
-            return {"ok": True, "delivered": 0, "reason": blocked, "reports": []}
+            return {"ok": True, "delivered": 0, "asked": 0, "reason": blocked,
+                    "reports": []}
     outbox = Outbox(store, policy=AttentionPolicy(store,
                                                   owner_principal=policy.owner_principal),
                     owner_principal=policy.owner_principal)
@@ -228,10 +229,55 @@ def deliver_ready(store, *, policy: DeliveryPolicy,
     # is now empty" — and a record that led with that would read as though nothing had been
     # sent at all. Say what went out first, then why it stopped.
     tail = reports[-1].get("reason") if reports else "nothing was tried"
-    return {"ok": all(item.get("ok") for item in reports),
-            "delivered": sent,
-            "reason": f"{sent} artifact(s) reached the transport; {tail}" if sent else tail,
-            "reports": reports}
+    reason = f"{sent} artifact(s) reached the transport; {tail}" if sent else tail
+    questions = _ask_queued(store, policy=policy, sink=sink, out=out, holder=holder,
+                            limit=limit)
+    # Questions ride the same hand as reminders and spend the same budget, so one drain can
+    # report both halves of what the owner was interrupted with. A run that found nothing
+    # being asked adds nothing to the sentence: the quiet drains are the ones whose
+    # unchanged reason is what tells the operator the loop is still alive.
+    if questions.get("sent") or questions.get("attempted"):
+        reason += f"; {questions['reason']}"
+    return {"ok": all(item.get("ok") for item in reports)
+                    and bool(questions.get("ok", True)),
+            "delivered": sent, "asked": int(questions.get("sent") or 0),
+            "questions": questions, "reason": reason, "reports": reports}
+
+
+def _ask_queued(store, *, policy: DeliveryPolicy, sink: Callable[[str], Any] | None,
+                out: TextIO | None, holder: str, limit: int) -> dict[str, Any]:
+    """Ask the owner every question this archive is holding that may now be asked.
+
+    Living beside the outbox rather than inside it is what keeps a question from having to
+    be a reminder: an inquiry is about a decision the archive already awaits, it has no due
+    time, and answering it settles that decision through the same door the command line
+    uses. What it shares with a reminder is the transport, the destination and the owner's
+    daily limit on being interrupted.
+    """
+    from .inquiries import InquiryStore
+
+    writer = sink if sink is not None else _stream_sink(out)
+    if writer is None:
+        return {"ok": True, "sent": 0, "attempted": False, "reports": [],
+                "reason": "no transport was named to ask through"}
+    inquiries = InquiryStore(store, owner_principal=policy.owner_principal)
+    report = inquiries.send_next(sink=writer, destination=str(policy.destination),
+                                 holder=holder, limit=limit)
+    return {"ok": report.get("ok", True), "sent": int(report.get("sent") or 0),
+            "attempted": any(item.get("attempted") for item in report.get("reports") or []),
+            "reason": str(report.get("reason") or ""), "reports": report.get("reports") or []}
+
+
+def _stream_sink(out: TextIO | None) -> Callable[[str], Any] | None:
+    """A transport that prints the message, for a drain run with no program attached."""
+    if out is None:
+        return None
+
+    def send(body: str) -> None:
+        out.write(body + "\n")
+        out.flush()
+
+    return send
 
 
 def local_sink(hermes_home: str | Path, *, directory: str = "memory/delivered"):

@@ -72,14 +72,27 @@ PROVIDER_NAME = "hermes-memory"
 CHECKPOINT_API_VERSION = 2
 
 # A write, in the sense Hermes means it: something a cron pass or a delegated
-# subagent must not do to the owner's memory on its own initiative.
+# subagent must not do to the owner's memory on its own initiative. Opening a question
+# and taking an answer are writes in exactly that sense: one spends the owner's attention
+# budget and the other can settle an erasure.
 _WRITING_TOOLS = frozenset({"memory_remember", "memory_identity_candidate",
-                            "memory_forget_request", "memory_goal"})
+                            "memory_forget_request", "memory_goal", "memory_clarify",
+                            "memory_clarify_answer"})
 
 # A prefetch rides along with every turn, so it stays small enough that memory
 # never becomes the bulk of the context window.
 _PREFETCH_TOKENS = 1200
 _MAX_ITEMS = 20
+
+
+# The owner acts a question may be about, spelled out rather than imported: the host
+# imports this module before it knows whether hermes_memory is installed, and a tool schema
+# cannot be built lazily. A test holds this list against ``operations.decisions.ACTS``,
+# because a door that advertises an act it cannot settle is worse than one that stays quiet.
+_OWNER_ACTS = ("forgetting", "identity", "identity-rejection", "edge-revocation", "assertion",
+               "assertion-retraction", "lesson-activation", "lesson-retraction",
+               "lesson-confirmation", "lesson-contradiction", "goal-activation",
+               "goal-completion", "goal-cancellation")
 
 
 def _account_field() -> dict[str, Any]:
@@ -198,6 +211,78 @@ _TOOLS = [
             "properties": {"query": {"type": "string"}},
         },
     },
+    {
+        "name": "memory_clarify",
+        "description": (
+            "Queue a question about a decision the archive is already waiting on from the "
+            "owner — a candidate goal, a proposed identity join, a previewed forgetting — so "
+            "it reaches them on their own channel when the sender next runs. This is not a "
+            "way to ask the owner something the conversation could ask in its next sentence: "
+            "it spends the owner's attention budget, which is capped per day, and it only "
+            "works on something the owner has already been asked to decide. It opens the "
+            "question and sends nothing by itself; nothing is decided by asking."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["decision", "subject", "question"],
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": list(_OWNER_ACTS),
+                    "description": ("The owner act the question is about, named exactly as "
+                                    "`hermes-memory owner --list` names it."),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": ("The thing awaited: the goal, candidate, lesson or intent "
+                                    "id. A lesson is `name` or `name@N`."),
+                },
+                "question": {
+                    "type": "string",
+                    "description": ("What the owner is being asked, in their words, 10-900 "
+                                    "characters. It must be answerable by saying yes or no, "
+                                    "or by picking one of `choices`."),
+                },
+                "choices": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Up to four options, when the question is a picking one.",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": ("What this is about, for the per-topic cooldown. Defaults "
+                                    "to 'general'."),
+                },
+            },
+        },
+    },
+    {
+        "name": "memory_clarify_answer",
+        "description": (
+            "Relay the owner's reply to one of those questions. Pass their words exactly as "
+            "sent, code included: the code is the whole authority here, and it is what tells "
+            "the archive this came from the owner rather than from somebody who read the "
+            "listing. This settles real owner decisions — including a confirmed forgetting — "
+            "so it is refused unless the owner has switched replies on, and it decides "
+            "nothing when the thing asked about has moved since it was shown."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["reply"],
+            "properties": {
+                "reply": {
+                    "type": "string",
+                    "description": ("The owner's message, verbatim, including the six "
+                                    "character code they were sent."),
+                },
+                "inquiry": {
+                    "type": "string",
+                    "description": ("Optional `inq_...` id, when the conversation has more "
+                                    "than one question open and the reply names one."),
+                },
+            },
+        },
+    },
 ]
 
 
@@ -216,6 +301,10 @@ class HermesMemoryProvider(_MemoryProvider):
         self._binding_error = ""
         self._session_id = ""
         self._platform = ""
+        # Which conversation the host is speaking through, as the host named it. Only the
+        # host knows this: an answer's channel is evidence about where the owner said it, so
+        # it is read from the session binding and never taken from a tool argument.
+        self._chat_id = ""
         self._agent_context = "primary"
         self._last_injected = 0
         self._unavailable = ""
@@ -278,6 +367,10 @@ class HermesMemoryProvider(_MemoryProvider):
         # learned practice can apply to the WhatsApp thread it was earned in and not to a
         # terminal session on the same machine.
         self._platform = str(kwargs.get("platform") or "").strip()[:120]
+        # The gateway names the chat it is relaying; a terminal session names no chat. Both
+        # are the host's statement, which is the only statement this process trusts about
+        # where a message came from.
+        self._chat_id = str(kwargs.get("chat_id") or "").strip()[:120]
         # A subagent, cron run or flush pass is not a conversation with this
         # profile's owner, so it captures nothing of its own.
         self._agent_context = str(kwargs.get("agent_context") or "primary")
@@ -380,6 +473,10 @@ class HermesMemoryProvider(_MemoryProvider):
             return self._goal_proposal(args)
         if tool_name == "memory_forget_request":
             return self._forget_request(args)
+        if tool_name == "memory_clarify":
+            return self._clarify(args)
+        if tool_name == "memory_clarify_answer":
+            return self._clarify_answer(args)
         raise ValueError(f"unsupported tool {tool_name!r}")
 
     def _goal_proposal(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -496,6 +593,80 @@ class HermesMemoryProvider(_MemoryProvider):
                 "note": ("Nothing has been deleted. The owner must confirm this exact digest; "
                          "an agent cannot confirm its own forgetting request."),
             }
+
+    def _clarify(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Open a question about a decision the archive already awaits from the owner.
+
+        Asking is not deciding and it is not sending: the row is written here and the
+        transport that reaches the owner is the same drain that sends reminders, on the same
+        budget, under the same quiet hours. So an agent that asks ten things has spent the
+        owner's attention whether or not any of them were answered.
+        """
+        from hermes_memory.proactive.inquiries import InquiryStore
+
+        decision = str(args.get("decision", "")).strip()
+        subject = " ".join(str(args.get("subject", "")).split())
+        question = " ".join(str(args.get("question", "")).split())
+        choices = args.get("choices") or ()
+        if decision not in _OWNER_ACTS:
+            raise ValueError(f"decision must be one of the owner acts {list(_OWNER_ACTS)}")
+        if not subject:
+            raise ValueError("subject names the thing the owner is being asked about")
+        if not question:
+            raise ValueError("question must be the thing the owner is asked")
+        if not isinstance(choices, (list, tuple)):
+            raise ValueError("choices must be a list of options, or left out")
+        settings = self._bound().settings
+        with self._open_store() as store:
+            inquiries = InquiryStore(store, owner_principal=settings.owner_principal)
+            allowed, who = inquiries.replies_allowed()
+            if not allowed:
+                return {"ok": False, "asked": False,
+                        "reason": f"the question would be asked and could not be answered: "
+                                  f"{who}"}
+            made = inquiries.ask(
+                decision=decision, subject_id=subject, question=question,
+                topic=str(args.get("topic") or "general").strip()[:80] or "general",
+                choices=tuple(str(item) for item in choices),
+                reason=f"asked in a {self._platform or 'local'} conversation")
+            if not made.get("asked"):
+                return {"ok": True, **{key: value for key, value in made.items()
+                                       if key != "asked"}, "asked": False}
+            return {
+                "ok": True, "asked": True, "inquiry": made["id"], "state": made["state"],
+                "decision": decision, "subject": subject, "expires_at": made["expires_at"],
+                "note": ("Queued for the owner's own channel; it goes out when the sender "
+                         "next runs, and only inside their attention budget. Nothing is "
+                         "decided by asking, and the answer arrives as a reply the owner "
+                         "sends — not as anything this conversation can supply."),
+            }
+
+    def _clarify_answer(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Relay the owner's own words, with the channel the host says they came from.
+
+        The code in the reply is the authority and this method never learns one: it is stored
+        as a digest, so a conversation cannot read a question back out of the archive and
+        answer it on the owner's behalf. What is left to a lying relay is a guess at six
+        characters, a switch the owner has to turn on first, and an audit line either way.
+        """
+        from hermes_memory.proactive.inquiries import InquiryStore
+
+        reply = " ".join(str(args.get("reply", "")).split())
+        if not reply:
+            raise ValueError("reply must be the owner's message, verbatim")
+        named = str(args.get("inquiry") or "").strip() or None
+        channel = f"{self._platform or 'local'}:{self._chat_id}" if self._chat_id else \
+            (self._platform or "local")
+        settings = self._bound().settings
+        with self._open_store() as store:
+            inquiries = InquiryStore(store, owner_principal=settings.owner_principal)
+            answer = inquiries.answer(reply=reply, inquiry_id=named, channel=channel)
+        answer["channel"] = channel
+        answer.setdefault("note", (
+            "The owner's decision is recorded." if answer.get("settled") else
+            "Nothing was decided; say what the reason above said rather than what you hoped "
+            "it said."))
+        return answer
 
     def _thread_cache(self) -> dict[str, Any]:
         """This thread's connection and packet cache, rebuilt when the session moved.

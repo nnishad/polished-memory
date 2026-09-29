@@ -292,6 +292,93 @@ def phase_delivery(inst: dict, goals: int = 250) -> None:
 
 # -- 4. identity ---------------------------------------------------------------
 
+def phase_questions(inst: dict, candidates: int = 200, budget: int = 5) -> None:
+    """Two hundred things an agent proposed, one owner, and a cap that does not stretch.
+
+    The load this feature can create is not storage, it is interruption: every candidate is a
+    question, and a queue of questions is bounded by nothing except what the owner agreed to
+    be asked about in a day. So the harness opens the whole backlog, drains it as the runtime
+    would, and checks that the cap holds — six drains over two hundred queued questions may
+    spend five of them, and everything else has to still be there, held to a named time.
+    """
+    import re
+
+    from hermes_memory.proactive.inquiries import InquiryStore
+
+    print(f"\nquestions: {candidates} agent proposals, then nine passes and the same drain")
+    with EvidenceStore(inst["db"]) as store:
+        AttentionPolicy(store, owner_principal=OWNER).configure(
+            actor=OWNER, topic="decisions", timezone_name="UTC", cooldown_minutes=0,
+            quiet_from="00:00", quiet_until="00:01", max_immediate_per_day=budget,
+            digest_per_day=0, shadow=False)
+        InquiryStore(store, owner_principal=OWNER).allow_replies(
+            actor=OWNER, on=True, reason="the harness answers by reply")
+        goals = GoalStore(store, events=DueEventLog(store), owner_principal=OWNER)
+        for index in range(candidates):
+            goals.propose(title=f"Adopt proposal {index}", statement="An agent found it.",
+                          timezone_name="UTC", proposed_by="agent:harness",
+                          proposed_kind="agent")
+
+    started = time.perf_counter()
+    with EvidenceStore(inst["db"]) as store:
+        for _ in range(9):
+            opened = Maintenance(store, owner_principal=OWNER,
+                                 clock=time.time).pass_now(sections=("questions",))
+        rows = int(store.db.execute("SELECT count(*) FROM inquiries").fetchone()[0])
+        duplicates = int(store.db.execute(
+            "SELECT count(*) FROM (SELECT id FROM inquiries GROUP BY id HAVING count(*) > 1)"
+        ).fetchone()[0])
+    report("passes", asked=rows, duplicate_rows=duplicates,
+           seconds=round(time.perf_counter() - started, 2),
+           last=opened["questions"]["asked"])
+    check("nine passes ask each state once, not once a period",
+          rows == candidates and duplicates == 0, rows=rows, duplicates=duplicates)
+
+    written = inst["profile_home"] / "memory" / "delivered"
+    started = time.perf_counter()
+    for _ in range(6):
+        subprocess.run([CLI, "-m", "hermes_memory.cli", "deliver", "--hermes-home",
+                        str(inst["profile_home"]), "--limit", "25"], env=inst["env"],
+                       capture_output=True, text=True, timeout=600)
+    with EvidenceStore(inst["db"]) as store:
+        queued = int(store.db.execute("SELECT count(*) FROM inquiries WHERE state='open' "
+                                      "AND next_try_at IS NULL").fetchone()[0])
+        sent = int(store.db.execute("SELECT count(*) FROM inquiries WHERE "
+                                    "state='sent'").fetchone()[0])
+        held = int(store.db.execute("SELECT count(*) FROM inquiries WHERE state='open' AND "
+                                    "next_try_at IS NOT NULL").fetchone()[0])
+        files = len(list(written.glob("*.md"))) if written.is_dir() else 0
+    report("asking", sent=sent, held=held, seconds=round(time.perf_counter() - started, 2),
+           files=files)
+    check(f"a backlog of {candidates} cannot spend more than the {budget} a day it was given",
+          sent == budget, sent=sent, budget=budget)
+    check("everything not asked is held to a named time, not dropped",
+          queued + held + sent == candidates, queued=queued, held=held, sent=sent)
+    check("every question that went out reached the transport the owner named",
+          files >= sent, files=files, sent=sent)
+
+    with EvidenceStore(inst["db"]) as store:
+        inquiries = InquiryStore(store, owner_principal=OWNER)
+        live = inquiries.list(states=("sent",))[0]
+        body = next(path.read_text(encoding="utf-8")
+                    for path in written.glob("*.md") if live.id in path.read_text())
+        code = re.search(r"`yes ([A-Z2-9]{6})`", body).group(1)
+        answered = inquiries.answer(reply=f"yes {code}", channel="local:harness")
+        twice = inquiries.answer(reply=f"yes {code}", channel="local:harness")
+        status = store.db.execute("SELECT status FROM goals WHERE id=?",
+                                  (live.subject_id,)).fetchone()[0]
+    report("answering", settled=answered["settled"], state=status,
+           reuse=twice["reason"][:40])
+    check("the code the owner was handed adopts the thing it asked about",
+          answered["settled"] is True and status == "active", settled=answered["settled"],
+          status=status)
+    check("and it is spent: the second use decides nothing",
+          twice["settled"] is False and "already answered" in twice["reason"],
+          reason=twice["reason"][:80])
+
+
+# -- 5. identity ---------------------------------------------------------------
+
 def phase_identity(inst: dict, candidates: int = 120) -> None:
     print(f"\nidentity: {candidates} same-person proposals, half confirmed, half left for "
           "the owner")
@@ -504,6 +591,7 @@ def main() -> int:
         phase_ingest(inst, args.records)
         phase_retrieval(inst)
         phase_delivery(inst)
+        phase_questions(inst)
         phase_identity(inst)
         phase_erasure(inst)
         phase_concurrency(inst)

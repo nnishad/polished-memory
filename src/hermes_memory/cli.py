@@ -290,6 +290,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="agree, or withdraw agreement, to be interrupted: while this is "
                             "off every due reminder is kept and deferred, and nothing reaches "
                             "the transport however urgent it is")
+    owner.add_argument("--switch-replies", choices=("on", "off"), metavar="{on,off}",
+                       help="allow a reply on the delivery channel to settle a decision this "
+                            "memory is awaiting — which needs --switch-delivery on first, "
+                            "because the answer is only worth as much as the channel it "
+                            "arrived on")
     owner.add_argument("--timezone", metavar="NAME",
                        help="with --switch-delivery, which clock the quiet hours and the "
                             "daily cap are counted in")
@@ -1378,9 +1383,7 @@ def _owner_command(settings, args) -> int:
     so it is answered from the instance ledger and needs no profile.
     """
     from .install.profiles import InstallationError
-    from .knowledge.assertions import AssertionStore
-    from .lifecycle.erasure import ErasureManager
-    from .storage.identity import IdentityStore
+    from .operations.decisions import REASON_REQUIRED, settle
 
     decisions = {"forgetting": args.confirm_forgetting,
                  "identity": args.confirm_identity,
@@ -1393,6 +1396,7 @@ def _owner_command(settings, args) -> int:
                  "lesson-confirmation": args.confirm_lesson,
                  "lesson-contradiction": args.contradict_lesson,
                  "delivery": args.switch_delivery,
+                 "replies": args.switch_replies,
                  "allowance": args.grant_allowance,
                  "allowance-revocation": args.revoke_allowance}
     chosen = [name for name, value in decisions.items() if value]
@@ -1441,16 +1445,16 @@ def _owner_command(settings, args) -> int:
         print("refused: no owner principal is configured, so this decision could not be "
               "attributed to anybody; set HERMES_MEMORY_OWNER_PRINCIPAL", file=sys.stderr)
         return 2
-    if name == "forgetting" and not args.digest:
-        print("refused: a forgetting is confirmed against the digest of the preview that "
-              "was shown; `owner --list` prints it", file=sys.stderr)
-        return 2
-    if name != "forgetting" and not (args.reason or "").strip():
-        print("refused: a decision that changes what the archive stands behind has to say "
-              "why, because it outlives this conversation", file=sys.stderr)
-        return 2
-    if name == "delivery":
-        return _owner_delivery(settings, scoped=scoped, actor=actor, args=args)
+    if name in ("delivery", "replies"):
+        # The two switches that decide what may reach a person at all. They are refused
+        # without a stated reason for the same reason the decisions are: the entry outlives
+        # the conversation, and whoever reads it later needs to know who agreed to what.
+        if not (args.reason or "").strip():
+            print(f"refused: {REASON_REQUIRED}", file=sys.stderr)
+            return 2
+        return (_owner_delivery(settings, scoped=scoped, actor=actor, args=args)
+                if name == "delivery" else
+                _owner_replies(scoped=scoped, actor=actor, args=args))
     chosen_id = {"forgetting": args.confirm_forgetting, "identity": args.confirm_identity,
                  "identity-rejection": args.reject_identity,
                  "edge-revocation": args.revoke_edge,
@@ -1462,57 +1466,14 @@ def _owner_command(settings, args) -> int:
                  "lesson-contradiction": args.contradict_lesson}[name]
     try:
         with EvidenceStore(scoped.db_path) as store:
-            if name == "forgetting":
-                outcome = ErasureManager(store, owner_principal=scoped.owner_principal)\
-                    .confirm(intent_id=chosen_id, preview_digest=args.digest, actor=actor)
-            elif name.startswith("assertion"):
-                claims = AssertionStore(store, owner_principal=scoped.owner_principal)
-                decide = claims.confirm if name == "assertion" else claims.retract
-                outcome = decide(assertion_id=chosen_id, actor=actor, reason=args.reason)
-            elif name.startswith("lesson"):
-                from .learning.lessons import LessonStore
-                from .learning.outcomes import OutcomeLog
-
-                lessons = LessonStore(store,
-                                      outcomes=OutcomeLog(store, owner_principal=scoped
-                                                          .owner_principal),
-                                      owner_principal=scoped.owner_principal)
-                identifier, number = _lesson_ref(chosen_id, args.version)
-                if number is None and name != "lesson-retraction":
-                    raise EvidenceError(
-                        "a lesson decision names the version it is about — `chase-invoice@3` "
-                        "or --version 3 — because its versions disagree with each other by "
-                        "construction, and withdrawing the newest is a different act from "
-                        "withdrawing the one that was taught")
-                if name == "lesson-activation":
-                    outcome = lessons.activate(lesson_id=identifier, version=number,
-                                               actor=actor, reason=args.reason)
-                elif name == "lesson-retraction":
-                    outcome = lessons.retract(lesson_id=identifier, version=number,
-                                              actor=actor, reason=args.reason)
-                elif name == "lesson-confirmation":
-                    outcome = lessons.record_confirmation(lesson_id=identifier,
-                                                          version=number, note=args.reason,
-                                                          actor=actor,
-                                                          evidence=args.evidence or ())
-                else:
-                    outcome = lessons.record_contradiction(lesson_id=identifier,
-                                                           version=number, note=args.reason,
-                                                           actor=actor,
-                                                           evidence=args.evidence or ())
-            else:
-                identities = IdentityStore(store, owner_principal=scoped.owner_principal)
-                if name == "identity":
-                    outcome = identities.confirm(candidate_id=chosen_id, actor=actor,
-                                                 reason=args.reason,
-                                                 valid_from=args.valid_from,
-                                                 valid_until=args.valid_until)
-                elif name == "identity-rejection":
-                    outcome = identities.reject(candidate_id=chosen_id, actor=actor,
-                                                reason=args.reason)
-                else:
-                    outcome = identities.revoke(edge_id=chosen_id, actor=actor,
-                                                reason=args.reason)
+            # One function for both handles on this door: the command line and a reply from
+            # the owner's own channel must not be two implementations of the same act, or the
+            # weaker of the two is the one that ends up deciding.
+            outcome = settle(store, owner_principal=scoped.owner_principal, name=name,
+                             subject_id=chosen_id, actor=actor, reason=args.reason,
+                             preview_digest=args.digest, version=args.version,
+                             valid_from=args.valid_from, valid_until=args.valid_until,
+                             evidence=args.evidence or ())
     except (EvidenceError, InstallationError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -1520,21 +1481,46 @@ def _owner_command(settings, args) -> int:
                   "actor": actor, **outcome})
 
 
-def _lesson_ref(value: str, version: int | None) -> tuple[str, int | None]:
-    """`name@3` and `--version 3` are one statement; two different numbers are a refusal."""
-    named, _, suffix = str(value).partition("@")
-    if suffix and version is not None and suffix != str(version):
-        raise EvidenceError(f"{value} names version {suffix} while --version names "
-                            f"{version}; a decision cannot be about two revisions")
-    if suffix and not suffix.isdigit():
-        raise EvidenceError(f"{value!r} is not a lesson reference; expected a name, or "
-                            "name@N")
-    number = int(suffix) if suffix.isdigit() and version is None else version
-    return named, number
+def _owner_replies(*, scoped, actor: str, args) -> int:
+    """Whether a reply from the owner's channel may settle one of their decisions.
+
+    Off until the owner says so, and useless unless delivery is pointed at one private
+    channel of theirs: a question answered over a transport anybody can post to is a
+    capability the runtime has on its own, which is the thing this whole surface refuses to
+    be. The switch itself is only ever reachable from a terminal, never from a reply.
+    """
+    from .proactive.inquiries import InquiryStore
+
+    on = str(args.switch_replies or "").strip().lower()
+    if on not in ("on", "off"):
+        print("refused: --switch-replies takes on or off", file=sys.stderr)
+        return 2
+    reason = (args.reason or "").strip()
+    if on == "on":
+        if not (args.actor or "").strip():
+            print("refused: allowing a chat reply to settle a decision has to name who "
+                  "allowed it — that is the same person whose reply it will be taken as",
+                  file=sys.stderr)
+            return 2
+        if not scoped.delivery_enabled or not scoped.delivery_target:
+            print("refused: replies need delivery switched on with a destination first — a "
+                  "question that cannot be asked cannot be answered, and the destination is "
+                  "what ties the answer to the owner's own channel", file=sys.stderr)
+            return 2
+    try:
+        with EvidenceStore(scoped.db_path) as store:
+            outcome = InquiryStore(store,
+                                   owner_principal=scoped.owner_principal).allow_replies(
+                                       actor=actor, on=(on == "on"), reason=reason)
+    except (EvidenceError, InstallationError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": True, "decision": "replies", "profile": scoped.profile,
+                  "actor": actor, "destination": scoped.delivery_target, **outcome})
 
 
 def _awaiting(targets) -> list[dict[str, Any]]:
-    """What each enrolled memory is waiting on, counted rather than quoted.
+    """What each enrolled memory is waiting on, and what it has asked the owner about.
 
     A record ID or an account's identifiers are private evidence; a listing that dumped
     them would put them in the scrollback of whatever terminal the owner was reading in.
@@ -1545,6 +1531,7 @@ def _awaiting(targets) -> list[dict[str, Any]]:
     from .learning.lessons import LessonStore
     from .learning.outcomes import OutcomeLog
     from .lifecycle.erasure import ErasureManager
+    from .proactive.inquiries import InquiryStore
     from .storage.identity import IdentityStore
 
     found = []
@@ -1553,7 +1540,8 @@ def _awaiting(targets) -> list[dict[str, Any]]:
                  "awaiting_forgetting": [], "identity_candidates": [],
                  "candidate_assertions": [], "confirmed_identities": 0,
                  "lesson_candidates": [], "lessons_for_review": [],
-                 "goal_candidates": []}
+                 "goal_candidates": [], "questions": [], "replies_enabled": False,
+                 "replies_why": ""}
         found.append(entry)
         if not scoped.db_path.is_file():
             entry["reason"] = "no store yet"
@@ -1611,6 +1599,17 @@ def _awaiting(targets) -> list[dict[str, Any]]:
                     "SELECT id, title, statement, created_by, created_kind, created_at, "
                     "due_at FROM goals WHERE status='candidate' "
                     "ORDER BY created_at, id LIMIT 8").fetchall()]
+            # What has been asked, and whether asking is even allowed here. The code that
+            # answers a question is in none of it — this is the screen an agent can read, and
+            # the code is the one thing that must not be recoverable from what it can see.
+            inquiries = InquiryStore(store, owner_principal=scoped.owner_principal)
+            entry["replies_enabled"], entry["replies_why"] = inquiries.replies_allowed()
+            entry["questions"] = [
+                {"inquiry": item.id, "decision": item.decision, "subject": item.subject_id,
+                 "question": item.question, "choices": list(item.choices),
+                 "state": item.state, "asked_at": item.asked_at,
+                 "expires_at": item.expires_at, "sent_at": item.sent_at}
+                for item in inquiries.list(states=("open", "sent"), limit=8)]
     return found
 
 

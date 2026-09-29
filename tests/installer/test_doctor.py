@@ -169,8 +169,8 @@ def test_a_bare_store_is_described_rather_than_condemned(store):
     report = Doctor(store, backend=tripwire).examine()
     assert [item["check"] for item in report["findings"]] == [
         "layout", "database", "schema", "configuration", "coverage", "queue", "standing",
-        "background", "provenance", "lineage", "erasure", "delivery", "gate", "inference",
-        "credentials", "leases", "backend", "release"]
+        "background", "provenance", "lineage", "erasure", "delivery", "questions", "gate",
+        "inference", "credentials", "leases", "backend", "release"]
     assert report["probes"] == {"connectivity": False, "synthetic": False}
     assert tripwire.reached == []
 
@@ -260,11 +260,16 @@ def test_a_schema_this_build_does_not_know_is_refused_before_anything_else(store
 
 
 def test_outstanding_migrations_are_reported_without_being_applied(store):
+    from hermes_memory.storage import migrations
+
     store.db.execute("DELETE FROM schema_migrations WHERE name='0012_source_gaps'")
     finding = Doctor(store, backend=Tripwire()).schema()
     assert finding.severity == WARN
     assert finding.remedy == "run setup or upgrade to apply them"
-    assert store.db.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 11
+    # The diagnosis is a reading: the rows this build knows about, minus the one it
+    # does not have, and nothing applied on the way to saying so.
+    assert store.db.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == \
+        len(migrations.MIGRATIONS) - 1
 
 
 # -- configuration -----------------------------------------------------------

@@ -429,6 +429,131 @@ def test_an_agent_cannot_confirm_the_erasure_it_opened(provider):
             ["results"][0]["id"])
 
 
+# -- asking the owner, and taking their reply back -----------------------------
+
+@pytest.fixture()
+def asking(plugin, tmp_path, monkeypatch):
+    """A provider whose owner exists, has agreed to be asked, and speaks on Telegram."""
+    from hermes_memory.proactive.inquiries import InquiryStore
+
+    monkeypatch.setenv("HERMES_MEMORY_OWNER_PRINCIPAL", OWNER)
+    monkeypatch.setenv("HERMES_MEMORY_HOME", str(tmp_path / "profile"))
+    enroll(tmp_path / "profile", tmp_path / "profile")
+    instance = plugin.HermesMemoryProvider()
+    assert instance.is_available(), instance.unavailable_reason()
+    instance.initialize("sess-1", hermes_home=str(tmp_path / "profile"),
+                        platform="telegram", chat_id="787655730")
+    with instance._open_store() as store:
+        InquiryStore(store, owner_principal=OWNER).allow_replies(
+            actor=OWNER, on=True, reason="a reply on my own channel, carrying a code")
+    return instance
+
+
+def a_proposed_goal(asking):
+    """One candidate the agent proposed and cannot adopt itself."""
+    asking.handle_tool_call("memory_remember",
+                            {"content": "The passport expires in six weeks."})
+    made = json.loads(asking.handle_tool_call("memory_goal", {
+        "title": "Renew the passport", "statement": "It expires in six weeks."}))
+    assert made["status"] == "candidate", made
+    return made["goal_id"]
+
+
+def test_memory_clarify_queues_a_question_and_adopts_nothing(asking):
+    """Asking is a write to a queue, not a decision: the candidate stays a candidate."""
+    identifier = a_proposed_goal(asking)
+
+    payload = json.loads(asking.handle_tool_call("memory_clarify", {
+        "decision": "goal-activation", "subject": identifier,
+        "question": "Should I start reminding you about the passport?"}))
+
+    assert payload["asked"] is True and payload["state"] == "open", payload
+    assert payload["inquiry"].startswith("inq_")
+    assert "code" not in json.dumps(payload).lower()
+    with asking._open_store() as store:
+        assert store.db.execute("SELECT status FROM goals WHERE id=?",
+                                (identifier,)).fetchone()[0] == "candidate"
+
+
+def test_a_question_is_not_opened_where_it_could_never_be_answered(asking):
+    """Replies off is not a reason to queue a question the sender would only void."""
+    from hermes_memory.proactive.inquiries import InquiryStore
+
+    with asking._open_store() as store:
+        InquiryStore(store, owner_principal=OWNER).allow_replies(
+            actor=OWNER, on=False, reason="I would rather use the door")
+    identifier = a_proposed_goal(asking)
+
+    payload = json.loads(asking.handle_tool_call("memory_clarify", {
+        "decision": "goal-activation", "subject": identifier,
+        "question": "Should I start reminding you about the passport?"}))
+
+    assert payload["ok"] is False and payload["asked"] is False
+    assert "switched off" in payload["reason"]
+
+
+def test_the_same_question_asked_twice_is_asked_once(asking):
+    identifier = a_proposed_goal(asking)
+    question = {"decision": "goal-activation", "subject": identifier,
+                "question": "Should I start reminding you about the passport?"}
+
+    first = json.loads(asking.handle_tool_call("memory_clarify", question))
+    again = json.loads(asking.handle_tool_call("memory_clarify", question))
+
+    assert first["asked"] is True and again["asked"] is False
+    assert again["id"] == first["inquiry"]
+
+
+def test_a_reply_about_a_state_that_awaits_nobody_decides_nothing(asking):
+    identifier = a_proposed_goal(asking)
+    asking.handle_tool_call("memory_clarify", {
+        "decision": "goal-activation", "subject": identifier,
+        "question": "Should I start reminding you about the passport?"})
+
+    payload = json.loads(asking.handle_tool_call(
+        "memory_clarify_answer", {"reply": "yes QQQQQQ"}))
+
+    assert payload["settled"] is False and "no question is open under" in payload["reason"]
+
+
+def test_the_reply_is_attributed_to_the_channel_the_host_named(asking):
+    """The conversation cannot say where it came from; only the host's binding can.
+
+    ``channel`` is not in the tool's arguments at all, so a relay that claimed to be a private
+    SMS to the owner has nothing to overwrite — and the audit line carries what the host said,
+    not what the caller said.
+    """
+    assert set(next(item for item in asking.get_tool_schemas()
+                    if item["name"] == "memory_clarify_answer")
+               ["parameters"]["properties"]) == {"reply", "inquiry"}
+
+    payload = json.loads(asking.handle_tool_call(
+        "memory_clarify_answer", {"reply": "yes QQQQQQ", "channel": "sms:+15559999"}))
+
+    assert payload["settled"] is False
+    assert payload["channel"] == "telegram:787655730"
+
+
+def test_a_reply_is_not_taken_from_a_cron_context(asking):
+    home = asking._activity.hermes_home
+    asking.initialize("sess-cron", hermes_home=str(home), platform="cron",
+                      agent_context="cron")
+
+    payload = json.loads(asking.handle_tool_call("memory_clarify_answer",
+                                                 {"reply": "yes XJ23KK"}))
+
+    assert payload["ok"] is False and "cron context" in payload["error"]
+
+
+def test_a_question_can_only_be_about_an_act_the_door_can_settle(asking):
+    """The tool's enum and the owner's door are one list, checked rather than hoped."""
+    from hermes_memory.operations.decisions import ACTS
+
+    schema = next(item for item in asking.get_tool_schemas()
+                  if item["name"] == "memory_clarify")
+    assert schema["parameters"]["properties"]["decision"]["enum"] == list(ACTS)
+
+
 def test_recall_reports_the_semantic_channel_honestly(provider):
     provider.handle_tool_call("memory_remember", {"content": "The garage door code is 8841."})
     payload = json.loads(provider.handle_tool_call("memory_recall", {"query": "garage"}))

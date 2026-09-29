@@ -867,6 +867,59 @@ SOURCE_GAP_STATEMENTS: tuple[str, ...] = (
 )
 
 
+INQUIRY_STATEMENTS: tuple[str, ...] = (
+    """
+    -- One row per question the framework asks the owner, and the only place a reply from a
+    -- chat can become an owner decision. It deliberately does not live in the outbox: an
+    -- artifact must answer a recorded decision, a decision must answer a scheduled intention,
+    -- and an intention needs a goal behind it — a chain shaped by reminders, which a question
+    -- about an erasure preview or an identity candidate has no part in. So a question walks
+    -- beside that machinery and shares only what it must: the same attention budget, so a
+    -- reminder and a question cannot each spend the owner's day.
+    --
+    -- `code_digest` is the whole of the security story and the reason for this table. The
+    -- answer code exists only in the message that went to the owner's own approved channel;
+    -- nothing in this store can read it back, so nothing that leaks a row leaks the ability
+    -- to answer. `subject_digest` is the fence: an answer settles exactly the preview the
+    -- owner was shown, and if the archive moved under it the question is void, not answered.
+    CREATE TABLE inquiries(
+        id TEXT PRIMARY KEY,
+        topic TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        subject_digest TEXT NOT NULL,
+        question TEXT NOT NULL,
+        choices TEXT NOT NULL DEFAULT '[]',
+        -- NULL until it is actually asked: the code is minted on the way out, so a question
+        -- that was never sent has no answer to check against.
+        code_digest TEXT,
+        state TEXT NOT NULL CHECK(state IN ('open', 'sent', 'answered', 'expired',
+            'withdrawn', 'void')),
+        reason TEXT,
+        epoch INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT,
+        lease_until REAL,
+        held_by TEXT,
+        next_try_at TEXT,
+        proof TEXT,
+        correlation TEXT,
+        asked_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        sent_at TEXT,
+        answered_at TEXT,
+        answer TEXT,
+        answer_channel TEXT,
+        settled TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(decision, subject_id, subject_digest)
+    )""",
+    "CREATE INDEX inquiries_sendable ON inquiries(state, next_try_at, expires_at)",
+    "CREATE INDEX inquiries_subject ON inquiries(decision, subject_id, state)",
+)
+
+
 @dataclass(frozen=True)
 class Migration:
     name: str
@@ -887,6 +940,7 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0010_proactivity", PROACTIVITY_STATEMENTS),
     Migration("0011_learning", LEARNING_STATEMENTS),
     Migration("0012_source_gaps", SOURCE_GAP_STATEMENTS),
+    Migration("0013_inquiries", INQUIRY_STATEMENTS),
 )
 
 

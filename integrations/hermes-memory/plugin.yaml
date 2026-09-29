@@ -23,6 +23,8 @@ provides_tools:
   - memory_identity_candidate
   - memory_goal
   - memory_forget_request
+  - memory_clarify
+  - memory_clarify_answer
 
 # Hooks registered with the host's hook registry: none, and saying so is the point.
 # `sync_turn`, `prefetch`, `queue_prefetch`, `on_pre_compress`, `on_memory_write`,

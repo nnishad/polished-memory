@@ -141,6 +141,69 @@ to name its profile — which store an identity belongs to is never guessed.
 default. With no owner named, `--list` still works and every decision is refused, which is
 the correct shape for a machine nobody has told who it belongs to.
 
+## Being asked, instead of waiting
+
+Everything above is a door the owner walks through. A door nobody walks past is how a
+candidate stays a candidate for a year, so the archive can also *ask* — over the same
+transport reminders use, to the same one private destination, inside the same attention
+budget. Asking is switched off by default and is the owner's decision to make:
+
+```sh
+hermes-memory owner --switch-replies on --actor "$USER" \
+  --reason "a yes from my own chat is mine, and it carries a code"
+hermes-memory owner --switch-replies off --actor "$USER" --reason "back to the door"
+```
+
+A question is not an artifact. It is a row beside the outbox, about one of the thirteen acts
+`owner --list` names, and it is opened by two things: the background pass (for whatever an
+*agent* proposed and only the owner can adopt — a reminder, a habit, an identity join, a
+previewed forgetting) and the `memory_clarify` tool in a conversation. Neither of them sends
+it. The delivery drain does, which is the rule that keeps the pass touching no channel and
+keeps an agent from ringing the owner's bell by itself. `hermes-memory deliver` and the
+runtime timer are the only things that ask, and one run carries both halves:
+
+```
+1 artifact(s) reached the transport; nothing is ready to send right now; 2 question(s) asked
+```
+
+The message says what answering will do, who it reaches and until when. Then the owner's
+reply, relayed verbatim by `memory_clarify_answer`:
+
+```
+yes K7Q2M4      settles it, through the same function the command line calls
+no K7Q2M4       stops the asking and decides nothing — the candidate stays a candidate
+K7Q2M4          refused: a code proves who sent it, not what to do with it
+```
+
+The code is the whole authority, and it is the one thing the archive cannot be read for: it
+is minted as the message goes out, stored only as a digest, and returned by nothing — not
+`owner --list`, not `status`, not `memory_recall`, not the store itself. An agent that can
+see every table has to guess six characters from an alphabet with no 0, 1, I or O in it, and
+every wrong guess is written to the audit as `inquiry_refused`. The channel the answer came
+from is read from the host's session binding and is not an argument the model may pass.
+
+What a reply cannot do:
+
+- decide something the owner has not been shown. The question carries a digest of the whole
+  row it is about; if that row has moved, the answer is refused and the reason says so.
+- outlive the archive it was asked in. An epoch change voids it, and a void question reopens
+  when the same state is still awaiting.
+- arrive while an operator is holding delivery — a question that cannot be re-asked is not
+  one worth taking under a hold.
+- be spent twice. One code, one decision, and a second use is told it was already answered.
+
+A refusal, a decline and a settle are all durable: `inquiry_asked`, `inquiry_sent`,
+`inquiry_answered`, `inquiry_declined`, `inquiry_refused`, `inquiry_expired`, `inquiry_void`
+and `inquiry_replies_switch` in the audit, with the actor and the channel beside them.
+
+`status` answers the operator's question (`questions`: whether replies are on and who said
+so, how many are queued, with the owner, held back to a later hour, answered, declined,
+expired) and `doctor` fails quietly in the two cases that need doing tonight: a question that
+has outlived its own window, which means the pass has not run, and a queue of questions with
+no drain scheduled to ask them. `owner --list` shows both halves on one screen — the decision
+and whether it has been asked about — because a listing that showed only the waiting is what
+made a silent archive indistinguishable from a finished one.
+
 ## Holding a stage
 
 ```sh
@@ -864,7 +927,8 @@ share, so no surface can talk to a memory it was not bound to.
 | `POST /v1/forget-requests` | provider `memory_forget_request` — preview and impact manifest, erases nothing | scoped agent |
 | `POST /v1/owner/forget-confirmations` | `owner --confirm-forgetting --digest …` — the fence plus a durable obligation | owner only |
 | `hermes-memory deliver` — a command, not a route | the outbox's hand door: one bounded drain, with lease and attempt correlation and the receipt the transport actually gave. The runtime unit runs the same drain on its own timer (`HERMES_MEMORY_DELIVERY_POLL_S`); this is for the moment you want it sent now | this installation's own scheduler, or you |
-| `POST /v1/owner/controls` | `pause` / `start` / `stop`, with actor and policy version recorded | owner only |
+| `POST /v1/questions` and its answer | provider `memory_clarify` (opens a question, sends nothing) and `memory_clarify_answer` (relays the owner's words, with the channel the host named); the asking itself is the drain's | scoped agent asks, owner answers |
+| `POST /v1/owner/controls` | `pause` / `start` / `stop`, with actor and policy version recorded; the same door carries `owner --switch-delivery` and `--switch-replies` | owner only |
 | `GET /v1/jobs/{id}` | `form`, `maintain`, `cancel --job`, and the queue stage of `status` | scoped agent, operator |
 
 The four owner rows are the reason there is no framework HTTP surface on the agent's path: an

@@ -106,7 +106,8 @@ class Doctor:
         checks = [self.layout, self.database, self.schema, self.configuration,
                   self.coverage, self.queue, self.standing, self.background,
                   self.provenance, self.lineage,
-                  self.erasure, self.delivery, self.gate, self.inference_outcomes,
+                  self.erasure, self.delivery, self.questions, self.gate,
+                  self.inference_outcomes,
                   self.credentials_in_records,
                   self.leases, self.backend_ledger, self.release]
         with snapshot(self.db):
@@ -445,6 +446,39 @@ class Doctor:
         return Finding("delivery", _severity_for(report.state), report.detail,
                        evidence={"state": report.state,
                                  "in_flight": evidence.get("in_flight"), "loop": loop})
+
+    def questions(self) -> Finding:
+        """The asking half of the owner's decisions: is anything stuck that should be moving.
+
+        Distinct from `delivery`, which reads the outbox. A question is not an artifact and
+        never appears in that backlog, so a queue of things the owner was never asked would be
+        invisible there — and an installation that means to ask but cannot is exactly the fault
+        this check exists to catch.
+        """
+        report = self.status.questions()
+        loop = self.status.delivery_loop()
+        stale = int(self.db.execute(
+            "SELECT count(*) FROM inquiries WHERE state IN ('open','sent') AND "
+            "expires_at<=?", (now(),)).fetchone()[0])
+        if stale:
+            return Finding("questions", WARN,
+                           f"{stale} question(s) are past the window they were asked in and "
+                           "nothing has closed them",
+                           "the maintenance pass runs the `questions` section, which expires "
+                           "them and lets the asking start again; check that it is running",
+                           report)
+        if report["queued"] and not report["held"] and not loop["scheduled"]:
+            return Finding("questions", WARN,
+                           f"{report['queued']} question(s) are queued and nothing is "
+                           "scheduled to ask them",
+                           loop["note"] + "; `hermes-memory deliver` asks them now", report)
+        if report["expired"]:
+            return Finding("questions", WARN,
+                           f"{report['expired']} question(s) expired unanswered",
+                           "the decisions behind them are still open: `hermes-memory "
+                           "owner --list` shows them, and they are asked again once the state "
+                           "they were about is still awaiting", report)
+        return Finding("questions", OK, report["note"], remedy=None, evidence=report)
 
     def gate(self) -> Finding:
         report = self.status.resource_gate()

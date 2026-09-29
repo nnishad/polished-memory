@@ -140,6 +140,7 @@ class StatusReporter:
             queue = self.queue_age()
             background = self.background_pass()
             sending = self.delivery_loop()
+            asking = self.questions()
             epoch = self.store.epoch()
         states = {stage.name: stage.state for stage in stages}
         return {
@@ -152,11 +153,12 @@ class StatusReporter:
             "overall": _overall(states),
             "erasure_backlog": erasure,
             "awaiting_owner": waiting,
+            "questions": asking,
             "queue": queue,
             "background_pass": background,
             "delivery_loop": sending,
             "notes": _notes(stages, erasure=erasure, waiting=waiting, queue=queue,
-                            background=background, delivery_loop=sending),
+                            background=background, delivery_loop=sending, questions=asking),
         }
 
     def stage(self, name: str) -> StageReport:
@@ -727,6 +729,50 @@ class StatusReporter:
                          "periods: the runtime's drain loop is not sending them" if behind
                          else "the runtime drains the outbox on its own, on schedule")}
 
+    def questions(self) -> dict[str, Any]:
+        """What the archive is asking the owner, and whether the asking is switched on.
+
+        A question is the only way a decision reaches the owner without them typing a command,
+        and it is off by default — so the commonest real state of a fresh installation is
+        "everything awaits, nothing is asked", and a report that could not say so would leave
+        the owner reading a quiet archive as an idle one.
+        """
+        from ..proactive.inquiries import REPLIES_STAGE, InquiryStore
+
+        inquiries = InquiryStore(self.store,
+                                 owner_principal=getattr(self.settings, "owner_principal", None))
+        allowed, who = inquiries.replies_allowed()
+        counts = self._grouped("SELECT state, count(*) AS n FROM inquiries GROUP BY state")
+        # Held, not refused: a question inside quiet hours or behind the daily limit has a
+        # time on it, and one that has been waiting past its own window is the same fact at a
+        # different temperature — which is what the doctor reads off this pair.
+        held = int(self.db.execute(
+            "SELECT count(*) FROM inquiries WHERE state='open' AND next_try_at IS NOT NULL "
+            "AND next_try_at>?", (now(),)).fetchone()[0])
+        open_rows = self.db.execute(
+            "SELECT id, decision, subject_id, question, asked_at, expires_at, state, "
+            "next_try_at FROM inquiries WHERE state IN ('open','sent') ORDER BY asked_at, id "
+            "LIMIT 8").fetchall()
+        return {"replies_enabled": allowed, "why": who,
+                "stage": str((self.store.control("global", REPLIES_STAGE) or {}).get("state")
+                             or "unset"),
+                "counts": {key: int(counts.get(key, 0)) for key in
+                           ("open", "sent", "answered", "expired", "withdrawn", "void")},
+                "awaiting_answer": int(counts.get("sent", 0)),
+                "queued": int(counts.get("open", 0)),
+                "answered": int(counts.get("answered", 0)),
+                "expired": int(counts.get("expired", 0)),
+                "live": [{"id": str(row["id"]), "decision": str(row["decision"]),
+                          "subject": str(row["subject_id"]), "state": str(row["state"]),
+                          "asked_at": str(row["asked_at"]),
+                          "expires_at": str(row["expires_at"])} for row in open_rows],
+                "held": held, "waiting": int(counts.get("open", 0)) + int(
+                    counts.get("sent", 0)),
+                "note": (f"{int(counts.get('open', 0))} question(s) are queued and "
+                         f"{int(counts.get('sent', 0))} are with the owner"
+                         if allowed else
+                         "nothing is being asked: " + who)}
+
     # -- primitives ----------------------------------------------------------
 
     @property
@@ -951,7 +997,8 @@ def _overall(states: dict[str, str]) -> str:
 def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
            waiting: dict[str, Any], queue: dict[str, Any],
            background: dict[str, Any] | None = None,
-           delivery_loop: dict[str, Any] | None = None) -> list[str]:
+           delivery_loop: dict[str, Any] | None = None,
+           questions: dict[str, Any] | None = None) -> list[str]:
     """What an operator would ask next, from the stages that already answered."""
     notes = [f"{stage.name}: {stage.detail}" for stage in stages if stage.state == DEGRADED]
     if queue.get("stale"):
@@ -979,6 +1026,16 @@ def _notes(stages: list[StageReport], *, erasure: dict[str, Any],
         # decisions ends up waited on by nobody.
         notes.append(f"owner: {deciding} decision(s) are yours alone; "
                      "`hermes-memory owner --list` shows them")
+    if questions is not None and deciding and not questions["replies_enabled"]:
+        # The distinct complaint: the archive is not merely waiting, it is waiting without
+        # saying so. A decision nobody is asked about is a decision nobody knows to make.
+        notes.append(f"questions: {deciding} decision(s) await the owner and nothing is asked "
+                     f"on their channel — {questions['why']}; "
+                     "`hermes-memory owner --switch-replies on --reason ...` makes the "
+                     "archive ask instead of wait")
+    if questions is not None and questions["expired"]:
+        notes.append(f"questions: {questions['expired']} question(s) expired unanswered; the "
+                     "decisions behind them are still open at `hermes-memory owner --list`")
     delivery = next((stage for stage in stages if stage.name == "delivery"), None)
     if delivery_loop is not None and delivery_loop.get("waiting") and (
             delivery_loop.get("behind") or not delivery_loop.get("scheduled")):

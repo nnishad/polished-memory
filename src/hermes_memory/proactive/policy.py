@@ -327,11 +327,55 @@ class AttentionPolicy:
             "SELECT count(*) FROM attention_windows WHERE scope=? AND kind='digest' "
             "AND closes_at>=? AND closes_at<?",
             (f"topic:{topic}", day_start, day_end)).fetchone()[0]
-        return {"immediate_today": int(immediate), "digests_closing_today": int(digests),
+        return {"immediate_today": int(immediate), "asked_today": self._asked(
+                    day_start, day_end, topic),
+                "interrupted_today": self._interruptions(topic, day_start, day_end, shadow),
+                "digests_closing_today": int(digests),
                 "shadow": shadow, "local_day": _parse(moment).astimezone(zone)
                 .date().isoformat()}
 
     # -- internals -----------------------------------------------------------
+
+    def _interruptions(self, topic: str, day_start: str, day_end: str,
+                       shadow: bool) -> int:
+        """How often this topic has already woken the owner today, questions included.
+
+        Counted together deliberately: a reminder and a question are the same thing from the
+        owner's side of the phone, and two separate allowances would let one day hold both
+        caps — which is how a feature that asks becomes a feature that nags.
+        """
+        decided = int(self.db.execute(
+            "SELECT count(*) FROM proactive_decisions WHERE topic=? AND action=? AND "
+            "shadow=? AND decided_at>=? AND decided_at<?",
+            (topic, "notify_owner", int(shadow), day_start, day_end)).fetchone()[0])
+        return decided + self._asked(day_start, day_end, topic)
+
+    def _asked(self, day_start: str, day_end: str, topic: str) -> int:
+        """Questions this topic put to the owner in her own day, if this store has them."""
+        if self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND "
+                           "name='inquiries'").fetchone() is None:
+            return 0
+        return int(self.db.execute(
+            "SELECT count(*) FROM inquiries WHERE topic=? AND state IN ('sent','answered') "
+            "AND COALESCE(sent_at, asked_at)>=? AND COALESCE(sent_at, asked_at)<?",
+            (topic, day_start, day_end)).fetchone()[0])
+
+    def _last_spoke(self, topic: str, shadow: bool) -> str | None:
+        """When this topic last interrupted the owner, by reminder or by question alike."""
+        decided = self.db.execute(
+            "SELECT decided_at FROM proactive_decisions WHERE topic=? AND action=? AND "
+            "shadow=? ORDER BY decided_at DESC, id LIMIT 1",
+            (topic, "notify_owner", int(shadow))).fetchone()
+        asked = None
+        if self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND "
+                           "name='inquiries'").fetchone() is not None:
+            asked = self.db.execute(
+                "SELECT COALESCE(sent_at, asked_at) AS at FROM inquiries WHERE topic=? AND "
+                "state IN ('sent','answered') ORDER BY COALESCE(sent_at, asked_at) DESC, id "
+                "LIMIT 1", (topic,)).fetchone()
+        moments = [str(row["at" if "at" in row.keys() else "decided_at"])
+                   for row in (decided, asked) if row is not None]
+        return max(moments) if moments else None
 
     def _immediate_spent(self, topic: str, moment: str, zone, settings,
                          shadow: bool) -> tuple[bool, str]:
@@ -339,20 +383,14 @@ class AttentionPolicy:
         day_start, day_end = _local_day(moment, zone)
         if limit <= 0:
             return True, "the owner allows no immediate notifications"
-        used = int(self.db.execute(
-            "SELECT count(*) FROM proactive_decisions WHERE topic=? AND action=? AND "
-            "shadow=? AND decided_at>=? AND decided_at<?",
-            (topic, "notify_owner", int(shadow), day_start, day_end)).fetchone()[0])
+        used = self._interruptions(topic, day_start, day_end, shadow)
         if used >= limit:
             return True, f"the immediate budget for this day is spent ({used}/{limit})"
         minutes = int(settings["cooldown_minutes"])
         if minutes > 0:
-            row = self.db.execute(
-                "SELECT decided_at FROM proactive_decisions WHERE topic=? AND action=? "
-                "AND shadow=? ORDER BY decided_at DESC, id LIMIT 1",
-                (topic, "notify_owner", int(shadow))).fetchone()
-            if row is not None:
-                gap = (_parse(moment) - _parse(str(row["decided_at"]))).total_seconds() / 60
+            last = self._last_spoke(topic, shadow)
+            if last is not None:
+                gap = (_parse(moment) - _parse(last)).total_seconds() / 60
                 if gap < minutes:
                     return True, (f"this topic spoke {int(gap)} minutes ago and waits "
                                   f"{minutes}")
