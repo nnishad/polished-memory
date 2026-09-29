@@ -447,6 +447,22 @@ def test_an_unproven_send_is_a_failure(store):
     assert "correlate the host receipts" in finding.remedy
 
 
+def test_a_send_whose_carrier_shows_no_proof_is_a_warning_not_a_failure(store):
+    """The handover finished; nobody can witness it. That is a fact, not a broken machine.
+
+    Two kinds of silence come back from a transport, and only one of them means the owner may
+    not have been told. Grading both as FAIL is how every reminder sent by an unreflective
+    carrier keeps the installation red permanently — and a permanently red report is one that
+    gets skipped, including on the night when something really is stuck.
+    """
+    _handoff(store)
+    store.db.execute("UPDATE outbox SET state='accepted_unverified'")
+    finding = Doctor(store).delivery()
+    assert finding.severity == WARN
+    assert "no proof came back" in finding.detail
+    assert "correlation" in finding.remedy
+
+
 def test_artifacts_that_aged_out_unsent_indicate_a_transport_that_stopped(store):
     _handoff(store)
     store.db.execute("UPDATE outbox SET expires_at='2000-01-01T00:00:00+00:00'")

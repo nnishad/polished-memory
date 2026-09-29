@@ -465,16 +465,26 @@ def phase_reports(inst: dict) -> None:
     with EvidenceStore(inst["db"]) as store:
         unproven = int(store.db.execute(
             "SELECT count(*) FROM outbox WHERE state='accepted_unverified'").fetchone()[0])
-    # A clean doctor is not the invariant — an honest one is. Drains that handed artifacts
-    # over without a carrier's receipt *should* degrade the delivery stage, and a doctor
-    # that stayed quiet about them would be the bug.
-    check("the delivery stage is degraded exactly as far as the unproven sends say",
-          (states["delivery"] == "degraded") == (unproven > 0), delivery=states["delivery"],
-          unproven=unproven)
+        uncertain = int(store.db.execute(
+            "SELECT count(*) FROM outbox WHERE state='uncertain'").fetchone()[0])
+    # A clean doctor is not the invariant — an honest one is. A local sink hands over with no
+    # carrier's receipt, so those sends are counted and warned about without holding the
+    # stage open forever; and an artifact whose handover met no answer at all still degrades
+    # it, because that one does not know whether the owner was told.
+    check("a send with no proof is counted and warned about, not left invisible",
+          unproven == 0 or (states["delivery"] != "degraded"
+                            and any(item["severity"] == "warn"
+                                    and item["check"] == "delivery"
+                                    for item in parsed["findings"])),
+          delivery=states["delivery"], unproven=unproven)
+    check("a handover that met no answer still degrades the stage",
+          (states["delivery"] == "degraded") == (uncertain > 0),
+          delivery=states["delivery"], uncertain=uncertain)
     check("the doctor says so in as many words",
-          any("delivery proof" in str(item.get("detail")) or "unproven" in str(item)
-              for item in parsed["findings"] if item["severity"] != "ok"),
-          findings=[item["severity"] for item in parsed["findings"]])
+          any(item["check"] == "delivery" and item["severity"] != "ok"
+              and "proof" in str(item.get("detail")) for item in parsed["findings"]),
+          findings=[(item["check"], item["severity"]) for item in parsed["findings"]
+                    if item["severity"] != "ok"])
     check("status answers", status.returncode == 0 and bool(states), code=status.returncode)
 
 

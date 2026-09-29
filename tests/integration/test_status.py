@@ -676,12 +676,29 @@ def test_an_artifact_waiting_on_a_transport_is_reported_as_work_in_flight(store)
                for note in StatusReporter(store).report()["notes"])
 
 
-def test_an_artifact_sent_without_a_proof_stays_unresolved(store):
+def test_a_send_the_carrier_cannot_witness_is_counted_rather_than_held_open(store):
+    """A transport that says "sent" and shows nothing is a finished delivery, not a fault.
+
+    Grading it DEGRADED meant every reminder ever sent by an unreflective carrier kept the
+    stage red forever, and a permanently red report is a report nobody reads. It is still
+    named in the detail and still counted, because it is a delivery nobody can prove.
+    """
     the_whole_handoff(store)
     store.db.execute("UPDATE outbox SET state='accepted_unverified'")
     report = StatusReporter(store).delivery()
-    assert report.state == DEGRADED
+    assert report.state == OPERATIONAL
     assert report.evidence["unproven"] == 1
+    assert report.evidence["awaiting_reconciliation"] == 0
+    assert "sent without a proof" in report.detail
+
+
+def test_a_handover_that_met_no_answer_is_the_one_that_degrades_the_stage(store):
+    """The two silences, kept apart: this one does not know whether the owner was told."""
+    the_whole_handoff(store)
+    store.db.execute("UPDATE outbox SET state='uncertain'")
+    report = StatusReporter(store).delivery()
+    assert report.state == DEGRADED
+    assert report.evidence["awaiting_reconciliation"] == 1
 
 
 def test_an_artifact_that_aged_out_unsent_is_a_transport_that_stopped_coming(store):

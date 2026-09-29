@@ -54,7 +54,16 @@ REPORTED_STAGES = ("capture", "raw_indexing", "observations", "summaries", "goal
 # Outbox rows a transport is still responsible for, and rows whose only outstanding
 # question is whether the outside world accepted them.
 IN_FLIGHT = ("prepared", "leased", "attempted")
-UNPROVEN = ("uncertain", "accepted_unverified")
+# A send the framework cannot witness is not one failure but two, and they want different
+# answers. `uncertain` means the handover began and no answer came back: the owner may have
+# been messaged or may not have, and somebody has to reconcile it. `accepted_unverified`
+# means the carrier said it sent and gave nothing to check that against — a delivery that
+# finished, with a transport that does not read its own wire back. Holding that open as a
+# degradation asks every day's reminders to be permanently red, which is how a report stops
+# being read at all; what it deserves is to be counted, named, and marked as awaiting a
+# transport that can echo the correlation back.
+AWAITING_RECONCILIATION = ("uncertain",)
+UNPROVEN = ("accepted_unverified",)
 # Job states that mean work is waiting rather than finished, and states that mean the
 # queue is not merely slow but stuck.
 BUSY_JOBS = ("queued", "leased", "submitting", "running", "retry_wait")
@@ -419,10 +428,11 @@ class StatusReporter:
              "paused_sources": sorted(paused)})
 
     def delivery(self) -> StageReport:
-        """The framework makes artifacts; the host sends them. This says which is stuck."""
+        """The framework makes artifacts; a transport sends them. This says which is stuck."""
         counts = self._grouped("SELECT state, count(*) AS n FROM outbox GROUP BY state")
         in_flight = sum(int(counts.get(state, 0)) for state in IN_FLIGHT)
         unproven = sum(int(counts.get(state, 0)) for state in UNPROVEN)
+        awaiting = sum(int(counts.get(state, 0)) for state in AWAITING_RECONCILIATION)
         overdue = int(self.db.execute(
             "SELECT count(*) FROM outbox WHERE state IN ({}) AND expires_at IS NOT NULL "
             "AND expires_at <= ?".format(",".join("?" * len(IN_FLIGHT))),
@@ -432,9 +442,10 @@ class StatusReporter:
         held = bool(hold and hold["state"] == "paused")
         # An artifact past its own expiry is not "in flight": it is a transport that
         # stopped coming, and the report says so rather than counting it as busy work.
-        state = (DEGRADED if unproven or overdue else
+        state = (DEGRADED if awaiting or overdue else
                  PAUSED if held or self._all_stopped("proactivity", paused) else
-                 OPERATIONAL if in_flight or counts.get("confirmed") else UNCONFIGURED)
+                 OPERATIONAL if in_flight or counts.get("confirmed") or unproven
+                 else UNCONFIGURED)
         shadowed = self._shadowed()
         # An empty outbox does not say *why* it is empty, and "unconfigured" sent people to the
         # model config to look for a switch that lives in the attention policy. The state stays
@@ -443,13 +454,15 @@ class StatusReporter:
         quiet = (state == UNCONFIGURED and shadowed)
         return StageReport(
             "delivery", state,
-            f"{in_flight} artifact(s) waiting on the transport, {unproven} without a "
-            f"delivery proof, {counts.get('confirmed', 0)} confirmed"
+            f"{in_flight} artifact(s) waiting on the transport, {unproven} sent without a "
+            f"proof this framework can check, {awaiting} awaiting reconciliation, "
+            f"{counts.get('confirmed', 0)} confirmed"
             + ("; the owner has not switched delivery on yet, so a due reminder is kept and "
                "deferred (`hermes-memory owner --switch-delivery on --timezone …`)"
                if quiet else "")
             + (_hold_note(hold, "delivery", self.release_staged_at()) if held else ""),
             {"by_state": dict(counts), "in_flight": in_flight, "unproven": unproven,
+             "awaiting_reconciliation": awaiting,
              "past_expiry": overdue, "paused_sources": sorted(paused),
              "shadow": shadowed,
              "instance_hold": held, "instance_hold_by": (hold or {}).get("actor"),

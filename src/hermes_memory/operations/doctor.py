@@ -406,10 +406,23 @@ class Doctor:
         # scheduled to send it. Without the second half, a stalled artifact and an
         # installation whose owner kept the timer by design read identically.
         loop = self.status.delivery_loop()
-        if evidence.get("unproven"):
+        if evidence.get("awaiting_reconciliation"):
             return Finding("delivery", FAIL,
-                           f"{evidence['unproven']} artifact(s) have no delivery proof",
+                           f"{evidence['awaiting_reconciliation']} artifact(s) began a "
+                           "handover and no answer came back",
                            "correlate the host receipts, or suppress what cannot be proved",
+                           {"by_state": evidence.get("by_state"), "loop": loop})
+        if evidence.get("unproven"):
+            # Not a failure: the carrier said it sent, and nothing in this framework can
+            # check that. Calling it a degradation every day forever is how a report stops
+            # being read, so it is said plainly and points at the one thing that closes it.
+            return Finding("delivery", WARN,
+                           f"{evidence['unproven']} artifact(s) were sent, and no proof came "
+                           "back to check",
+                           "the transport that carried them reports intent, not read-back; a "
+                           "transport that echoes this artifact's own correlation line settles "
+                           "them as confirmed, and `status --stage delivery` keeps counting "
+                           "them until one does",
                            {"by_state": evidence.get("by_state"), "loop": loop})
         if evidence.get("past_expiry"):
             # An artifact that aged out says the outbox was never claimed, and there are two
