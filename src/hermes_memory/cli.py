@@ -483,6 +483,17 @@ def main(argv: list[str] | None = None) -> int:
                           help="speak for a fixed instant instead for now; for a backfill or "
                                "a rehearsal, never for a live alert")
 
+    deliver = sub.add_parser(
+        "deliver",
+        help="hand the owner's ready artifacts to the transport and record what came back; "
+             "this is the outbox's only caller, and nothing sends without it")
+    deliver.add_argument("--hermes-home",
+                         help="deliver the memory enrolled for this Hermes profile home")
+    deliver.add_argument("--profile", help="deliver this profile's outbox")
+    deliver.add_argument("--limit", type=int, default=1,
+                         help="the most artifacts to send in this run (1-25); a bounded drain "
+                              "is what makes an interrupted one knowable")
+
     cancel = sub.add_parser(
         "cancel",
         help="stop work: a queued job and the backend operation behind it, or say what is "
@@ -595,6 +606,8 @@ def main(argv: list[str] | None = None) -> int:
         return _evaluate_command(settings, args)
     if args.command == "maintain":
         return _maintenance_command(settings, args)
+    if args.command == "deliver":
+        return _deliver_command(settings, args)
     if args.command == "cancel":
         return _cancel_command(settings, args)
     if args.command == "goal":
@@ -2067,6 +2080,60 @@ def _maintenance_command(settings, args) -> int:
     if not report.get("ok"):
         return _emit(report, 2)
     return _emit(report)
+
+
+def _delivery_target(settings, *, hermes_home: str | None, profile: str | None):
+    """The one memory whose outbox is being drained, and the home a send writes into.
+
+    Naming it is not ceremony here: for an installation with no messaging platform the
+    profile's Hermes home *is* the destination, so a drain that guessed which memory to
+    read would also be guessing where the owner's message lands.
+    """
+    from .install.profiles import InstallationError, ProfileRegistry
+
+    if not hermes_home and not profile:
+        raise InstallationError(
+            "delivery names the memory it drains — pass --hermes-home or --profile, "
+            "because the profile's home is also where a locally-delivered artifact goes")
+    registry = ProfileRegistry.reading(settings)
+    try:
+        item = registry.resolve(hermes_home) if hermes_home else registry.profile(profile)
+        return item.scoped(settings), Path(item.hermes_home), item.profile
+    finally:
+        registry.db.close()
+
+
+def _deliver_command(settings, args) -> int:
+    """The outbox's only caller: take what is ready, hand it over, record what came back.
+
+    The pass that decides a reminder is due deliberately does not send it — that decision
+    spends nothing and runs unattended, and a transport is not nothing. So the artifact
+    waits in the outbox until somebody runs this, and what it reports is the receipt the
+    transport actually gave, not an assumption that a file appearing means it was read.
+    """
+    from .install.profiles import InstallationError
+    from .proactive.delivery import DeliveryPolicy, deliver_ready, local_sink
+
+    try:
+        scoped, home, profile = _delivery_target(settings, hermes_home=args.hermes_home,
+                                                 profile=args.profile)
+    except InstallationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    policy = DeliveryPolicy.from_settings(scoped)
+    try:
+        with EvidenceStore(scoped.db_path) as store:
+            held = ("delivery is paused for this installation by the owner"
+                    if store.stage_is_paused("global", "delivery") else None)
+            report = deliver_ready(store, policy=policy, sink=local_sink(home),
+                                   limit=args.limit, held=held)
+    except (EvidenceError, ValueError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+    return _emit({"ok": report["ok"], "profile": profile,
+                  "target": policy.destination,
+                  "transport": str(home / "memory" / "delivered"), **report},
+                 0 if report["ok"] else 2)
 
 
 # The stop door. Unlike the background pass this one names a person: a cancelled job is a

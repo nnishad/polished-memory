@@ -170,7 +170,11 @@ and the door that ends that quiet is `hermes-memory owner --switch-delivery on -
 Europe/Amsterdam --actor "$USER" --reason "…"` — the timezone is required because the quiet
 hours and the daily cap are counted in a local day, and a reminder that arrives at the wrong
 hour is the harm this switch exists to authorize once, carefully. `--switch-delivery off`
-puts it back and asks for no clock, because nothing is being timed. `status` reports the
+puts it back and asks for no clock, because nothing is being timed. Switching it on is not
+the same as sending: the pass that finds a reminder due deliberately does not hand anything
+to a transport, so `hermes-memory deliver --hermes-home ~/.hermes` is the one caller that
+drains the outbox, and an installation that never runs it will have a policy that allows
+delivery and an outbox that stays full. `status` reports the
 stage `unconfigured` while the switch is off and names this command beside it, so an empty
 outbox says which of the two silences it is. A release record also carries the instant it was
 staged, so a hold
@@ -844,8 +848,7 @@ share, so no surface can talk to a memory it was not bound to.
 | `POST /v1/feedback` | outcome log behind `owner --confirm-lesson / --contradict-lesson / --retract-lesson` | owner, with the receipt it cites |
 | `POST /v1/forget-requests` | provider `memory_forget_request` — preview and impact manifest, erases nothing | scoped agent |
 | `POST /v1/owner/forget-confirmations` | `owner --confirm-forgetting --digest …` — the fence plus a durable obligation | owner only |
-| `POST /v1/delivery/claim` | the delivery bridge: one artifact per claim, lease and attempt correlation | fixed bridge |
-| `POST /v1/delivery/receipts` | the same bridge's proof path; a caller cannot self-report delivery | trusted receipt bridge |
+| `hermes-memory deliver` — a command, not a route | the outbox's only caller: one bounded drain, with lease and attempt correlation and the receipt the transport actually gave | this installation's own scheduler |
 | `POST /v1/owner/controls` | `pause` / `start` / `stop`, with actor and policy version recorded | owner only |
 | `GET /v1/jobs/{id}` | `form`, `maintain`, `cancel --job`, and the queue stage of `status` | scoped agent, operator |
 
