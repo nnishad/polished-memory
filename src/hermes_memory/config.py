@@ -233,6 +233,10 @@ class Settings:
     # verification on the generation route is refused, so the judge and the
     # writer cannot be the same model sharing its errors.
     verifier_route: ModelRoute | None = None
+    # How the pre-send boundary acts on an unchecked personal-memory assertion:
+    # off (skip), warn (record and send), enforce (revise or hold). Warn first so
+    # enforcement is switched on with a measured false-positive rate, not hope.
+    boundary_mode: str = "warn"
     max_output_tokens: OutputCaps = field(default_factory=OutputCaps)
     route_credentials: dict[str, str] = field(default_factory=dict)
     gate_token: str | None = None
@@ -407,6 +411,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         embeddings_route=_route(get, allowed, "EMBEDDINGS", default_resource="local-gpu"),
         reranker_route=_route(get, allowed, "RERANKER", default_resource="local-gpu"),
         verifier_route=_route(get, allowed, "VERIFIER", default_resource="remote-9b"),
+        boundary_mode=_boundary_mode(get),
         max_output_tokens=OutputCaps(
             retain=_cap(get, "RETAIN"), consolidate=_cap(get, "CONSOLIDATE"),
             reflect=_cap(get, "REFLECT"), foreground=_cap(get, "FOREGROUND")),
@@ -481,6 +486,15 @@ def _route(get, allowed: frozenset[str], key: str, *, default_resource: str):
             f"not {resource!r}: slots are per device, not per endpoint")
     return ModelRoute(base_url=base_url, resource=resource,
                       model=(get(f"{key}_MODEL") or "").strip() or None)
+
+
+def _boundary_mode(get) -> str:
+    value = (get("BOUNDARY_MODE") or "warn").strip().casefold()
+    if value not in {"off", "warn", "enforce"}:
+        raise SettingError(
+            f"HERMES_MEMORY_BOUNDARY_MODE must be off, warn or enforce, not {value!r}: "
+            "a boundary whose mode is a typo is a boundary nobody chose")
+    return value
 
 
 def _command(get, key: str) -> tuple[str, ...]:

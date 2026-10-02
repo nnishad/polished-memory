@@ -1024,6 +1024,21 @@ MIGRATIONS: Sequence[Migration] = (
         "ON projection_generations BEGIN UPDATE context_revision SET value=value+1 WHERE id=1; END"
         for operation in ("INSERT", "UPDATE", "DELETE")
     )),
+    # The send boundary's audit log. A receipt about a check is not memory content,
+    # so it carries no context_revision trigger: recording that a draft was checked
+    # must not invalidate the packets the check itself read.
+    Migration("0020_boundary", (
+        """CREATE TABLE boundary_receipts(
+            id TEXT PRIMARY KEY,
+            session_id TEXT,
+            packet_id TEXT,
+            watermark TEXT NOT NULL,
+            mode TEXT NOT NULL CHECK(mode IN ('off','warn','enforce')),
+            disposition TEXT NOT NULL CHECK(disposition IN ('pass','revise','block')),
+            claims_json TEXT NOT NULL,
+            digests TEXT NOT NULL,
+            created_at TEXT NOT NULL)""",
+    )),
 )
 
 

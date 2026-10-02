@@ -442,6 +442,10 @@ class HermesMemoryProvider(_MemoryProvider):
         self._owner_reply = ""
         self._agent_context = "primary"
         self._last_injected = 0
+        # The packet this turn actually injected, kept so the pre-send boundary can
+        # check a draft against exactly what the agent was given — not a re-recall.
+        self._last_packet = None
+        self._last_query = ""
         self._unavailable = ""
         # A connection and a packet cache per thread, not per provider: see `_thread_cache`.
         self._local = threading.local()
@@ -1096,6 +1100,43 @@ class HermesMemoryProvider(_MemoryProvider):
                             "rejected": check["rejected"],
                             "claims_digest": check["claims_digest"]}}
 
+    # -- the pre-send boundary ----------------------------------------------
+
+    def pre_send(self, draft: str, turn_context: Any = None) -> dict[str, Any]:
+        """The host's last door: check personal-memory claims before the reply ships.
+
+        Optional provider method (the host calls it only if present). The draft is
+        checked against the packet this turn injected, so the agent may assert what
+        it was given and nothing more. Returns the boundary verdict; the host
+        applies the action (none / downgrade / hold) per the configured mode.
+        """
+        settings = self._bound().settings
+        if getattr(settings, "boundary_mode", "warn") == "off":
+            return {"ok": True, "disposition": "pass", "mode": "off",
+                    "action": {"mode": "none"}, "claims": [], "detector": {},
+                    "receipt": {}}
+        context = turn_context if isinstance(turn_context, dict) else {}
+        packet = self._last_packet
+        if packet is None:
+            query = str(context.get("query") or self._last_query or "").strip()
+            if query:
+                try:
+                    packet = self._broker().assemble(
+                        query, limit=8, lessons=self._lessons(),
+                        account_id=self._caller_account_id)
+                except Exception:
+                    packet = None
+        from hermes_memory.processing.boundary import SendBoundary
+
+        boundary = SendBoundary(settings=settings, store=self._thread_store(),
+                                account_id=self._caller_account_id)
+        verdict = boundary.check(draft or "", packet=packet,
+                                 session_id=str(context.get("session_id") or self._session_id
+                                                or ""))
+        payload = verdict.as_dict()
+        payload["ok"] = True
+        return payload
+
     # -- context injection ---------------------------------------------------
 
     def system_prompt_block(self) -> str:
@@ -1131,9 +1172,13 @@ class HermesMemoryProvider(_MemoryProvider):
             return ""
         answered = ""
         wanted = query.strip()
+        self._last_query = wanted
         warmed = self._consume_queued(wanted, session_id)
         if warmed is not None:
             self._last_injected = warmed[1]
+            # The warmed queue carries the rendered packet, not the object; the
+            # boundary re-derives it from the query (a cache hit in practice).
+            self._last_packet = None
             return f"{answered}\n\n{warmed[0]}".strip()
         try:
             packet = self._broker().assemble(wanted, limit=8, lessons=self._lessons(),
@@ -1142,9 +1187,11 @@ class HermesMemoryProvider(_MemoryProvider):
             # A store we cannot read is not an empty archive, and the difference
             # is the whole reason the packet carries its channels.
             self._last_injected = 0
+            self._last_packet = None
             return (f"{answered}\n\n(Memory could not be consulted: {str(error)[:160]}. "
                     "Treat this as retrieval failure, not as absence.)").strip()
         self._last_injected = len(packet.items)
+        self._last_packet = packet
         return f"{answered}\n\n{packet.render()}".strip()
 
     def _settle_from_turn(self, query: str, *, inbound_context=None) -> str:

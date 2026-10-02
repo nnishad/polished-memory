@@ -38,8 +38,9 @@ provides_tools:
 # `get_tool_schemas()` after the provider initializes, so `provides_tools` below is a
 # declaration the static doctor cannot confirm from registration alone.
 # Notably there is no provider-initiated notification hook in Hermes, so proactive output is
-# left as a durable artifact for cron to collect.
-provides_hooks: []
+# left as a durable artifact for cron to collect. pre_send is the host's outbound gate: the
+# provider implements it so personal-memory claims in a reply are checked before delivery.
+provides_hooks: [pre_send]
 
 # Maps to plugins.entries.hermes-memory.settings. The host parses this as a flat mapping of
 # setting name -> spec ({type: str, description: …}), *not* as JSON Schema: writing it as

@@ -820,7 +820,7 @@ def test_provider_overrides_only_verified_hermes_hooks(plugin):
         "handle_tool_call", "shutdown", "on_turn_start", "identity_signature",
         "on_session_end", "on_session_switch", "on_pre_compress", "on_delegation",
         "get_config_schema", "save_config", "on_memory_write", "backup_paths",
-        "pre_compress_checkpoint_api_version",
+        "pre_compress_checkpoint_api_version", "pre_send",
     }
     declared = {key for key in vars(plugin.HermesMemoryProvider) if not key.startswith("_")}
     assert declared - verified == set()
@@ -1749,9 +1749,11 @@ def test_the_manifest_claims_exactly_what_the_provider_registers(provider):
         return items
 
     registered = sorted(str(item.get("name")) for item in provider.get_tool_schemas())
-    assert listed("provides_hooks") == [], \
-        ("a memory provider dispatches lifecycle callbacks through the manager, not the "
-         "host's hook registry, so it subscribes to no hook event")
+    assert listed("provides_hooks") == ["pre_send"], \
+        ("the only host hook this provider subscribes to is the outbound gate; lifecycle "
+         "callbacks still ride the memory manager, not the hook registry")
+    assert "pre_send" in vars(type(provider)), \
+        "the manifest declares pre_send, so the provider must implement it"
     assert sorted(listed("provides_tools") or []) == registered, \
         (f"the manifest declares {sorted(listed('provides_tools') or [])} but the provider "
          f"registers {registered}")

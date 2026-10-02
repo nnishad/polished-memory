@@ -11,6 +11,7 @@ from hermes_memory.install import activation
 from hermes_memory.install.release import _registerable_snapshot, _source_fingerprints
 from hermes_memory.ids import digest
 from hermes_memory.storage.evidence import EvidenceStore
+from hermes_memory.storage.migrations import MIGRATIONS
 from hermes_memory.install.upgrade import UpgradeError
 
 
@@ -63,7 +64,10 @@ def candidate(tmp_path, monkeypatch):
         elif "is-active" in argv:
             output = "inactive\n"
         elif activation.PROBE in argv:
-            output = json.dumps({"digest": "paired", "schema": 17})
+            # The probe must answer with the schema this code actually opens, or the
+            # plan reads a matching store as a downgrade. A literal here would turn
+            # every future migration into a false "code downgrade" refusal.
+            output = json.dumps({"digest": "paired", "schema": len(MIGRATIONS)})
         elif "install" in argv and "plugins" in argv:
             (host / "plugins/.install-metadata.json").write_text(json.dumps({
                 "hermes-memory": {"revision": commit}}))
