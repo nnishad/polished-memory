@@ -286,6 +286,7 @@ class ContextBroker:
             tokens_used=spent, took_ms=int((self.clock() - started) * 1000),
             conflicts=conflicts, epoch=epoch, revision=revision, withheld=withheld,
             deduped=tuple(dropped_dupes),
+            window=tuple(window) if window else None,
         )
         packet = _with_id(packet)
         if self.cache is not None and not store_moved:

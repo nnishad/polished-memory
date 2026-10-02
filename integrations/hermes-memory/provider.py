@@ -15,6 +15,7 @@ import json
 import re
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,34 @@ _PREFETCH_TOKENS = 1200
 _MAX_ITEMS = 20
 
 
+def _window(since: Any, until: Any) -> tuple[str | None, str | None] | None:
+    """Validate a caller-supplied temporal window into the broker's (start, end) form.
+
+    Absolute ISO-8601 only: relative phrasing is the model's job, and a fuzzy date
+    library here would turn "around March" into a precision the archive does not
+    have. Bounds are normalized to ISO so the broker's string comparison against
+    occurred_at is comparing like with like; an inverted window is a caller error,
+    not an empty result.
+    """
+    if since is None and until is None:
+        return None
+
+    def parse(value: Any, name: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be an ISO-8601 date or datetime string")
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).isoformat()
+        except ValueError:
+            raise ValueError(f"{name} is not ISO-8601: {value!r}") from None
+
+    start, end = parse(since, "since"), parse(until, "until")
+    if start and end and start > end:
+        raise ValueError(f"since ({start}) is after until ({end}); a window cannot be inverted")
+    return (start, end)
+
+
 # The owner acts a question may be about, spelled out rather than imported: the host
 # imports this module before it knows whether hermes_memory is installed, and a tool schema
 # cannot be built lazily. A test holds this list against ``operations.decisions.ACTS``,
@@ -131,6 +160,19 @@ _TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "What to look for."},
                 "limit": {"type": "integer", "description": "Maximum results, 1-20."},
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Optional ISO-8601 lower bound on when the evidence occurred "
+                        "(e.g. 2026-09-01 or 2026-09-01T00:00:00+00:00). Convert relative "
+                        "phrasing like 'last week' to an absolute date yourself; only "
+                        "absolute ISO values are accepted. Undated records still pass."
+                    ),
+                },
+                "until": {
+                    "type": "string",
+                    "description": "Optional ISO-8601 upper bound on when the evidence occurred.",
+                },
                 "task": {
                     "type": "object",
                     "description": (
@@ -565,7 +607,8 @@ class HermesMemoryProvider(_MemoryProvider):
             return self._status()
         if tool_name == "memory_recall":
             return self._recall(str(args.get("query", "")), int(args.get("limit") or 10),
-                                args.get("task"))
+                                args.get("task"), since=args.get("since"),
+                                until=args.get("until"))
         if tool_name == "memory_verify":
             from hermes_memory.processing.verification import verify_memory_claims
 
@@ -840,7 +883,8 @@ class HermesMemoryProvider(_MemoryProvider):
         settings.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         return EvidenceStore(settings.db_path)
 
-    def _recall(self, query: str, limit: int, task: Any = None) -> dict[str, Any]:
+    def _recall(self, query: str, limit: int, task: Any = None, *,
+                since: Any = None, until: Any = None) -> dict[str, Any]:
         """One packet, assembled by the same broker prefetch() uses.
 
         The ceiling is the broker's, not the caller's: honouring a tool-supplied
@@ -850,7 +894,8 @@ class HermesMemoryProvider(_MemoryProvider):
         """
         broker = self._broker()
         packet = broker.assemble(query, limit=min(max(1, limit), _MAX_ITEMS),
-                                 lessons=self._lessons(task), account_id=self._caller_account_id)
+                                 lessons=self._lessons(task), account_id=self._caller_account_id,
+                                 window=_window(since, until))
         payload = packet.as_dict()
         payload["ok"] = True
         payload["channel"] = "context_broker"

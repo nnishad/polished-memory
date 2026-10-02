@@ -106,6 +106,9 @@ class Packet:
     # Record ids folded into a higher-ranked near-twin during assembly. Named so
     # suppression is a fact in the packet, not a silent shrink of the result list.
     deduped: tuple[str, ...] = ()
+    # The temporal window the caller asked for, so "nothing in March" and "nothing
+    # at all" never read the same way.
+    window: tuple[str | None, str | None] | None = None
 
     @property
     def empty(self) -> bool:
@@ -125,7 +128,8 @@ class Packet:
                 "tokens_used": self.tokens_used, "took_ms": self.took_ms,
                 "conflicts": list(self.conflicts), "epoch": self.epoch,
                 "revision": self.revision, "withheld": self.withheld,
-                "deduped": list(self.deduped)}
+                "deduped": list(self.deduped),
+                "window": list(self.window) if self.window else None}
 
     def _caveats(self) -> list[str]:
         notes: list[str] = []
@@ -155,6 +159,10 @@ class Packet:
         if self.deduped:
             notes.append(f"{len(self.deduped)} near-duplicate record(s) were folded into their "
                          "higher-ranked twin; the wording was repeated, not the fact")
+        if self.window:
+            start, end = self.window
+            notes.append("only evidence dated within the requested window was considered: "
+                         f"{start or 'the beginning'} .. {end or 'now'}; undated records still pass")
         if self.summaries:
             notes.append("summaries are this archive's own readings of the evidence, not a "
                          "second sighting of it; quote the record, not the digest")
