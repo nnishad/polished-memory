@@ -65,7 +65,8 @@ def _item(evidence, *, text: str | None = None, span_truncated: bool = False) ->
         text=evidence.text if text is None else text,
         occurred_at=evidence.occurred_at, occurred_precision=evidence.occurred_precision,
         observed_at=evidence.observed_at, channel="lexical", score=1.0,
-        span_truncated=span_truncated)
+        span_truncated=span_truncated,
+        agent_authored=bool((evidence.metadata or {}).get("agent_authored")))
 
 
 class ContextBroker:

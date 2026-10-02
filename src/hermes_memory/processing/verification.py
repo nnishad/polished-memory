@@ -41,9 +41,16 @@ def verify_memory_claims(settings, store, claims, *, account_id=None, client=Non
                 or not in_scope(evidence_accounts(identity, record), identifiers)):
             # Do not expose whether another person's source exists.
             raise HindsightError("claim evidence is unavailable in the caller's scope")
+        if record.metadata.get("agent_authored"):
+            # An agent note is the agent's own prose, not a sighting. Allowing it as
+            # evidence would let unverified writing certify itself a turn later.
+            raise HindsightError(
+                "claim evidence cites an unverified agent note; agent-authored records "
+                "are not admissible evidence")
         evidence.append({"record_id": record.id, "revision": record.revision,
                          "text": record.text, "source": record.source,
-                         "role": record.metadata.get("role"), "occurred_at": record.occurred_at})
+                         "role": record.metadata.get("role"), "occurred_at": record.occurred_at,
+                         "agent_authored": bool(record.metadata.get("agent_authored"))})
     table = build_routes(settings, credentials=settings.route_credentials)
     route = table.by_name("foreground")
     verifier = table.by_name("verifier") if "verifier" in table.names() else None

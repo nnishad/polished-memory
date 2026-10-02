@@ -52,6 +52,10 @@ class EvidenceItem:
     # what is missing is not nothing.
     span_truncated: bool = False
     score: float = 0.0
+    # Written by the agent itself without canonical evidence. Rendered as a labeled
+    # note and never admissible as evidence for a checked claim, so the agent's own
+    # prose cannot launder into a "verified" fact a turn later.
+    agent_authored: bool = False
     # Backend documents a derived item was read out of, empty for local evidence.
     provenance: tuple[str, ...] = ()
 
@@ -62,6 +66,7 @@ class EvidenceItem:
                 "observed_at": self.observed_at, "channel": self.channel,
                 "provenance_complete": self.provenance_complete,
                 "span_truncated": self.span_truncated,
+                "agent_authored": self.agent_authored,
                 "provenance": list(self.provenance)}
 
 
@@ -189,7 +194,9 @@ class Packet:
         for item in self.items:
             when = item.occurred_at or "time unknown"
             cut = "…" if item.span_truncated else ""
-            lines.append(f"- [{item.source} @ {when}; record_id={item.id}] {item.text[:600]}{cut}")
+            note = " (agent note, unverified)" if item.agent_authored else ""
+            lines.append(f"- [{item.source} @ {when}; record_id={item.id}]{note} "
+                         f"{item.text[:600]}{cut}")
         for summary in self.summaries:
             text = str(summary.get("body") or "")[:600]
             if text:

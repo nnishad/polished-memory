@@ -12,6 +12,7 @@ cron transport to pick up.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -117,6 +118,29 @@ def _window(since: Any, until: Any) -> tuple[str | None, str | None] | None:
     return (start, end)
 
 
+def _remember_strict() -> bool:
+    """Owner knob: refuse unevidenced personal-memory claims at write time.
+
+    Read per call, not at import, so a test (or an operator flipping the env) sees
+    the change without a restart. Off by default: operational notes ("user asked
+    for a reminder") are legitimate agent writing and must not need evidence.
+    """
+    return os.environ.get("HERMES_MEMORY_REMEMBER_STRICT", "").strip().casefold() \
+        in {"1", "true", "yes", "on"}
+
+
+# The seed of the F1 send-boundary detector: second-person assertions about the
+# owner are the shape a personal-memory claim takes. Conservative on purpose —
+# over-matching only costs a request for evidence, under-matching stores a guess.
+_PERSONAL_MARKERS = re.compile(
+    r"\b(you|your|yours|you're|you are|you have|you've|you had|you will|you'll|you like|"
+    r"you prefer|the user|the owner)\b", re.IGNORECASE)
+
+
+def _looks_personal(text: str) -> bool:
+    return bool(_PERSONAL_MARKERS.search(text or ""))
+
+
 # The owner acts a question may be about, spelled out rather than imported: the host
 # imports this module before it knows whether hermes_memory is installed, and a tool schema
 # cannot be built lazily. A test holds this list against ``operations.decisions.ACTS``,
@@ -188,13 +212,35 @@ _TOOLS = [
     },
     {
         "name": "memory_remember",
-        "description": "Store an explicit statement as durable evidence.",
+        "description": (
+            "Store an explicit statement as durable evidence. Supply `evidence` "
+            "(verbatim quotes from records memory_recall returned) and the statement is "
+            "verified against that evidence before it is stored; without evidence it is "
+            "stored as an unverified agent note and labeled as such on recall."
+        ),
         "parameters": {
             "type": "object",
             "required": ["content"],
             "properties": {
                 "content": {"type": "string"},
                 "context": {"type": "string", "description": "Short label for the kind of memory."},
+                "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "description": (
+                        "Canonical evidence the statement is drawn from, as returned by "
+                        "memory_recall: [{record_id, quote}] with quote copied verbatim "
+                        "from that record. Verified before the memory is stored."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["record_id", "quote"],
+                        "properties": {"record_id": {"type": "string"},
+                                       "quote": {"type": "string"}},
+                    },
+                },
             },
         },
     },
@@ -983,25 +1029,72 @@ class HermesMemoryProvider(_MemoryProvider):
             raise ValueError("content must not be empty")
         from hermes_memory.ids import digest
 
+        evidence = args.get("evidence")
+        verification = None
+        stored_text = content
         with self._open_store() as store:
+            if evidence:
+                verification = self._verify_remember(store, content, evidence)
+                stored_text = verification["text"]
+            elif _remember_strict() and _looks_personal(content):
+                raise ValueError(
+                    "strict remember: a personal-memory claim needs evidence; supply "
+                    "[{record_id, quote}] from memory_recall, or store it as an "
+                    "operational note without personal assertions")
             revision = str(store.epoch())
+            metadata = {"context": str(args.get("context", "user preference"))[:200],
+                        "session_id": self._session_id,
+                        "profile": self._bound().name,
+                        # An unevidenced remember is the agent's own prose, not a
+                        # sighting: labeled on recall and inadmissible as evidence.
+                        "agent_authored": verification is None}
+            if verification is not None:
+                metadata["verification"] = verification["receipt"]
             committed = store.commit({
                 "source": "hermes",
                 # Not ``hash()``: Python salts string hashes per process, so an
                 # id built from it would differ after every restart and the same
                 # statement would be remembered twice.
-                "source_id": f"explicit:{digest(content)[:16]}",
+                "source_id": f"explicit:{digest(stored_text)[:16]}",
                 "revision": revision,
                 "kind": "explicit_remember",
-                "text": content,
+                "text": stored_text,
                 "observed_at": _utc_now(),
                 "occurred_at": None,
                 "occurred_precision": "unknown",
-                "metadata": {"context": str(args.get("context", "user preference"))[:200],
-                             "session_id": self._session_id,
-                             "profile": self._bound().name},
+                "metadata": metadata,
             })
-            return {"ok": True, "id": committed["id"], "captured": True, "formed": False}
+            return {"ok": True, "id": committed["id"], "captured": True, "formed": False,
+                    "verified": verification is not None,
+                    "agent_authored": verification is None}
+
+    def _verify_remember(self, store, content: str, evidence: Any) -> dict[str, Any]:
+        """Check a to-be-stored statement against the evidence the agent cites for it.
+
+        Only the supported subset is stored; a statement the cited records do not
+        entail is refused outright rather than stored half-true.
+        """
+        from hermes_memory.processing.verification import verify_memory_claims
+
+        if not isinstance(evidence, list) or not evidence:
+            raise ValueError("evidence must be a nonempty list of {record_id, quote}")
+        record_ids = sorted({str(item.get("record_id", "")) for item in evidence
+                             if isinstance(item, dict)})
+        outcome = verify_memory_claims(
+            self._bound().settings, store,
+            [{"text": content, "record_ids": record_ids, "evidence": list(evidence)}],
+            account_id=self._caller_account_id)
+        supported = str(outcome.get("text") or "").strip()
+        if not supported:
+            raise ValueError(
+                "the cited evidence does not support this statement; nothing was stored")
+        check = outcome["verification"]
+        return {"text": supported,
+                "receipt": {"contract": check["contract"], "model": check["model"],
+                            "verifier": check.get("verifier", "generation-route"),
+                            "checked": check["checked"], "accepted": check["accepted"],
+                            "rejected": check["rejected"],
+                            "claims_digest": check["claims_digest"]}}
 
     # -- context injection ---------------------------------------------------
 
