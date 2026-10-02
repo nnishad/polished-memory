@@ -371,7 +371,9 @@ def test_a_page_stops_at_the_declared_size_and_keeps_the_servers_position():
     subject, _ = source(answer={"items": items, "next_cursor": "c2"}, records_per_page=10)
     page = subject.read_page(None)
     assert len(page.envelopes) == 10
-    assert page.next_cursor == "c2"
+    assert page.next_cursor.startswith("mcp-page-v1:")
+    second = subject.read_page(page.next_cursor)
+    assert second.envelopes[0]["source_id"] == "t10"
 
 
 def test_a_full_page_with_no_position_to_resume_from_reports_what_it_could_not_carry():
@@ -379,9 +381,10 @@ def test_a_full_page_with_no_position_to_resume_from_reports_what_it_could_not_c
     subject, _ = source(answer={"items": items}, records_per_page=10)
     page = subject.read_page(None)
     assert len(page.envelopes) == 10
-    assert page.skipped[0].ref == "threads#page-full"
-    assert "smaller page" in page.skipped[0].reason
-    assert page.next_cursor is None
+    assert not page.skipped
+    assert page.next_cursor.startswith("mcp-page-v1:")
+    records, gaps = subject.read_all()
+    assert len(records) == 30 and not gaps
 
 
 def test_an_answer_longer_than_one_page_will_hold_is_reported_not_quietly_cut(monkeypatch):
@@ -399,7 +402,9 @@ def test_a_byte_budget_stops_a_page_without_losing_the_rest():
     subject.capabilities = mcp.replace(subject.capabilities, max_bytes_per_page=50_000)
     page = subject.read_page(None)
     assert len(page.envelopes) == 1
-    assert page.next_cursor == "more"
+    assert page.next_cursor.startswith("mcp-page-v1:")
+    second = subject.read_page(page.next_cursor)
+    assert second.envelopes[0]["source_id"] == "t1"
 
 
 @pytest.mark.parametrize("answer", [None, "a string", {"no_items": []}, {"items": "abc"},

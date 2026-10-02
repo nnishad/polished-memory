@@ -68,7 +68,7 @@ def test_the_shipped_env_template_names_every_setting_the_code_reads(monkeypatch
     # A route's device and model are only asked about once its base URL is set, and an
     # output ceiling only once its operation is capped: a template that named the one and
     # not the others would look complete while hiding most of the configuration.
-    for route in ("TEXT", "VISION", "EMBEDDINGS"):
+    for route in ("TEXT", "VISION", "EMBEDDINGS", "RERANKER"):
         named |= {f"HERMES_MEMORY_{route}_{suffix}"
                   for suffix in ("BASE_URL", "RESOURCE", "MODEL")}
     named |= {f"HERMES_MEMORY_MAX_OUTPUT_TOKENS_{operation}"

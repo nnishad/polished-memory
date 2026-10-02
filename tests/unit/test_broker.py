@@ -21,11 +21,28 @@ ME = "me@example.com"
 STRANGER = "stranger@example.com"
 
 
+def test_hindi_words_keep_combining_marks_in_query_preprocessing(store):
+    from hermes_memory.storage.evidence import fts_terms
+
+    query = "मुझे चाय नहीं चाहिए"
+    assert fts_terms(query) == ["मुझे", "चाय", "नहीं", "चाहिए"]
+    record = store.commit(envelope(text=query, metadata={}))["id"]
+    assert any(item.id == record for item in store.search(query))
+
+
+def test_hinglish_query_preprocessing_preserves_negation_and_identifiers():
+    from hermes_memory.storage.evidence import fts_terms
+
+    assert fts_terms("Rohit_project42 ko chai nahi chahiye") == [
+        "Rohit_project42", "ko", "chai", "nahi", "chahiye"]
+
+
 class FakeBackend:
     """Stands in for Hindsight, using the real outcome shape."""
 
-    def __init__(self, *, results=(), truncated=(), error=None, sleep_s=0.0, during=None):
+    def __init__(self, *, results=(), source_facts=(), truncated=(), error=None, sleep_s=0.0, during=None):
         self.results = tuple(results)
+        self.source_facts = tuple(source_facts)
         self.truncated = tuple(truncated)
         self.error = error
         self.sleep_s = sleep_s
@@ -40,7 +57,8 @@ class FakeBackend:
             self.during()
         if self.error is not None:
             raise self.error
-        return RecallOutcome(results=self.results, truncated=self.truncated)
+        return RecallOutcome(results=self.results, source_facts=self.source_facts,
+                             truncated=self.truncated)
 
 
 @pytest.fixture()
@@ -72,9 +90,9 @@ def test_derived_text_without_local_evidence_is_never_claimed_as_supported(store
 
     packet = broker.assemble("preferences")
 
-    assert packet.facts and not packet.items
+    assert not packet.facts and not packet.items
     assert packet.coverage == "partial"
-    assert "derived fact" in packet.render()
+    assert "unverified" in packet.channels.detail
 
 
 def test_a_down_backend_is_not_reported_as_an_empty_archive(store, broker):
@@ -150,8 +168,9 @@ def test_the_token_ceiling_holds_and_says_so(store, broker):
 
 
 def test_derived_text_is_charged_against_the_same_ceiling(store):
+    record = store.commit(envelope(text="canonical supporting evidence", metadata={}))["id"]
     tight = ContextBroker(store, cache=None, budget_tokens=60)
-    tight.client = FakeBackend(results=[{"text": "word " * 4000}])
+    tight.client = FakeBackend(results=[{"text": "word " * 4000, "record_id": record}])
 
     packet = tight.assemble("anything")
     tight.close()

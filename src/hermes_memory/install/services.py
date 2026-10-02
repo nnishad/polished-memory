@@ -44,7 +44,7 @@ HELD_BEHIND_INFERENCE: frozenset[str] = frozenset({BACKEND_UNIT, WORKER_UNIT})
 RECORD_FILENAME = "services.json"
 PLAN_VERSION = "service-plan-v1"
 _TEMPLATE_TOKEN = re.compile(r"@([A-Z][A-Z0-9_]*)@")
-_ABSOLUTE = re.compile(r"(?:^|\s)(/\S+)")
+_ABSOLUTE = re.compile(r"(?:^|\s)[\-+!:]*(/\S+)")
 
 # Every line in a template that names a location. A token that is never answered would
 # otherwise install a unit pointing at a directory nobody chose.
@@ -219,10 +219,15 @@ def _check_locations(name: str, text: str, placed: Layout) -> None:
     """
     for line in text.splitlines():
         key, separator, value = line.strip().partition("=")
-        if not separator or key.strip() not in LOCATION_KEYS or not value.startswith("/"):
+        if not separator or key.strip() not in LOCATION_KEYS:
             continue
         for candidate in _ABSOLUTE.findall(value):
-            if not candidate.startswith(placed.roots):
+            normalized = Path(os.path.normpath(candidate))
+            allowed = any(normalized.is_relative_to(Path(os.path.normpath(root)))
+                          for root in (str(placed.release), str(placed.instance_home)))
+            # /bin is a fixed reload executable, never a writable namespace.
+            allowed = allowed or (key.strip() == "ExecReload" and normalized == Path("/bin/kill"))
+            if not allowed:
                 raise InstallationError(
                     f"{name} would let a service touch {candidate}, which is outside "
                     + " or ".join(placed.roots))

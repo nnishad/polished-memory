@@ -313,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="let bounded formation passes run under a standing grant instead "
                             "of a fresh read, until the caps named here or the expiry — not "
                             "unbounded, and not for another device than --resource covers")
+    owner.add_argument("--stage", choices=("formation", "consolidation", "synthesis", "assertions", "media"),
+                       default="formation", help="separate inference stage covered by this grant/revocation")
     owner.add_argument("--revoke-allowance", metavar="ALLOWANCE",
                        help="withdraw a standing grant; what it already spent stays spent")
     owner.add_argument("--allowances", action="store_true",
@@ -350,6 +352,8 @@ def main(argv: list[str] | None = None) -> int:
     release.add_argument("--source",
                          help="the checkout whose deployment/ and integrations/ are carried")
     release.add_argument("--wheel", help="a prebuilt wheel, rather than building one now")
+    release.add_argument("--snapshot", action="store_true",
+                         help="explicitly stage reviewed working-tree bytes, retaining their content identity")
     release.add_argument("--without-backend", action="store_true",
                          help="skip the backend environment; setup then refuses to stage "
                               "while a backend route is configured")
@@ -365,6 +369,13 @@ def main(argv: list[str] | None = None) -> int:
                          help="the staged release tree to switch to")
     upgrade.add_argument("--hermes-home",
                          help="the Hermes profile home whose host facts are reported")
+    activation = sub.add_parser("activate-release", help="review and activate a staged runtime/backend/host pair")
+    activation.add_argument("--release", required=True)
+    activation.add_argument("--hermes-home", required=True)
+    activation.add_argument("--hermes-source", required=True)
+    activation.add_argument("--apply", action="store_true")
+    activation.add_argument("--actor")
+    activation.add_argument("--review")
 
     uninstall = sub.add_parser("uninstall",
                                help="remove this installation and keep every byte of memory")
@@ -420,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
     form.add_argument("--max-jobs", type=int, default=None,
                       help="the most queued jobs to attempt in this invocation")
     form.add_argument("--actor")
+    form.add_argument("--generation", help="explicit prepared projection generation for a shadow rebuild")
     form.add_argument("--hermes-home",
                       help="form the memory enrolled for this Hermes profile home")
     form.add_argument("--review", metavar="DIGEST",
@@ -433,6 +445,15 @@ def main(argv: list[str] | None = None) -> int:
     form.add_argument("--reconcile", action="store_true",
                       help="ask the backend what became of submissions we cannot account "
                            "for; this sends no model request and spends no budget")
+
+    rebuild = sub.add_parser("rebuild", help="plan/prepare a shadow generation or review its cutover; no inference")
+    rebuild.add_argument("--hermes-home")
+    rebuild.add_argument("--generation", help="generation whose current coverage/cutover is reviewed")
+    rebuild_actions = rebuild.add_mutually_exclusive_group()
+    rebuild_actions.add_argument("--prepare", action="store_true")
+    rebuild_actions.add_argument("--activate", action="store_true")
+    rebuild.add_argument("--review", metavar="DIGEST")
+    rebuild.add_argument("--actor")
 
     summarize = sub.add_parser(
         "summarize",
@@ -597,6 +618,19 @@ def main(argv: list[str] | None = None) -> int:
         return _release_command(settings, args)
     if args.command == "upgrade":
         return _upgrade_command(settings, args)
+    if args.command == "activate-release":
+        from .install.activation import activation_plan, activate_release
+        from .install.upgrade import UpgradeError
+        from .install.profiles import InstallationError
+        try:
+            options = {"release": args.release, "hermes_home": args.hermes_home,
+                       "hermes_source": args.hermes_source}
+            report = activate_release(settings, **options, actor=args.actor, review=args.review) \
+                if args.apply else activation_plan(settings, **options)
+            return _emit(report)
+        except (UpgradeError, InstallationError, OSError, ValueError) as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
     if args.command == "uninstall":
         return _uninstall_command(settings, args)
     if args.command == "sources":
@@ -605,6 +639,8 @@ def main(argv: list[str] | None = None) -> int:
         return _import_command(settings, args)
     if args.command == "form":
         return _form_command(settings, args)
+    if args.command == "rebuild":
+        return _rebuild_command(settings, args)
     if args.command == "summarize":
         return _summarize_command(settings, args)
     if args.command == "evaluate":
@@ -1288,7 +1324,7 @@ def _owner_allowance(settings, *, name: str, args) -> int:
             return 2
     try:
         with instance_gate(settings) as gate:
-            grants = Allowances(gate.store, owner_principal=settings.owner_principal)
+            grants = Allowances(gate.store, owner_principal=settings.owner_principal, stage=args.stage)
             if name == "allowance":
                 outcome = grants.grant(actor=actor, reason=args.reason, records=args.records,
                                        tokens=args.tokens, duration_s=args.hours,
@@ -1652,7 +1688,7 @@ def _release_command(settings, args) -> int:
     try:
         if not args.apply:
             report = plan(settings=settings, into=into, source=args.source,
-                          wheel=args.wheel, backend=backend)
+                          wheel=args.wheel, backend=backend, snapshot=args.snapshot)
             return _emit({**report,
                           "next": "re-run with --apply --actor <login> --review <the digest "
                                   "above>. Nothing here moves runtime/current once it exists "
@@ -1662,7 +1698,8 @@ def _release_command(settings, args) -> int:
             raise ReleaseError("staging fetches packages and writes two interpreters; the "
                                "approval is the digest the plan printed, and none was given")
         report = stage(settings=settings, into=into, source=args.source, wheel=args.wheel,
-                       actor=args.actor or "", review=args.review, backend=backend)
+                       actor=args.actor or "", review=args.review, backend=backend,
+                       snapshot=args.snapshot)
     except (ReleaseError, InstallationError, OSError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -1956,13 +1993,13 @@ def _form_command(settings, args) -> int:
                   "it", file=sys.stderr)
             return 2
         try:
-            return _emit(formation_reconcile(settings, limit=limit))
+            return _emit(formation_reconcile(settings, limit=limit, generation_id=args.generation))
         except FormationError as error:
             print(f"refused: {error}", file=sys.stderr)
             return 2
     max_jobs = MAX_JOBS if args.max_jobs is None else args.max_jobs
     try:
-        proposal = formation_plan(settings, limit=limit)
+        proposal = formation_plan(settings, limit=limit, generation_id=args.generation)
     except FormationError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -1979,8 +2016,50 @@ def _form_command(settings, args) -> int:
         return _emit(formation_apply(
             settings, review=args.review, under_allowance=args.under_allowance,
             actor=args.actor or settings.owner_principal or "",
-            limit=limit, max_jobs=max_jobs))
+            limit=limit, max_jobs=max_jobs, generation_id=args.generation))
     except FormationError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
+
+
+def _rebuild_command(settings, args) -> int:
+    """Local owner-reviewed generation lifecycle, not a backend provisioning bypass."""
+    from .backend.generations import GenerationRegistry
+    from .install.profiles import InstallationError
+    from .processing.formation import processor_manifest, retain_route
+    from .storage.evidence import EvidenceError, EvidenceStore, ReadOnlyStore
+    try:
+        scoped = _memory_for_home(settings, args.hermes_home)
+        if not scoped.db_path.is_file():
+            raise EvidenceError("no canonical store; initialize through the owned workflow first")
+        if args.review and not (args.prepare or args.activate):
+            raise EvidenceError("--review must name a --prepare or --activate action")
+        if args.prepare and args.generation:
+            raise EvidenceError("prepare computes its generation from the current processor contract")
+        if args.activate and not args.generation:
+            raise EvidenceError("activation requires an explicit --generation")
+        if (args.prepare or args.activate) and not args.review:
+            raise EvidenceError("read the rebuild/cutover plan first and supply its --review digest")
+        reading = not (args.prepare or args.activate)
+        with (ReadOnlyStore(scoped.db_path) if reading else EvidenceStore(scoped.db_path)) as store:
+            if not store.db.execute("SELECT 1 FROM sqlite_master WHERE name='projection_generations'").fetchone():
+                raise EvidenceError("generation schema is not installed; upgrade through the owned workflow")
+            registry = GenerationRegistry(store, family_bank=scoped.bank_id,
+                                          owner_principal=scoped.owner_principal)
+            if args.generation:
+                plan = registry.cutover_plan(args.generation)
+                if args.activate:
+                    return _emit(registry.activate(args.generation,
+                        actor=args.actor or scoped.owner_principal, review=args.review))
+            else:
+                manifest = processor_manifest(scoped, retain_route(scoped))
+                plan = registry.plan(manifest)
+                if args.prepare:
+                    return _emit(registry.prepare(manifest,
+                        actor=args.actor or scoped.owner_principal, review=args.review))
+            return _emit({**plan, "not_performed": ["no model request", "no backend change",
+                           "no generation prepared or activated"]})
+    except (EvidenceError, InstallationError, ValueError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
 

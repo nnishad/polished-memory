@@ -26,6 +26,8 @@ from hermes_memory.processing.instance_gate import instance_gate
 from hermes_memory.processing.summarization import (MAX_BATCH, SummarizeError,
                                                    resolve_scope, scope_records,
                                                    summarize_apply, summarize_plan)
+from hermes_memory.processing.faithfulness import (canonical_evidence, normalize_claims,
+                                                   verified_result)
 from hermes_memory.storage.evidence import EvidenceStore, ReadOnlyStore
 from hermes_memory.storage.lineage import Lineage
 
@@ -42,11 +44,18 @@ class Reflects:
         self.text = text
         self.cited = cited
 
-    def reflect(self, query, **kwargs):
+    def synthesize(self, query, *, evidence, **kwargs):
         self.calls.append({"query": query, **kwargs})
-        return {"text": self.text, "facts": [{"id": f"m{i}"} for i in range(self.cited)],
-                "cited_memories": self.cited, "input_tokens": 120, "output_tokens": 30,
-                "truncated": False}
+        records = canonical_evidence(evidence)
+        # Trusted test adapter emulates a verifier receipt; real adapter uses a
+        # second gated model call. This stub is not a language-quality test.
+        claims = normalize_claims([{"text": self.text,
+            "record_ids": [item["record_id"] for item in evidence[:self.cited]],
+            "evidence": [{"record_id": item["record_id"], "quote": item["text"]}
+                         for item in evidence[:self.cited]]}], records)
+        result = verified_result(claims, ["supported"], records, model="synthetic-verifier")
+        return {**result, "cited_memories": self.cited, "input_tokens": 120,
+                "output_tokens": 30, "truncated": False}
 
 
 class Answers:
@@ -56,7 +65,7 @@ class Answers:
         self.error = error
         self.asks = 0
 
-    def reflect(self, query, **kwargs):
+    def synthesize(self, query, **kwargs):
         self.asks += 1
         raise self.error
 
@@ -70,6 +79,8 @@ def installation(tmp_path, monkeypatch):
     (home / "hermes-memory.env").write_text(
         f"HERMES_MEMORY_DATA_DIR={home / 'data'}\n"
         "HERMES_MEMORY_INFERENCE_ENABLED=true\n"
+        "HERMES_MEMORY_ADMISSION_URL=http://127.0.0.1:8124/v1\n"
+        "HERMES_MEMORY_TEXT_MODEL=synthetic-test-model\n"
         "HERMES_MEMORY_BACKGROUND_BUDGET_TOKENS=200000\n"
         f"HERMES_MEMORY_OWNER_PRINCIPAL={OWNER}\n"
         "HERMES_MEMORY_HINDSIGHT_URL=http://127.0.0.1:8123\n"
@@ -230,7 +241,7 @@ def test_planning_names_the_window_without_sending_anything(installation):
     plan = summarize_plan(installation, scope="project:survey")
     assert plan["ok"] is True and plan["kind"] == "project"
     assert plan["records"] == 2 and plan["selected"][0]["revision"] == "1"
-    assert plan["coverage"] == "truncated", "nothing has been projected to the backend yet"
+    assert plan["coverage"] == "full", "bounded canonical synthesis needs no backend projection"
     assert plan["not_performed"] and plan["review_digest"]
     with ReadOnlyStore(installation.db_path) as store:
         assert store.db.execute("SELECT count(*) FROM summaries").fetchone()[0] == 0
@@ -308,6 +319,27 @@ def test_the_question_asked_names_the_scope_and_the_ceiling(installation):
     assert "Say only what the evidence supports" in ask
 
 
+def test_summary_cites_actual_used_input_not_every_planned_record(installation):
+    result = approve(installation, Reflects(cited=1), scope="project:survey")
+    assert result["citations"] == 1 and result["planned_inputs"] == 2
+    with ReadOnlyStore(installation.db_path) as store:
+        assert store.db.execute("SELECT count(*) FROM derived_citations WHERE artifact_id=?",
+                                (result["summary"],)).fetchone()[0] == 1
+
+
+def test_authority_change_during_synthesis_withholds_the_result(installation):
+    class Changing(Reflects):
+        def synthesize(self, query, *, evidence, **kwargs):
+            with EvidenceStore(installation.db_path) as store:
+                store.hide(evidence[0]["record_id"], reason="withdrawn", actor=OWNER)
+            return super().synthesize(query, evidence=evidence, **kwargs)
+
+    result = approve(installation, Changing(), scope="project:survey")
+    assert result["ok"] is False and "authority changed" in result["refused"]
+    with ReadOnlyStore(installation.db_path) as store:
+        assert store.db.execute("SELECT count(*) FROM summaries").fetchone()[0] == 0
+
+
 def test_an_unapproved_digest_is_refused_before_the_backend_is_asked(installation):
     client = Reflects()
     with pytest.raises(SummarizeError, match="does not match"):
@@ -334,10 +366,120 @@ def test_a_summary_of_nothing_cannot_be_filed_even_if_the_backend_volunteers_pro
 
 
 def test_an_answer_with_no_words_in_it_leaves_the_scope_unsummarized(installation):
-    with pytest.raises(SummarizeError, match="no text"):
-        approve(installation, Reflects(text="   \n "), scope="project:survey")
+    outcome = approve(installation, Reflects(text="   \n "), scope="project:survey")
+    assert outcome["ok"] is False
     with ReadOnlyStore(installation.db_path) as store:
         assert store.db.execute("SELECT count(*) FROM summaries").fetchone()[0] == 0
+
+
+def test_custom_summary_client_cannot_publish_without_semantic_receipt(installation):
+    class Unchecked:
+        def synthesize(self, query, *, evidence, **kwargs):
+            return {"text": "The owner weighs 90 kg.",
+                    "record_ids": [evidence[0]["record_id"]], "input_tokens": 1}
+    outcome = approve(installation, Unchecked(), scope="project:survey")
+    assert outcome["ok"] is False and "semantically checked" in outcome["refused"]
+    with ReadOnlyStore(installation.db_path) as store:
+        assert store.db.execute("SELECT count(*) FROM summaries").fetchone()[0] == 0
+
+
+def test_summary_rewrite_after_verification_is_withheld(installation):
+    class Rewritten(Reflects):
+        def synthesize(self, query, **kwargs):
+            result = super().synthesize(query, **kwargs)
+            result["text"] += " The owner weighs 90 kg."
+            return result
+    outcome = approve(installation, Rewritten(), scope="project:survey")
+    assert outcome["ok"] is False
+
+
+class ChecksClaims:
+    def __init__(self, *, label="supported", during=None):
+        self.label, self.during, self.calls = label, during, []
+
+    def verify_claims(self, claims, *, evidence, **kwargs):
+        self.calls.append(evidence)
+        records = canonical_evidence(evidence)
+        normalized = normalize_claims(claims, records)
+        output = verified_result(normalized, [self.label] * len(claims), records, model="test")
+        if self.during:
+            self.during()
+        return output
+
+
+def verification_claim(record):
+    return {"text": record.text, "record_ids": [record.id],
+            "evidence": [{"record_id": record.id, "quote": record.text}]}
+
+
+def test_scoped_verification_returns_checked_text_without_writing_memories(installation):
+    from hermes_memory.processing.verification import verify_memory_claims
+    client = ChecksClaims()
+    with EvidenceStore(installation.db_path) as store:
+        record = store.get(ids(store)[0])
+        stamp = store.watermark()
+        output = verify_memory_claims(installation, store, [verification_claim(record)], client=client)
+        assert output["all_supported"] and output["text"] == record.text
+        assert store.watermark() == stamp
+        assert client.calls[0][0]["revision"] == record.revision
+
+
+def test_scoped_verification_returns_empty_text_for_rejected_claims(installation):
+    from hermes_memory.processing.verification import verify_memory_claims
+    with EvidenceStore(installation.db_path) as store:
+        record = store.get(ids(store)[0])
+        output = verify_memory_claims(installation, store, [verification_claim(record)],
+                                      client=ChecksClaims(label="insufficient_evidence"))
+        assert output["ok"] and not output["all_supported"] and output["text"] == ""
+
+
+def test_scoped_verification_refuses_hidden_sources_before_inference(installation):
+    from hermes_memory.processing.verification import verify_memory_claims
+    client = ChecksClaims()
+    with EvidenceStore(installation.db_path) as store:
+        record = store.get(ids(store)[0])
+        store.hide(record.id, reason="test", actor=OWNER)
+        with pytest.raises(HindsightError, match="caller"):
+            verify_memory_claims(installation, store, [verification_claim(record)], client=client)
+        assert not client.calls
+
+
+def test_scoped_verification_refuses_another_accounts_sources(installation):
+    from hermes_memory.processing.verification import verify_memory_claims
+    from hermes_memory.storage.identity import IdentityStore
+    client = ChecksClaims()
+    with EvidenceStore(installation.db_path) as store:
+        committed = store.commit(envelope(source_id="private", text="Private note",
+            metadata={"participants": [{"namespace": "email", "address": "private@example.com"}]}))
+        IdentityStore(store).account("email", "private@example.com")
+        stranger = IdentityStore(store).account("email", "stranger@example.com")
+        with pytest.raises(HindsightError, match="caller"):
+            verify_memory_claims(installation, store, [verification_claim(store.get(committed["id"]))],
+                                 account_id=stranger, client=client)
+        assert not client.calls
+
+
+def test_visibility_change_during_verification_withholds_everything(installation):
+    from hermes_memory.processing.verification import verify_memory_claims
+    with EvidenceStore(installation.db_path) as store:
+        record = store.get(ids(store)[0])
+        client = ChecksClaims(during=lambda: store.hide(record.id, reason="test", actor=OWNER))
+        with pytest.raises(HindsightError, match="authority changed"):
+            verify_memory_claims(installation, store, [verification_claim(record)], client=client)
+
+
+def test_scoped_verification_never_returns_unchecked_text_when_claims_are_empty(installation):
+    from hermes_memory.processing.verification import verify_memory_claims
+    class Bad(ChecksClaims):
+        def verify_claims(self, *args, **kwargs):
+            output = super().verify_claims(*args, **kwargs)
+            output["text"] = "Invented fact"
+            return output
+    with EvidenceStore(installation.db_path) as store:
+        record = store.get(ids(store)[0])
+        with pytest.raises(HindsightError, match="semantically checked"):
+            verify_memory_claims(installation, store, [verification_claim(record)],
+                                 client=Bad(label="insufficient_evidence"))
 
 
 def test_a_reflection_gets_a_deadline_a_generation_can_meet(installation):
@@ -396,8 +538,8 @@ def test_a_second_approved_pass_supersedes_the_first_reading(installation):
         newer = approve(installation, Reflects(text="and then the invoice was chased"),
                         scope="project:survey")
         assert newer["revision"] == 1
-        assert habits.verdict(newer["summary"]) == "partial", \
-            "nothing has been projected, so the manifest is honestly truncated"
+        assert habits.verdict(newer["summary"]) == "complete", \
+            "explicit canonical input has complete support without a backend projection"
 
 
 def test_a_mental_model_needs_the_owner_and_says_which_one(installation):

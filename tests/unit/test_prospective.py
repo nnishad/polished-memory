@@ -243,7 +243,7 @@ def test_a_message_from_a_confirmed_account_satisfies_the_condition(store):
     store_with_inbox(store)
     arrived = store.commit(envelope(observed_at="2026-09-25T11:30:00+00:00",
                                     text="I can come Thursday.",
-                                    metadata={"account_ids": [account]}))["id"]
+                                    metadata={"account_ids": [account], "author_account_id": account}))["id"]
 
     verdict = evaluate(store.db, "new_message_from",
                        {"account_id": account, "since": "2026-09-21T00:00:00+00:00"},

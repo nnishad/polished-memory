@@ -86,9 +86,12 @@ class OutcomeLog:
         teller = _text(actor, "actor", 120)
         words = _text(note, "note", 600)
         spans = [str(item) for item in evidence][:24]
-        self._check_authority(kind=kind, actor=teller, valence=valence, evidence=spans)
-        outcome_id = "outc_" + digest([subject_kind, subject, kind, valence, words,
-                                       teller])[:32]
+        self._check_authority(kind=kind, actor=teller, valence=valence, evidence=spans,
+                              subject_kind=subject_kind, subject_id=subject)
+        # One delivery is one observation, even if retold with a new note/actor.
+        identity = ([subject_kind, subject, kind, sorted(set(spans))] if kind == "host_receipt"
+                    else [subject_kind, subject, kind, valence, words, teller])
+        outcome_id = "outc_" + digest(identity)[:32]
         connection = db if db is not None else self.db
         if db is not None and not db.in_transaction:
             raise EvidenceError("recording an outcome needs an ambient transaction")
@@ -138,8 +141,10 @@ class OutcomeLog:
     # -- authority -----------------------------------------------------------
 
     def _check_authority(self, *, kind: str, actor: str, valence: str,
-                         evidence: Sequence[str]) -> None:
+                         evidence: Sequence[str], subject_kind: str, subject_id: str) -> None:
         if kind == "host_receipt":
+            if not evidence:
+                raise EvidenceError("a host receipt requires nonempty delivery evidence")
             if self.outbox is None:
                 raise EvidenceError(
                     "a host receipt needs the outbox to check it against: without a "
@@ -154,6 +159,9 @@ class OutcomeLog:
                     raise EvidenceError(
                         f"{artifact.id} is {artifact.state}, so nothing reached anybody; "
                         "a receipt has to be written against a send that happened")
+                if subject_kind != "artifact" or subject_id != artifact.id or valence != "success":
+                    raise EvidenceError("a delivery receipt proves only that exact artifact's delivery; "
+                                        "use owner reports/evaluation for task, goal or lesson outcomes")
         elif kind == "owner_report":
             if self.owner_principal is None or actor != self.owner_principal:
                 raise EvidenceError(

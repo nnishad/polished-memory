@@ -25,11 +25,17 @@ class BudgetExhausted(Exception):
 
 @dataclass(frozen=True)
 class Budget:
-    """Daily allowance for one resource, in tokens, with a call ceiling."""
+    """Daily allowance for one resource, in tokens, with call and latency ceilings.
+
+    Owner decision 2026-10-02: the text/reranker models are local, so the call and
+    cumulative-latency ceilings are raised to effectively unlimited. The token ceiling
+    stays env-driven (HERMES_MEMORY_BACKGROUND_BUDGET_TOKENS). These are large finite
+    values rather than infinity so they remain valid JSON in `report()`/doctor output.
+    """
 
     tokens: int
-    calls: int = 2000
-    seconds: float = 3600.0
+    calls: int = 1_000_000_000
+    seconds: float = 1_000_000_000.0
 
     def __post_init__(self) -> None:
         if self.tokens < 0:
@@ -79,6 +85,8 @@ class Budgets:
             raise BudgetExhausted(self.scope, resource, int(spent["tokens"]), budget.tokens)
         if spent["calls"] >= budget.calls:
             raise BudgetExhausted(self.scope, resource, int(spent["calls"]), budget.calls)
+        if budget.seconds is not None and spent["seconds"] >= budget.seconds:
+            raise BudgetExhausted(self.scope, resource, spent["seconds"], budget.seconds)
 
     def charge(self, resource: str, *, tokens: int, seconds: float = 0.0,
                calls: int = 1) -> dict[str, Any]:

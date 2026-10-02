@@ -31,6 +31,7 @@ __all__ = ["AllowanceError", "Allowances", "STAGE", "ANY_RESOURCE", "MAX_DURATIO
            "MAX_RECORDS"]
 
 STAGE = "formation"
+STAGES = frozenset({"formation", "consolidation", "synthesis", "assertions", "media"})
 # The grant names a resource ("remote-9b") or this, meaning whatever the retain route points
 # at today. A wildcard is allowed because a route's upstream changes more often than an
 # owner's willingness does — and because a *moved* endpoint must be re-decided by hand.
@@ -60,7 +61,8 @@ class Allowances:
     """The owner's standing decisions about bounded inference, and their accounting."""
 
     def __init__(self, store, *, owner_principal: str | None = None,
-                 clock: Callable[[], float] = time.time, scope: str = INSTANCE_SCOPE):
+                 clock: Callable[[], float] = time.time, scope: str = INSTANCE_SCOPE,
+                 stage: str = STAGE):
         # A reading has no owner in the room — `status` reports who holds the models without
         # naming anybody — so the principal is not required to build one. It is required to
         # grant, and an unset principal matches no actor, which fails closed rather than open.
@@ -70,6 +72,9 @@ class Allowances:
             else None
         self.clock = clock
         self.scope = scope
+        if stage not in STAGES:
+            raise AllowanceError("unsupported inference allowance stage")
+        self.stage = stage
 
     # -- the grant -----------------------------------------------------------
 
@@ -106,20 +111,24 @@ class Allowances:
         live = self.current() if wanted == ANY_RESOURCE else self.current(resource=wanted)
         if live is not None:
             raise AllowanceError(
-                f"allowance {live['id']} already covers {self.scope}/{STAGE}/"
+                f"allowance {live['id']} already covers {self.scope}/{self.stage}/"
                 f"{live['resource']} until {live['expires_at']}; revoke it first — a second "
                 "grant for one device would have to be added up to be read, and a permission "
                 "that needs arithmetic is not a permission")
-        identifier = "alw_" + digest([self.scope, STAGE, wanted, actor.strip(),
+        identifier = "alw_" + digest([self.scope, self.stage, wanted, actor.strip(),
                                       reason, _instant(moment), records, tokens,
                                       _instant(end)])[:24]
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            # The wildcard conflict check must also run under the write lock;
+            # the per-resource unique index alone cannot arbitrate '*' vs named.
+            if self.current(resource=None if wanted == ANY_RESOURCE else wanted) is not None:
+                raise AllowanceError("a live allowance already covers this stage/resource")
             self.db.execute(
                 "INSERT INTO allowances(id, scope, stage, resource, actor, reason, "
                 "granted_at, expires_at, max_records, token_budget, state) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?, 'active')",
-                (identifier, self.scope, STAGE, wanted, actor.strip(), reason,
+                (identifier, self.scope, self.stage, wanted, actor.strip(), reason,
                  _instant(moment), _instant(end), records, tokens))
             self.db.execute("COMMIT")
         except sqlite3.IntegrityError:
@@ -166,7 +175,7 @@ class Allowances:
         """
         rows = self.db.execute(
             "SELECT id, expires_at, resource FROM allowances WHERE scope=? AND stage=? "
-            "AND state='active' ORDER BY granted_at", (self.scope, STAGE)).fetchall()
+            "AND state='active' ORDER BY granted_at", (self.scope, self.stage)).fetchall()
         moment = self.clock()
         wanted = resource.strip() if isinstance(resource, str) and resource.strip() else None
         chosen = None
@@ -190,7 +199,7 @@ class Allowances:
         """
         rows = self.db.execute(
             "SELECT id, expires_at FROM allowances WHERE scope=? AND stage=? AND "
-            "state='active'", (self.scope, STAGE)).fetchall()
+            "state='active'", (self.scope, self.stage)).fetchall()
         moment = self.clock()
         retired = [str(row["id"]) for row in rows if _epoch(str(row["expires_at"])) <= moment]
         for identifier in retired:
@@ -220,7 +229,7 @@ class Allowances:
         else:
             row = self.current(resource=resource)
             if row is None:
-                return None, (f"no active allowance covers {self.scope}/{STAGE}/{resource}; "
+                return None, (f"no active allowance covers {self.scope}/{self.stage}/{resource}; "
                               "run `hermes-memory owner --grant-allowance`, or approve a "
                               "pass one at a time with `form --review <digest>`")
         if row["resource"] not in (ANY_RESOURCE, resource):
@@ -251,8 +260,7 @@ class Allowances:
             raise AllowanceError("consumption cannot be negative")
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute("SELECT * FROM allowances WHERE id=?",
-                                  (identifier,)).fetchone()
+            row = self._row(identifier)
             if row is None:
                 raise AllowanceError(f"no allowance {identifier!r} to charge")
             used_records = int(row["used_records"]) + int(records)
@@ -273,7 +281,7 @@ class Allowances:
     def ledger(self, *, include_closed: bool = False) -> list[dict[str, Any]]:
         rows = self.db.execute(
             "SELECT id FROM allowances WHERE scope=? AND stage=? ORDER BY granted_at",
-            (self.scope, STAGE)).fetchall()
+            (self.scope, self.stage)).fetchall()
         out = [self.state(str(row["id"])) for row in rows]
         return out if include_closed else [entry for entry in out
                                            if entry["state"] == "active"]
@@ -304,8 +312,8 @@ class Allowances:
     def _row(self, identifier: str) -> sqlite3.Row | None:
         if not isinstance(identifier, str) or not identifier.strip():
             raise AllowanceError("an allowance is named by its id")
-        return self.db.execute("SELECT * FROM allowances WHERE id=?",
-                               (identifier.strip(),)).fetchone()
+        return self.db.execute("SELECT * FROM allowances WHERE id=? AND scope=? AND stage=?",
+                               (identifier.strip(), self.scope, self.stage)).fetchone()
 
     def _expiry(self, *, moment: float, duration_s: float | None,
                 expires_at: str | None) -> float:

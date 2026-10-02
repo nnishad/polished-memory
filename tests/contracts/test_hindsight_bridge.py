@@ -66,6 +66,42 @@ def mapped(store):
 
 # -- handshake ---------------------------------------------------------------
 
+def test_reflection_support_readback_is_exact_and_recursive(client, transport):
+    transport.when(f"POST /v1/default/banks/{BANK}/reflect", TransportResult(200,
+        {"text": "Coffee", "based_on": {"memories": [{"id": "observation-1", "text": "Coffee"}]}}))
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/observation-1", TransportResult(200,
+        {"id": "observation-1", "text": "Coffee", "source_memory_ids": ["fact-1"], "fact_type": "observation"}))
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/fact-1", TransportResult(200,
+        {"id": "fact-1", "document_id": "canonical-document", "text": "Coffee"}))
+    result = client.reflect("Drink?", include_support=True)
+    assert result["facts"][0]["source_fact_ids"] == ["fact-1"]
+    assert result["source_facts"][0]["document_id"] == "canonical-document"
+    assert len(transport.calls) == 3
+
+
+def test_reflection_support_cycle_and_identity_drift_are_refused(client, transport):
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/fact-1", TransportResult(200,
+        {"id": "fact-1", "source_memory_ids": ["fact-1"]}))
+    with pytest.raises(HindsightError, match="cyclic"):
+        client.hydrate_support([{"id": "fact-1"}])
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/fact-1", TransportResult(200,
+        {"id": "other-fact", "document_id": "other"}))
+    with pytest.raises(HindsightError, match="different"):
+        client.hydrate_support([{"id": "fact-1"}])
+
+
+@pytest.mark.parametrize("identifier", ["../other", "x?bank=other", "", "x" * 129])
+def test_memory_readback_rejects_path_injection_before_socket(client, transport, identifier):
+    with pytest.raises(HindsightError, match="path-safe"):
+        client.get_memory(identifier)
+    assert not transport.calls
+
+
+def test_reflection_support_identity_budget_precedes_socket(client, transport):
+    with pytest.raises(HindsightError, match="bound"):
+        client.hydrate_support([{"id": str(i)} for i in range(65)])
+    assert not transport.calls
+
 def test_an_unreachable_backend_raises_instead_of_starting_something(transport):
     transport.default = TransportResult(0, transport_error="connection refused")
     client = HindsightClient(base_url="http://127.0.0.1:1", bank_id=BANK, transport=transport)
@@ -80,6 +116,29 @@ def test_constructing_a_client_never_touches_the_network():
 
     client = HindsightClient(base_url="http://127.0.0.1:8123", bank_id=BANK, transport=explode)
     assert client.capabilities.version == PINNED_VERSION
+
+
+def test_scoped_consolidation_uses_the_pinned_native_shape(client, transport):
+    transport.default = TransportResult(200, {"operation_id": "operation-1", "deduplicated": False})
+    assert client.consolidate(observation_scopes=[["project:budget"]])["operation_id"] == "operation-1"
+    assert transport.calls[0]["url"].endswith(f"/banks/{BANK}/consolidate")
+    assert transport.calls[0]["payload"] == {"observation_scopes": [["project:budget"]]}
+
+
+@pytest.mark.parametrize("scopes", [None, [], [[]], ["tag"], [[""]], [["x" * 201]]])
+def test_consolidation_cannot_implicitly_request_every_scope(client, transport, scopes):
+    with pytest.raises(HindsightError):
+        client.consolidate(observation_scopes=scopes)
+    assert transport.calls == []
+
+
+def test_source_fact_map_keys_survive_missing_redundant_ids():
+    from hermes_memory.backend.hindsight_client import RecallOutcome
+
+    assert RecallOutcome.from_body({"source_facts": {"f1": {"text": "fact"}}}).source_facts == (
+        {"id": "f1", "text": "fact"},)
+    with pytest.raises(HindsightError, match="identities"):
+        RecallOutcome.from_body({"source_facts": {"f1": {"id": "another"}}})
 
 
 def test_an_api_key_is_sent_but_never_written_into_a_request_body(client, transport):
@@ -286,6 +345,19 @@ def test_a_synchronous_submission_with_no_answer_is_settled_by_the_document_itse
 
     assert outcome["verified"] == 1 and outcome["absent"] == 0
     assert docs.state(record, "1") == VERIFIED
+
+
+def test_present_sync_document_with_withdrawn_input_is_failed_not_coverage(mapped, transport):
+    docs, record = mapped
+    docs.begin(record, "1")
+    docs.store.hide(record, reason="withdrawn", actor="owner")
+    client = HindsightClient(base_url="http://127.0.0.1:8813", bank_id=BANK, transport=transport)
+    transport.when(f"GET /v1/default/banks/{BANK}/memories/list",
+                   TransportResult(200, {"memories": [{"id": "one"}]}))
+    outcome = docs.reconcile(client=client)
+    assert outcome["verified"] == 0
+    assert docs.state(record, "1") == FAILED
+    assert "withdrawn" in store_row(docs.store, record)["error"]
 
 
 def test_a_document_the_backend_does_not_have_is_recorded_as_gone(mapped, transport):

@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ..ids import backend_document_id, now
+from ..ids import backend_document_id, digest, now
 from ..storage.evidence import EvidenceError
 from .capabilities import (OPERATION_ABANDONED, OPERATION_DONE, OPERATION_RUNNING,
                            OPERATION_STOPPED)
@@ -31,37 +31,66 @@ ABSENT = "absent"        # erased and verified gone
 
 
 class DocumentMap:
-    def __init__(self, store, *, backend: str = "hindsight", bank_id: str = "hermes"):
+    def __init__(self, store, *, backend: str = "hindsight", bank_id: str = "hermes",
+                 generation_id: str | None = None):
         self.store = store
         self.db = store.db
         self.backend = backend
         self.bank_id = bank_id
+        self.generation_id = generation_id
+        if generation_id is not None:
+            row = self.db.execute("SELECT bank_id,backend,epoch,state FROM projection_generations "
+                                  "WHERE id=?", (generation_id,)).fetchone()
+            if (row is None or row["bank_id"] != bank_id or row["backend"] != backend
+                    or row["epoch"] != self.store.epoch() or row["state"] == "retired"):
+                raise EvidenceError("mapping generation is not a current writable bank binding")
 
     def document_id(self, record_id: str, revision: str) -> str:
         return backend_document_id(record_id, revision)
 
-    def begin(self, record_id: str, revision: str, *, async_submission: bool = False) -> dict:
+    def _writable_generation(self):
+        if self.generation_id is None:
+            return
+        row = self.db.execute("SELECT epoch,state FROM projection_generations WHERE id=?",
+                              (self.generation_id,)).fetchone()
+        if row is None or row["epoch"] != self.store.epoch() or row["state"] == "retired":
+            raise EvidenceError("projection generation is stale or retired")
+
+    def begin(self, record_id: str, revision: str, *, async_submission: bool = False,
+              context_version: int = 2) -> dict:
         """Record intent and hand back the identity to submit under.
 
         ``submission_id`` is only meaningful for an async retain; a synchronous
         call is its own confirmation, so minting an id for it would suggest a
         reconciliation path that does not exist.
         """
-        if not self.store.get(record_id, include_hidden=True):
+        record = self.store.get(record_id, include_hidden=True)
+        if not record:
             raise EvidenceError(f"cannot project unknown record {record_id!r}")
+        if record.revision != revision:
+            raise EvidenceError("projection revision differs from the canonical input revision")
+        if type(context_version) is not int or context_version not in {1, 2}:
+            raise EvidenceError("unsupported retention context contract")
         document_id = self.document_id(record_id, revision)
         submission_id = str(uuid.uuid4()) if async_submission else None
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._writable_generation()
             existing = self.db.execute(
-                "SELECT state, operation_id FROM backend_documents "
+                "SELECT state, operation_id, retain_context_version,desired_epoch,generation_id "
+                "FROM backend_documents "
                 "WHERE record_id=? AND revision=? AND backend=? AND bank_id=?",
                 (record_id, revision, self.backend, self.bank_id)).fetchone()
+            if existing and (existing["desired_epoch"] != self.store.epoch()
+                             or (self.generation_id is not None
+                                 and existing["generation_id"] != self.generation_id)):
+                raise EvidenceError("mapping has a stale epoch/generation; rebuild in a shadow bank")
             if existing and existing["state"] == VERIFIED:
                 self.db.execute("COMMIT")
                 return {"document_id": document_id, "submission_id": None,
                         "state": VERIFIED, "already_projected": True}
             if existing:
+                context_version = existing["retain_context_version"]
                 if existing["operation_id"]:
                     # Reuse the identity already on record: minting a new one
                     # would abandon the operation the backend may be running.
@@ -74,10 +103,11 @@ class DocumentMap:
             else:
                 self.db.execute(
                     "INSERT INTO backend_documents(record_id, revision, backend, bank_id, "
-                    "document_id, desired_epoch, state, operation_id, confirmed_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,NULL)",
+                    "document_id, desired_epoch, state, operation_id, confirmed_at, retain_context_version,"
+                    "generation_id,input_manifest) VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?)",
                     (record_id, revision, self.backend, self.bank_id, document_id,
-                     self.store.epoch(), SUBMITTED if submission_id else QUEUED, submission_id))
+                     self.store.epoch(), SUBMITTED if submission_id else QUEUED, submission_id,
+                     context_version, self.generation_id, self._input_manifest(record_id, revision)))
             self.store._audit("projection_begin", record_id,
                               {"revision": revision, "state": self.state(record_id, revision),
                                "document_id": document_id})
@@ -87,7 +117,42 @@ class DocumentMap:
             self.db.execute("ROLLBACK")
             raise
         return {"document_id": document_id, "submission_id": submission_id, "state": outcome,
-                "already_projected": False}
+                "already_projected": False, "context_version": context_version}
+
+    def _input_manifest(self, record_id, revision):
+        import json
+        from .generations import input_manifest
+        return json.dumps(input_manifest(self.store, record_id, revision), sort_keys=True)
+
+    def pin_payload(self, record_id: str, revision: str, payload: dict) -> None:
+        """A retry cannot reuse an operation UUID for different retained bytes.
+
+        Persist only the digest: canonical text is immutable, and the versioned
+        formatter reconstructs it without storing another private-text copy.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self._writable_generation()
+            row = self.db.execute(
+                "SELECT retain_payload_digest, document_id, desired_epoch FROM backend_documents "
+                "WHERE record_id=? AND revision=? AND backend=? AND bank_id=?",
+                (record_id, revision, self.backend, self.bank_id)).fetchone()
+            if (row is None or not self.store.live_and_visible(record_id)
+                    or row["desired_epoch"] != self.store.epoch()
+                    or payload.get("document_id") != row["document_id"]):
+                raise EvidenceError("retention payload has no current live mapping")
+            fingerprint = digest(payload)
+            if row["retain_payload_digest"] and row["retain_payload_digest"] != fingerprint:
+                raise EvidenceError("retention payload changed; reconcile the existing operation")
+            if not row["retain_payload_digest"]:
+                self.db.execute(
+                    "UPDATE backend_documents SET retain_payload_digest=? "
+                    "WHERE record_id=? AND revision=? AND backend=? AND bank_id=?",
+                    (fingerprint, record_id, revision, self.backend, self.bank_id))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
 
     def state(self, record_id: str, revision: str) -> str:
         row = self.db.execute(
@@ -111,9 +176,8 @@ class DocumentMap:
 
     def _set(self, record_id: str, revision: str, state: str, *, error: str | None,
              operation_id: str | None = None, db=None) -> None:
-        # Confirming is a statement about the epoch that is current *now*. A row that
-        # kept the epoch it was queued under would go on reporting superseded coverage
-        # as though the reset before it had never happened.
+        # Confirmation cannot promote a pre-reset submission into a new epoch.
+        # Acknowledgements describe the intent persisted before that request.
         epoch = self.store.epoch() if state == VERIFIED else None
         if db is not None and not db.in_transaction:
             raise EvidenceError("a mapping written inside a transaction needs one open")
@@ -122,6 +186,16 @@ class DocumentMap:
         if owns:
             connection.execute("BEGIN IMMEDIATE")
         try:
+            if state == VERIFIED:
+                mapping = connection.execute(
+                    "SELECT desired_epoch FROM backend_documents WHERE record_id=? AND revision=? "
+                    "AND backend=? AND bank_id=?", (record_id, revision, self.backend,
+                                                  self.bank_id)).fetchone()
+                record = self.store.get(record_id)
+                if (mapping is None or mapping["desired_epoch"] != self.store.epoch()
+                        or record is None or record.revision != revision
+                        or not self.store.live_and_visible(record_id)):
+                    raise EvidenceError("cannot confirm stale or withdrawn projection input")
             cursor = connection.execute(
                 "UPDATE backend_documents SET state=?, error=?, "
                 "desired_epoch=COALESCE(?, desired_epoch), "
@@ -170,8 +244,12 @@ class DocumentMap:
                 if state in {"present", "absent"}:
                     settled += 1
                     if state == "present":
-                        self.confirm(row["record_id"], row["revision"])
-                        verified += 1
+                        try:
+                            self.confirm(row["record_id"], row["revision"])
+                            verified += 1
+                        except EvidenceError:
+                            self.fail(row["record_id"], row["revision"],
+                                      error="present document has stale or withdrawn canonical input")
                     else:
                         self.mark_absent(row["record_id"], row["revision"])
                         absent += 1
@@ -192,8 +270,12 @@ class DocumentMap:
             state = operation_state(operation)
             settled += 1
             if state in OPERATION_DONE:
-                self.confirm(row["record_id"], row["revision"])
-                verified += 1
+                try:
+                    self.confirm(row["record_id"], row["revision"])
+                    verified += 1
+                except EvidenceError:
+                    self.fail(row["record_id"], row["revision"],
+                              error="completed operation has stale or withdrawn canonical input")
             elif state in OPERATION_ABANDONED | OPERATION_STOPPED:
                 # `not_found` belongs here: an operation the backend has no record of is a
                 # question that can never be answered, and leaving the row open would ask it

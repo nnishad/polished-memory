@@ -1,5 +1,5 @@
 {
-  "framework_digest": "02be274567f6d511406158b3388b7988b57b80245d6048e0d3bdb0f05cd17b24",
+  "framework_digest": "c69dd80186e6877648327c6ccaf19e929a8e074cc50092bd7c0a1298dff96f39",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",
@@ -89,6 +89,12 @@
         "since": "0.10.1"
       },
       {
+        "method": "POST",
+        "name": "consolidate",
+        "path": "/v1/default/banks/{bank_id}/consolidate",
+        "since": "0.10.1"
+      },
+      {
         "method": "GET",
         "name": "bank_stats",
         "path": "/v1/default/banks/{bank_id}/stats",
@@ -128,13 +134,14 @@
   "plugin": {
     "checkpoint_api_version": 2,
     "files": {
-      "__init__.py": "f0a4ef9ed9ee5b157dd39ff837365026ff0418b8dbb82283b91daa4e85aabf90",
-      "client.py": "c37f5472fe01d7fe1f4bb0fea46c4566865cb2e937dbef8ddc3c237ac6ace9ab",
-      "delivery.py": "0fa5477cca13be8760af4f7ce49738ae96e62a3a5853b1293a91df8d4db2e235",
-      "provider.py": "c0b32526ce81abe18067553091b20210b6e03e0db4e3d349cc1be002ea7cef2b",
+      "__init__.py": "195ee73b38061812018511bf7cca37d98d3110fb444acb5f634e0703aad6deae",
+      "capture.py": "9abc8975fe8d643e47d78e69064d47e0d9aac3c0053537f12e977a6a59cc8c4d",
+      "client.py": "b47eea43e38d8c02cb6c0af689e7cf828623213158ba6404de7e82015c50b03b",
+      "delivery.py": "62fc2ab8f1d658cb77077ae0cd947038e9a9feb6a99e8cf17038965d0927e59d",
+      "provider.py": "6a2462eb6b268284e7fdf82804047d9422d68be298e20b398e0127bb759aa64c",
       "runtime.py": "84ed13bb3a80680a41c931913a2cfad7daee1f81a8721c92b96ef4695d7a5ab2",
       "setup.py": "cff5daa30cc556beb239fd94230e54f47636d7920930faca10eee4017a098454",
-      "spool.py": "121ec110eb8bb0fff0710ca1fbac088815d1429c6c09ffa158a5458591c48abf"
+      "spool.py": "6726df3f7581e2b51bb077595de17c0aba3b0038768bde75db5afcacbcd143ba"
     },
     "kind": "exclusive",
     "name": "hermes-memory",
@@ -143,7 +150,7 @@
     "version": "0.1.0"
   },
   "schema": {
-    "evidence_migrations": 13,
+    "evidence_migrations": 17,
     "evidence_newer": "refused",
     "evidence_older": "migrated forward on open",
     "gate_ledger_version": 3

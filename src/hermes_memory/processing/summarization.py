@@ -1,4 +1,4 @@
-"""C6 composition: a summary of a window, from archive to backend and back to the store.
+"""C6 composition: scoped canonical evidence to admitted synthesis and the store.
 
 ``SummaryStore`` knows how to hold a summary, ``ProvenanceLedger`` knows whether its
 evidence still stands, and the broker knows how to read one. None of them knows how a
@@ -10,11 +10,9 @@ one reflection is a model call over private evidence, and §8.2 does not put a b
 reflector on the machine before the request bounds have been shown to a person. So a pass
 happens when somebody names the scope and approves the digest of what was read.
 
-The scope is resolved locally and the citations are that local set, not whatever the
-backend felt like retrieving. That is the only ordering that can be checked afterwards:
-"Hindsight answered something about this week" is not provenance, whereas "this is the
-window of records the claim is about, and here is whether every one of them was actually
-projected when the answer came back" is.
+The model receives only the approved canonical input. Published citations are the
+validated subset it actually used, not all planned records or an unrestricted bank
+reflection. A concurrent archive revision invalidates publication.
 """
 from __future__ import annotations
 
@@ -23,18 +21,19 @@ from typing import Any, Sequence
 
 
 from ..backend.capabilities import PINNED_VERSION
-from ..config import scoped_secret
 from ..ids import digest, now
 from ..knowledge.summaries import KINDS, MAX_CITATIONS_PER_SUMMARY, SummaryStore
 from .instance_gate import instance_gate, status_gate
 from .routes import build_routes
+from .synthesis import MAX_INPUT_BYTES, SYNTHESIS_CONTRACT
+from .faithfulness import VERIFICATION_TOKENS, validate_publication
 
 __all__ = ["ROUTE_NAME", "SUMMARY_ROUTE", "DEFAULT_BATCH", "MAX_BATCH", "SCOPE_FIELDS",
            "SummarizeError", "resolve_scope", "scope_records", "summary_fingerprint",
            "summarize_plan", "summarize_apply", "client_for"]
 
 ROUTE_NAME = SUMMARY_ROUTE = "reflect"
-PLAN_VERSION = "summary-plan-v1"
+PLAN_VERSION = "summary-plan-v3-entailment"
 BUDGET_SCOPE = "global"
 BACKEND = "hindsight"
 
@@ -65,7 +64,9 @@ class SummarizeError(ValueError):
 def summary_fingerprint(settings, route) -> str:
     """Which processor wrote a summary. See ``formation.processor_fingerprint``."""
     return digest(["summary", PINNED_VERSION, settings.bank_id, route.resource,
-                   route.operation, route.upstream, int(route.max_output_tokens)])[:24]
+                   route.operation, route.upstream, int(route.max_output_tokens),
+                   PLAN_VERSION, MAX_INPUT_BYTES, SYNTHESIS_CONTRACT,
+                   settings.text_route.model if settings.text_route else None])[:24]
 
 
 def resolve_scope(scope: str) -> tuple[str, str]:
@@ -92,7 +93,8 @@ def resolve_scope(scope: str) -> tuple[str, str]:
 def _interval(field: str, value: str) -> tuple[str, str]:
     day = date.fromisoformat(value)
     end = day + timedelta(days=6) if field == "week" else day
-    start = day - timedelta(days=6) if field == "week" else day
+    # The scope names the first day of a rolling seven-day interval.
+    start = day
     return (f"{start.isoformat()}T00:00:00+00:00", f"{end.isoformat()}T23:59:59+00:00")
 
 
@@ -162,6 +164,8 @@ def summarize_plan(settings, *, scope: str, kind: str | None = None,
         if not settings.hindsight_url:
             blocking.append("no Hindsight endpoint is configured, so there is nothing to "
                             "reflect over")
+        if not settings.admission_url or not (settings.text_route and settings.text_route.model):
+            blocking.append("scoped synthesis needs the owned admission URL and explicit text model")
         if settings.background_budget_tokens <= 0:
             blocking.append("the daily background budget is 0, so no reflection is affordable")
 
@@ -190,10 +194,6 @@ def summarize_plan(settings, *, scope: str, kind: str | None = None,
             budget.update({"ledger": "instance",
                            "tokens_used": int(spent.get("tokens_used", 0)),
                            "remaining": int(spent.get("headroom", 0))})
-        if route and budget["remaining"] < per_call_tokens:
-            blocking.append(f"the budget left for {resource} today ({budget['remaining']:,} "
-                            f"token(s)) cannot fit one reflection ({per_call_tokens:,} "
-                            "reserved)")
 
         selected: list[dict[str, Any]] = []
         unprojected = 0
@@ -207,6 +207,14 @@ def summarize_plan(settings, *, scope: str, kind: str | None = None,
             unprojected = len(record_ids) - _projected(store, record_ids,
                                                        bank_id=settings.bank_id)
             stamps = [str(item["occurred_at"] or "") for item in selected if item["occurred_at"]]
+            evidence_bytes = sum(len(store.get(item["record_id"]).text.encode()) + 500
+                                 for item in selected)
+            if evidence_bytes > MAX_INPUT_BYTES:
+                blocking.append("canonical synthesis input exceeds its byte ceiling; narrow the scope")
+            # Conservative byte-as-token estimate for generation AND verification;
+            # the latter also carries the bounded draft. Each actual hop is gated.
+            per_call_tokens = (2 * (evidence_bytes + 4096) + 16_000 + VERIFICATION_TOKENS
+                               + (int(route.max_output_tokens) if route else 0))
             window = (stamps[0] if stamps else None, stamps[-1] if stamps else None)
             if not record_ids:
                 blocking.append(f"nothing in this archive belongs to {scope!r}: a summary of "
@@ -216,6 +224,10 @@ def summarize_plan(settings, *, scope: str, kind: str | None = None,
                                 "--limit or narrow the scope, do not summarize a prefix "
                                 "and call it the scope")
             refreshes = _pending(store, scope=scope, kind=kind)
+        budget["per_call_tokens"] = per_call_tokens
+        if route and budget["remaining"] < per_call_tokens:
+            blocking.append(f"the budget left for {resource} today ({budget['remaining']:,} "
+                            f"token(s)) cannot fit synthesis and verification ({per_call_tokens:,} reserved)")
         admission = _admission(reading)
         if admission["paused"]:
             blocking.append("all inference is paused by the operator")
@@ -243,7 +255,7 @@ def summarize_plan(settings, *, scope: str, kind: str | None = None,
             "refreshes": refreshes,
             "budget": budget,
             "gate": admission,
-            "coverage": ("full" if unprojected == 0 and selected else "truncated"),
+            "coverage": "full" if selected and not truncated else "truncated",
             "not_performed": [
                 "no model request was sent while this was planned",
                 "no summary was written or superseded",
@@ -298,7 +310,20 @@ def summarize_apply(settings, *, scope: str, kind: str | None = None, review: st
             budgets = Budgets(gate.store, daily={route.resource: Budget(
                 tokens=proposal["token_budget"])}, scope=BUDGET_SCOPE)
             habits = SummaryStore(store, owner_principal=settings.owner_principal)
-            outcome, failure = _reflect(gate, route, proposal, budgets=budgets, holder=holder)
+            stamp = store.watermark()
+            supplied = []
+            for item in proposal["selected"]:
+                record = store.get(item["record_id"])
+                if record is None or record.revision != item["revision"]:
+                    raise SummarizeError("approved input is no longer live at its reviewed revision")
+                supplied.append({"record_id": record.id, "revision": record.revision,
+                                 "source": record.source, "text": record.text,
+                                 "role": record.metadata.get("role"),
+                                 "occurred_at": record.occurred_at})
+            outcome, failure = _reflect(gate, route, proposal, budgets=budgets, holder=holder,
+                                         evidence=supplied)
+            if store.watermark() != stamp:
+                failure = "canonical authority changed during synthesis; output withheld"
             if failure:
                 # The promise stays in the ledger as a failed refresh rather than
                 # vanishing: the reason it did not happen is the thing an operator
@@ -317,10 +342,15 @@ def summarize_apply(settings, *, scope: str, kind: str | None = None, review: st
                                      "file; the window is left unsummarized rather than "
                                      "filled with a placeholder")
             spent = _used(outcome)
+            citations = outcome.get("record_ids")
+            if (not isinstance(citations, list) or not citations
+                    or any(identifier not in {item["record_id"] for item in supplied}
+                           for identifier in citations)):
+                raise SummarizeError("synthesis returned no valid actual input references")
             written = habits.publish(
                 scope=proposal["scope"], kind=proposal["kind"],
                 title=(title or _default_title(proposal))[:200], body=body[:8000],
-                citations=[{"record_id": item["record_id"]} for item in proposal["selected"]],
+                citations=[{"record_id": identifier} for identifier in sorted(set(citations))],
                 processor_fingerprint=proposal["processor_fingerprint"],
                 window=proposal["window"],
                 budget_tokens=min(_MAX_BODY_TOKENS, int(route.max_output_tokens) or
@@ -341,34 +371,34 @@ def summarize_apply(settings, *, scope: str, kind: str | None = None, review: st
                 "revision": written["revision"], "verdict": written["verdict"],
                 "scope": proposal["scope"], "kind": proposal["kind"],
                 "window": list(proposal["window"]),
-                "citations": len(proposal["selected"]),
-                "cited_by_backend": int(outcome.get("cited_memories") or 0),
+                "citations": len(set(citations)),
+                "planned_inputs": len(proposal["selected"]),
                 "coverage": proposal["coverage"],
                 "refreshes_settled": settled["settled"],
                 "tokens_charged": spent,
                 "budget": budgets.report(),
                 "performed": [
-                    "one reflect request, bounded by the route's output ceiling",
-                    f"{len(proposal['selected'])} record(s) declared as the window",
-                    "usage charged to the instance gate from what the backend reported",
+                    "scoped generation and separate per-claim entailment verification",
+                    f"{len(proposal['selected'])} canonical record(s) supplied as evidence",
+                    f"{len(set(citations))} record(s) cited by semantically checked claims",
+                    "usage accounted by the owned admission gate",
                 ],
             }
 
 
 def client_for(settings) -> Any:
-    """The configured backend, addressed by the installation rather than by a caller."""
-    from ..backend.hindsight_client import HindsightClient
+    """Explicit synthesis through the installation's owned admission endpoint."""
+    from .synthesis import ScopedSynthesizer
 
-    if not settings.hindsight_url:
-        raise SummarizeError("no backend endpoint is configured")
-    return HindsightClient(base_url=settings.hindsight_url, bank_id=settings.bank_id,
-                           api_key=scoped_secret(settings, settings.hindsight_api_key_env),
-                           timeout=REFLECT_TIMEOUT_S)
+    return ScopedSynthesizer(base_url=settings.admission_url,
+                             credential=settings.route_credentials.get(ROUTE_NAME),
+                             model=settings.text_route.model if settings.text_route else None,
+                             timeout=REFLECT_TIMEOUT_S)
 
 
 # -- internals ---------------------------------------------------------------
 
-def _reflect(gate, route, proposal, *, budgets, holder) -> tuple[dict[str, Any], str]:
+def _reflect(gate, route, proposal, *, budgets, holder, evidence) -> tuple[dict[str, Any], str]:
     """One bounded reflection, asked without claiming the device it is answered on.
 
     A pause and an unaffordable budget are refusals rather than something to attempt anyway,
@@ -391,25 +421,24 @@ def _reflect(gate, route, proposal, *, budgets, holder) -> tuple[dict[str, Any],
     if gate.unresolved_for(route.resource):
         return {}, (f"{route.resource} is blocked by a request nobody has answered for, and "
                     "waiting would not free it — `hermes-memory gate --resolve` settles it")
-    # No device reservation is taken here, and that is the whole point. The reflection is
-    # produced by the backend, which asks this same gate for this same device once per tool
-    # call; the outer request only carries a question. Claiming the single slot across a run
-    # that needs admission on it is not caution but a self-inflicted deadlock — the live
-    # machine answered its own nested calls with HTTP 429 "blocked by a request whose
-    # outcome nobody has established", which is how a stage comes to look permanently broken.
+    # The owned HTTP gate admits and accounts the model hop. Reserving its device
+    # again in this outer coordinator would deadlock that admission.
     started = time.monotonic()
     outcome: dict[str, Any] = {}
     tokens, failure = 0, ""
     try:
-        outcome = holder.reflect(_question(proposal),
-                                 max_tokens=int(route.max_output_tokens), budget="low")
+        if not callable(getattr(holder, "synthesize", None)):
+            raise SummarizeError("summary client must synthesize from explicit canonical input")
+        outcome = holder.synthesize(_question(proposal), evidence=evidence,
+                                    max_tokens=int(route.max_output_tokens), budget="low")
         tokens = _used(outcome)
+        validate_publication(outcome, evidence)
     except HindsightUnavailable as error:
         # The backend's own admissions say whether the device is free; nothing here holds it.
         failure = str(error)
     except (HindsightError, SummarizeError) as error:
         failure = str(error)
-    if tokens:
+    if tokens and not outcome.get("admission_accounted"):
         gate.charge(route.resource, tokens=tokens, seconds=time.monotonic() - started,
                     note=f"reflect {proposal['scope']}")
     return outcome, failure
@@ -418,9 +447,8 @@ def _reflect(gate, route, proposal, *, budgets, holder) -> tuple[dict[str, Any],
 def _question(proposal: dict[str, Any]) -> str:
     """What we ask the model, in the terms the plan allows it to answer in.
 
-    It names the window and the ceiling and asks for prose about the evidence: no
-    instruction to invent, and no private content pasted into the prompt — the backend
-    retrieves its own projections.
+    It names the window and ceiling. The synthesis adapter separately supplies the
+    approved canonical evidence; no backend retrieval may expand that input.
     """
     start, end = proposal["window"]
     span = f"between {start} and {end}" if start and end else "of no fixed date"

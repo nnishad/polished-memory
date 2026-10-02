@@ -13,6 +13,43 @@ from hermes_memory.storage.evidence import EvidenceError
 from hermes_memory.context import ContextBroker
 
 OWNER = "owner-principal"
+
+
+def test_latest_summary_resolves_dependencies_for_the_authenticated_caller(store):
+    from hermes_memory.storage.identity import IdentityStore
+
+    identity = IdentityStore(store)
+    caller = identity.account("email", "owner@example.com")
+    stranger = identity.account("email", "stranger@example.com")
+    record = store.commit(envelope(text="budget changed", metadata={
+        "account_ids": [caller], "project": "budget"}))["id"]
+    readings = SummaryStore(store)
+    made = publish(readings, [{"record_id": record}], scope="project:budget", kind="project")
+    assert readings.read(made["id"], account_id=caller)["available"] is True
+    assert [item.id for item in readings.latest("project:budget", account_id=caller)] == [made["id"]]
+    assert readings.latest("project:budget", account_id=stranger) == []
+    assert readings.latest("project:budget") == []
+
+
+def test_broker_scoped_summary_uses_caller_and_checks_every_dependency(store):
+    from hermes_memory.storage.identity import IdentityStore
+
+    identity = IdentityStore(store)
+    caller = identity.account("email", "owner@example.com")
+    first = store.commit(envelope(source_id="current", text="budget changed", metadata={
+        "account_ids": [caller], "project": "budget"}))["id"]
+    outside = store.commit(envelope(source="other", source_id="outside", text="prior context",
+                                   metadata={"account_ids": [caller]}))["id"]
+    readings = SummaryStore(store)
+    publish(readings, [{"record_id": first}, {"record_id": outside}],
+            scope="project:budget", kind="project")
+    broker = ContextBroker(store, summaries=readings, cache=False)
+    try:
+        assert broker.assemble("budget", account_id=caller, include_derived=False).summaries
+        assert not broker.assemble("budget", account_id=caller, sources=["gmail"],
+                                   include_derived=False).summaries
+    finally:
+        broker.close()
 BROKE = "The build broke at 04:12 and recovered at 05:00."
 
 

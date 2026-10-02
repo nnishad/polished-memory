@@ -190,6 +190,41 @@ def test_replaying_the_same_turn_does_not_duplicate(provider):
     assert provider._spool.counts()["pending"] == 1
 
 
+def test_turn_capture_keeps_the_received_clock_not_the_completion_clock(provider, plugin,
+                                                                       monkeypatch):
+    clock = iter(["2026-10-02T12:00:00Z", "2026-10-02T12:00:30Z"])
+    monkeypatch.setattr("hm_plugin.provider._utc_now", lambda: next(clock))
+    provider.on_turn_start(1, "kal bhejna", author_id="u1")
+    provider.sync_turn("kal bhejna", "noted", capture_id="clock-test")
+    payload = json.loads(next(iter(provider._spool.iter_all()))["payload"])
+    assert payload["source_context_version"] == 2
+    assert payload["utterance_at"] == "2026-10-02T12:00:00Z"
+    assert payload["utterance_time_basis"] == "host-turn-start"
+
+
+def test_capture_without_turn_start_does_not_invent_utterance_time(provider):
+    provider.sync_turn("old message", "reply", capture_id="no-clock")
+    payload = json.loads(next(iter(provider._spool.iter_all()))["payload"])
+    assert payload["utterance_at"] is None
+
+
+def test_session_boundary_does_not_reuse_previous_turn_clock(provider):
+    provider.on_turn_start(1, "first turn")
+    provider.on_session_switch("second-session")
+    provider.sync_turn("next session", "reply", capture_id="after-boundary")
+    payload = json.loads(next(iter(provider._spool.iter_all()))["payload"])
+    assert payload["utterance_at"] is None
+
+
+def test_next_capture_without_a_new_hook_cannot_borrow_previous_clock(provider):
+    provider.on_turn_start(1, "first turn")
+    provider.sync_turn("first turn", "reply", capture_id="first-clock")
+    provider.sync_turn("another turn", "reply", capture_id="without-new-hook")
+    payloads = [json.loads(row["payload"]) for row in provider._spool.iter_all()]
+    assert payloads[0]["utterance_at"] is not None
+    assert payloads[1]["utterance_at"] is None
+
+
 def test_claim_prevents_a_second_submitter(provider):
     provider.sync_turn("a", "b", session_id="s", messages=[{"role": "user"}])
     event = provider._spool.pending()[0]["event_id"]
@@ -445,7 +480,7 @@ def asking(plugin, tmp_path, monkeypatch):
     instance = plugin.HermesMemoryProvider()
     assert instance.is_available(), instance.unavailable_reason()
     instance.initialize("sess-1", hermes_home=str(tmp_path / "profile"),
-                        platform="telegram", chat_id="787655730")
+                        platform="telegram", chat_id="787655730", user_id="787655730")
     with instance._open_store() as store:
         InquiryStore(store, owner_principal=OWNER).allow_replies(
             actor=OWNER, on=True, reason="a reply on my own channel, carrying a code")
@@ -477,6 +512,8 @@ def test_memory_clarify_queues_a_question_and_adopts_nothing(asking):
     assert payload["asked"] is True and payload["state"] == "open", payload
     assert payload["inquiry"].startswith("inq_")
     assert "code" not in json.dumps(payload).lower()
+    assert "do not collect it here" in payload["note"], \
+        "an interactive prompt in this chat would take the answer's own message"
     with asking._open_store() as store:
         assert store.db.execute("SELECT status FROM goals WHERE id=?",
                                 (identifier,)).fetchone()[0] == "candidate"
@@ -516,7 +553,7 @@ def test_a_reply_about_a_state_that_awaits_nobody_decides_nothing(asking):
     asking.handle_tool_call("memory_clarify", {
         "decision": "goal-activation", "subject": identifier,
         "question": "Should I start reminding you about the passport?"})
-    asking.prefetch("yes QQQQQQ")
+    asking.on_turn_start(1, "yes QQQQQQ", author_id="787655730")
 
     payload = json.loads(asking.handle_tool_call(
         "memory_clarify_answer", {"reply": "yes QQQQQQ"}))
@@ -592,9 +629,9 @@ def test_the_owners_reply_is_taken_off_the_wire_without_anybody_deciding_to_noti
     """
     identifier, code = a_question_on_the_wire(asking, tmp_path)
 
-    said = asking.prefetch(quoted(code, said=f"yes {code}"))
+    said = asking.on_turn_start(1, quoted(code, said=f"yes {code}"), author_id="787655730")
 
-    assert "The owner answered their own question" in said
+    assert '"settled": true' in said and '"question":' in said
     with asking._open_store() as store:
         assert store.db.execute("SELECT status FROM goals WHERE id=?",
                                 (identifier,)).fetchone()[0] == "active"
@@ -610,7 +647,7 @@ def test_a_code_that_only_ever_came_back_in_the_quotation_is_not_an_answer(askin
     """
     identifier, code = a_question_on_the_wire(asking, tmp_path)
 
-    asking.prefetch(quoted(code, said="what is this?"))
+    asking.on_turn_start(1, quoted(code, said="what is this?"), author_id="787655730")
 
     payload = json.loads(asking.handle_tool_call("memory_clarify_answer",
                                                  {"reply": f"yes {code}"}))
@@ -709,6 +746,7 @@ def test_an_unreadable_store_is_reported_as_failure_not_as_absence(provider, mon
 
 def test_system_prompt_block_is_static_and_carries_no_memories(provider):
     block = provider.system_prompt_block()
+    assert "memory_verify" in block
     assert "evidence" in block.lower()
     assert "instruction" in block.lower()
 
@@ -878,7 +916,8 @@ def test_an_unenrolled_home_is_refused_rather_than_served_the_default(plugin, mo
     """Guessing the default profile is how one person's question gets another's answer."""
     provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
     stranger = tmp_path / "someone-else"
-    bind(provider, stranger)
+    with pytest.raises(plugin.client.BindingError, match="enroll"):
+        bind(provider, stranger)
 
     assert provider._activity is None
     assert "enroll" in provider.unavailable_reason()
@@ -893,7 +932,8 @@ def test_an_unenrolled_home_is_refused_rather_than_served_the_default(plugin, mo
 def test_capturing_nothing_is_better_than_capturing_into_the_wrong_profile(
         plugin, monkeypatch, tmp_path):
     provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
-    bind(provider, tmp_path / "stranger")
+    with pytest.raises(plugin.client.BindingError, match="enroll"):
+        bind(provider, tmp_path / "stranger")
     provider.sync_turn("My card pin is 1234", "Noted.", session_id="s",
                        messages=[{"role": "user"}])
     provider.on_memory_write("add", "user", "My card pin is 1234", metadata=None)
@@ -1008,7 +1048,8 @@ def test_status_names_the_profile_without_naming_the_conversation(provider):
 
 def test_an_initialise_without_a_home_says_so(plugin, monkeypatch, tmp_path):
     provider, _ = unconfigured(plugin, monkeypatch, tmp_path)
-    provider.initialize("sess-1", platform="cli")
+    with pytest.raises(plugin.client.BindingError, match="no hermes_home"):
+        provider.initialize("sess-1", platform="cli")
     assert "no hermes_home" in provider.unavailable_reason()
 
 
@@ -1084,6 +1125,15 @@ def test_a_warmed_packet_never_answers_a_different_question(provider):
     assert provider._queued == {}, "the discarded warm must not linger for a later turn"
 
 
+def test_a_warmed_packet_is_invalidated_after_evidence_is_hidden(provider):
+    result = json.loads(provider.handle_tool_call("memory_remember",
+                                                {"content": "Priya reviews the contracts."}))
+    provider.queue_prefetch("Priya contracts", session_id="sess-1")
+    provider._thread_store().hide(result["id"], reason="withdrawn", actor="owner")
+    assert "Priya" not in provider.prefetch("Priya contracts", session_id="sess-1")
+    assert provider._queued == {}
+
+
 def test_a_warmed_packet_is_consumed_once(provider):
     provider.handle_tool_call("memory_remember", {"content": "Priya reviews the contracts."})
     provider.queue_prefetch("Priya contracts", session_id="sess-1")
@@ -1109,9 +1159,9 @@ def test_session_end_records_the_boundary_once(provider):
     provider.on_session_end(transcript)
     endings = [json.loads(row["payload"]) for row in provider._spool.iter_all()
                if json.loads(row["payload"])["kind"] == "session_end"]
-    assert len(endings) == 1, "a replayed boundary is one event, not two"
+    assert len(endings) == 2, "each message is captured once across boundary retries"
     assert endings[0]["turns"] == 2
-    assert [message["role"] for message in endings[0]["messages"]] == ["user", "assistant"]
+    assert [message["role"] for event in endings for message in event["messages"]] == ["user", "assistant"]
 
 
 def test_a_different_transcript_is_a_different_ending(provider):
@@ -1119,6 +1169,188 @@ def test_a_different_transcript_is_a_different_ending(provider):
     provider.on_session_end([{"role": "user", "content": "two"}])
     assert len([row for row in provider._spool.iter_all()
                 if json.loads(row["payload"])["kind"] == "session_end"]) == 2
+
+
+def test_session_end_preserves_long_multimodal_messages_and_authors(provider):
+    messages = [{"role": "user", "content": "x" * 5001, "author": {"id": "alice"}}]
+    messages += [{"role": "assistant", "content": [{"type": "text", "text": f"reply {i}"}]}
+                 for i in range(25)]
+    messages += [{"role": "assistant", "content": "synthetic summary", "_compressed_summary": True}]
+    provider.on_session_end(messages)
+    rows = [json.loads(row["payload"]) for row in provider._spool.iter_all()]
+    assert len(rows) == 26
+    assert rows[0]["messages"][0]["text"] == "x" * 5001
+    assert rows[0]["messages"][0]["author"] == {"id": "alice"}
+    assert all(row["turns"] == 26 for row in rows)
+
+
+def test_strict_checkpoint_keeps_multimodal_text_without_summary(provider):
+    provider.on_pre_compress([
+        {"role": "user", "content": [{"type": "text", "text": "caption"},
+                                     {"type": "image_url", "image_url": {"url": "data:private"}}]},
+        {"role": "assistant", "content": "summary", "_compressed_summary": True},
+    ], require_checkpoint=True)
+    rows = [json.loads(row["payload"]) for row in provider._spool.iter_all()]
+    assert len(rows) == 1 and rows[0]["text"] == "caption"
+    assert "data:private" not in json.dumps(rows)
+
+
+def test_turn_identity_distinguishes_rewind_and_missing_messages(provider):
+    provider.sync_turn("one", "answer", messages=[{}, {}])
+    provider.on_session_switch("sess-1", rewound=True)
+    provider.sync_turn("one", "answer", messages=[{}, {}])
+    provider.sync_turn("one", "answer")
+    provider.sync_turn("one", "answer")
+    provider.sync_turn("one", "answer", capture_id="explicit")
+    provider.sync_turn("one", "answer", capture_id="explicit")
+    assert len(list(provider._spool.iter_all())) == 5
+
+
+def test_turn_start_clears_owner_reply_even_without_prefetch(provider):
+    provider._owner_reply = "previous owner answer"
+    provider.on_turn_start(2, "ok", author_id="guest", author_is_bot=False)
+    assert provider._owner_reply == ""
+    provider._host_user_id = "owner"
+    provider._settle_from_turn("this is an answer")
+    assert provider._owner_reply == ""
+
+
+def native_gateway_context(asking, **overrides):
+    from types import SimpleNamespace
+    home = str(asking._bound().hermes_home.resolve())
+    fields = dict(authenticated=True, internal=False, is_bot=False, forwarded=False,
+                  platform="telegram", chat_id="787655730", user_id="787655730",
+                  runtime_home=home, transport_home=home, transport_profile="default",
+                  chat_type="dm", text="yes", reply_to_message_id="100", thread_id="",
+                  message_id="101")
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def question_with_native_receipt(asking):
+    from hermes_memory.proactive.inquiries import InquiryStore
+    identifier = a_proposed_goal(asking)
+    def transport(body):
+        return {"sent": True, "platform": "telegram", "chat_id": "787655730", "message_id": "100"}
+    transport.hermes_home = str(asking._bound().hermes_home.resolve())
+    with asking._open_store() as store:
+        questions = InquiryStore(store, owner_principal=OWNER)
+        made = questions.ask(decision="goal-activation", subject_id=identifier,
+                             question="Should I remind you about the passport?")
+        assert questions.send_next(sink=transport, destination="telegram:787655730", holder="test")["sent"] == 1
+    return identifier, made["id"]
+
+
+def test_native_private_caller_resolves_only_an_existing_explicit_account(asking):
+    from hermes_memory.storage.identity import IdentityStore
+    identities = IdentityStore(asking._thread_store())
+    asking.on_turn_start(1, "preference", author_id="787655730",
+                         inbound_context=native_gateway_context(asking, text="preference"))
+    assert asking._caller_account_id is None
+    assert identities.db.execute("SELECT count(*) FROM identity_accounts").fetchone()[0] == 0
+    account = identities.account("source_account", "telegram:787655730")
+    asking.on_turn_start(2, "preference", author_id="787655730",
+                         inbound_context=native_gateway_context(asking, text="preference"))
+    assert asking._caller_account_id == account
+    asking.on_turn_start(3, "preference", author_id="787655730")
+    assert asking._caller_account_id is None, "unattested turn does not inherit the previous caller"
+
+
+@pytest.mark.parametrize("wrong", [dict(authenticated=False), dict(internal=True), dict(is_bot=True),
+                                   dict(forwarded=True), dict(chat_type="group"),
+                                   dict(user_id="guest"), dict(runtime_home="/other/profile")])
+def test_native_caller_binding_cannot_be_spoofed(asking, wrong):
+    from hermes_memory.storage.identity import IdentityStore
+    IdentityStore(asking._thread_store()).account("source_account", "telegram:787655730")
+    asking.on_turn_start(1, "preference", author_id="787655730",
+                         inbound_context=native_gateway_context(asking, **wrong))
+    assert asking._caller_account_id is None
+
+
+def test_gateway_short_reply_has_dossier_and_outcome_before_retrieval(asking, monkeypatch):
+    identifier, inquiry = question_with_native_receipt(asking)
+    native = native_gateway_context(asking)
+    # Rendered quote is irrelevant; only native.text is the owner's actual answer.
+    context = asking.on_turn_start(1, '[Replying to: "no"] yes', author_id="787655730", inbound_context=native)
+    assert inquiry in context and '"settled": true' in context and "passport" in context
+    with asking._open_store() as store:
+        assert store.db.execute("SELECT status FROM goals WHERE id=?", (identifier,)).fetchone()[0] == "active"
+    monkeypatch.setattr(asking, "_settle_from_turn", lambda *a, **kw: pytest.fail("retrieval tried to authorize"))
+    asking.prefetch("yes")
+
+
+@pytest.mark.parametrize("wrong", [dict(authenticated=False), dict(internal=True), dict(is_bot=True),
+    dict(forwarded=True), dict(user_id="guest"), dict(runtime_home="/other/profile"), dict(chat_type="group")])
+def test_gateway_cannot_authorize_unattested_native_reply(asking, wrong):
+    identifier, _ = question_with_native_receipt(asking)
+    asking.on_turn_start(1, "yes", author_id="787655730", inbound_context=native_gateway_context(asking, **wrong))
+    with asking._open_store() as store:
+        assert store.db.execute("SELECT status FROM goals WHERE id=?", (identifier,)).fetchone()[0] == "candidate"
+
+
+def test_plain_uncorrelated_yes_shows_pending_context_but_does_not_approve(asking):
+    identifier, inquiry = question_with_native_receipt(asking)
+    context = asking.on_turn_start(1, "yes", author_id="787655730",
+                                  inbound_context=native_gateway_context(asking, reply_to_message_id=""))
+    assert inquiry in context and '"reply_outcome": null' in context
+    with asking._open_store() as store:
+        assert store.db.execute("SELECT status FROM goals WHERE id=?", (identifier,)).fetchone()[0] == "candidate"
+def test_fresh_backup_hook_names_bound_store_and_bootstrap_files(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
+    home = tmp_path / "activity"
+    enrolled = enroll(instance, home)
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: home))
+    paths = provider.backup_paths()
+    assert str(instance / "installation.db") in paths
+    assert any("data" in path for path in paths)
+    assert provider._activity is None
+
+
+def test_saved_profile_configuration_is_used_without_moving_enrolled_data(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path,
+                                      ALLOWED_INFERENCE_HOSTS="127.0.0.1")
+    home = tmp_path / "activity"
+    enroll(instance, home)
+    provider.save_config({"hindsight_url": "http://127.0.0.1:9999", "api_key": "must-not-write",
+                          "data_dir": str(tmp_path / "unapproved-store")}, str(home))
+    bind(provider, home)
+    assert provider._activity.settings.hindsight_url == "http://127.0.0.1:9999"
+    assert provider._activity.data_dir != tmp_path / "unapproved-store"
+    assert "must-not-write" not in (home / "hermes-memory.json").read_text()
+
+
+def test_profile_configuration_cannot_widen_the_instance_allowlist(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path,
+                                      ALLOWED_INFERENCE_HOSTS="127.0.0.1")
+    home = tmp_path / "activity"
+    enroll(instance, home)
+    provider.save_config({"allowed_inference_hosts": "127.0.0.1,192.168.1.2"}, str(home))
+    with pytest.raises(plugin.client.BindingError, match="widen"):
+        bind(provider, home)
+
+
+def test_profile_configuration_refuses_the_model_gate_as_hindsight(plugin, monkeypatch, tmp_path):
+    provider, instance = unconfigured(plugin, monkeypatch, tmp_path,
+        ALLOWED_INFERENCE_HOSTS="127.0.0.1", ADMISSION_URL="http://127.0.0.1:8123")
+    home = tmp_path / "activity"
+    enroll(instance, home)
+    provider.save_config({"hindsight_url": "http://127.0.0.1:8123"}, str(home))
+    with pytest.raises(plugin.client.BindingError, match="admission"):
+        bind(provider, home)
+
+
+def test_host_bound_credentials_do_not_read_another_profiles_process_key(provider, monkeypatch):
+    import sys
+    import types
+    scoped = {"HINDSIGHT_API_KEY": "this-profile-only"}
+    monkeypatch.setenv("HINDSIGHT_API_KEY", "another-profile")
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", types.SimpleNamespace(
+        get_secret=lambda name: scoped.get(name), serves_routed_profile=lambda: True))
+    assert provider._activity.secret("HINDSIGHT_API_KEY") == "this-profile-only"
+    scoped.clear()
+    assert provider._activity.secret("HINDSIGHT_API_KEY") is None
 
 
 def test_a_delegation_records_what_the_parent_saw_not_the_childs_transcript(provider):
@@ -1149,7 +1381,8 @@ def test_the_checkpoint_claim_matches_what_the_spool_actually_does(provider, plu
 def test_a_required_checkpoint_fails_loudly_when_there_is_no_spool(
         plugin, monkeypatch, tmp_path):
     provider, _ = unconfigured(plugin, monkeypatch, tmp_path)
-    bind(provider, tmp_path / "stranger")
+    with pytest.raises(plugin.client.BindingError, match="enroll"):
+        bind(provider, tmp_path / "stranger")
     with pytest.raises(RuntimeError, match="no durable capture spool"):
         provider.on_pre_compress([{"role": "user", "content": "x"}], require_checkpoint=True)
     # Without the requirement the host treats this as best effort, not an error.
@@ -1166,16 +1399,14 @@ def test_a_rewound_index_is_not_the_same_message(provider):
 
 def test_a_repeated_native_note_is_mirrored_once_but_a_change_twice(provider):
     provider.on_memory_write("replace", "user", "Prefers mornings",
-                             metadata={"previous_content": "Prefers evenings"})
+                             metadata={"previous_content": "Prefers evenings", "operation_id": "first"})
     provider.on_memory_write("replace", "user", "Prefers mornings",
-                             metadata={"previous_content": "Prefers evenings"})
+                             metadata={"previous_content": "Prefers evenings", "operation_id": "first"})
     provider.on_memory_write("replace", "user", "Prefers mornings",
-                             metadata={"previous_content": "Prefers noons"})
+                             metadata={"previous_content": "Prefers noons", "operation_id": "second"})
     rows = [json.loads(row["payload"]) for row in provider._spool.iter_all()]
     assert len(rows) == 2, "the same write twice is one event; a different predecessor is not"
-    assert {tuple(sorted(row["metadata"])) for row in rows} == \
-           {("previous_content", "session_id", "write_origin"),
-            ("previous_content", "session_id", "write_origin")} or True
+    assert [row["metadata"]["operation_id"] for row in rows] == ["first", "second"]
     assert [row["metadata"]["previous_content"] for row in rows] == \
            ["Prefers evenings", "Prefers noons"]
 
@@ -1229,12 +1460,13 @@ def test_rebinding_to_an_unenrolled_home_stops_answering_from_the_old_one(
     provider.handle_tool_call("memory_remember", {"content": "Takes coffee black."})
     assert "coffee black" in provider.prefetch("coffee", session_id="s")
 
-    bind(provider, tmp_path / "homes" / "stranger")
+    with pytest.raises(plugin.client.BindingError, match="enroll"):
+        bind(provider, tmp_path / "homes" / "stranger")
     assert provider._activity is None
     assert "could not be consulted" in provider.prefetch("coffee", session_id="s")
     assert json.loads(provider.handle_tool_call("memory_recall",
                                                {"query": "coffee"}))["ok"] is False
-    assert provider.backup_paths() == [str(instance / "data")]
+    assert str(instance / "installation.db") in provider.backup_paths()
 
 
 def test_a_route_without_an_enabled_budget_never_builds_a_client(
@@ -1271,7 +1503,8 @@ def test_status_reports_the_delivery_decision_and_its_reason(provider, plugin):
 
 def test_status_of_an_unbound_provider_says_what_to_do(plugin, monkeypatch, tmp_path):
     provider, instance = unconfigured(plugin, monkeypatch, tmp_path)
-    bind(provider, tmp_path / "stranger")
+    with pytest.raises(plugin.client.BindingError, match="enroll"):
+        bind(provider, tmp_path / "stranger")
     report = json.loads(provider.handle_tool_call("memory_status", {}))
     assert report["bound"] is False and report["profile"] == "unbound"
     assert "enroll" in report["activity_home"]
@@ -1288,8 +1521,9 @@ def test_post_setup_writes_its_own_file_and_nothing_else(plugin, monkeypatch, tm
         "data_dir": str(tmp_path / "instance" / "data"),
         "hindsight_url": "http://127.0.0.1:8863"}})
     written = sorted(path.name for path in home.iterdir())
-    assert written == ["hermes-memory.env"], written
-    assert "HERMES_MEMORY_HINDSIGHT_URL" in (home / "hermes-memory.env").read_text()
+    assert written == ["hermes-memory.json"], written
+    assert json.loads((home / "hermes-memory.json").read_text())["hindsight_url"] == \
+           "http://127.0.0.1:8863"
     assert result["enrolled"] is False and "--actor" in result["next_command"]
     ledger = tmp_path / "instance" / "installation.db"
     assert not ledger.exists(), "setup may not create the ledger it is refused by"

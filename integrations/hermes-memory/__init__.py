@@ -14,7 +14,7 @@ from .runtime import adopt
 RUNTIME = adopt()
 
 from .provider import (PROVIDER_NAME, HermesMemoryProvider, post_setup,  # noqa: E402
-                       write_env_file)
+                       save_profile_config)
 
 
 def register(ctx) -> None:
@@ -26,4 +26,4 @@ def register(ctx) -> None:
     ctx.register_memory_provider(HermesMemoryProvider())
 
 
-__all__ = ["register", "post_setup", "PROVIDER_NAME", "HermesMemoryProvider", "write_env_file"]
+__all__ = ["register", "post_setup", "PROVIDER_NAME", "HermesMemoryProvider", "save_profile_config"]

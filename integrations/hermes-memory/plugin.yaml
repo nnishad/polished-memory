@@ -18,6 +18,7 @@ python_dependencies: []
 # overriding built-ins. No allow-tool-override is requested or needed.
 provides_tools:
   - memory_recall
+  - memory_verify
   - memory_remember
   - memory_status
   - memory_identity_candidate

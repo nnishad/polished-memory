@@ -82,33 +82,14 @@ class EmailSource(SourceAdapter):
                 "content_read": False, "observed_at": now()}
 
     def read_page(self, cursor: str | None) -> Page:
-        keys = self._keys()
-        remaining = [key for key in keys if cursor is None or key > cursor]
-        limit = self.capabilities.max_records_per_page
-        byte_budget = self.capabilities.max_bytes_per_page
-        envelopes: list[dict[str, Any]] = []
-        skipped: list[Skipped] = []
-        examined: list[str] = []
-        used = 0
-        for key in remaining:
-            # Every file examined advances the position, including one that yielded
-            # nothing: a gap is passed over once rather than retried forever.
-            if len(envelopes) >= limit or len(examined) >= limit * 4:
-                break
+        from .export_paging import read_export_page
+        def read(key):
             size = self._size_of(key)
             if size is None:
-                skipped.append(Skipped(key, "stat failed or the file disappeared"))
-                examined.append(key)
-                continue
+                return [], [Skipped(key, "stat failed or the file disappeared")]
             if size > MAX_MESSAGE_BYTES:
-                skipped.append(Skipped(
-                    key, f"{size} bytes exceeds the {MAX_MESSAGE_BYTES} byte per-message "
-                    "bound"))
-                examined.append(key)
-                continue
-            if used and used + size > byte_budget:
-                break
-            examined.append(key)
+                return [], [Skipped(key, f"{size} bytes exceeds the {MAX_MESSAGE_BYTES} byte per-message bound")]
+            envelopes, skipped = [], []
             for ref, envelope, reason in self._expand(key):
                 if envelope is None:
                     # A multi-message file reports which message it could not take,
@@ -116,10 +97,8 @@ class EmailSource(SourceAdapter):
                     skipped.append(Skipped(ref, reason))
                 else:
                     envelopes.append(envelope)
-            used += size
-        return Page(envelopes=tuple(envelopes), skipped=tuple(skipped),
-                    next_cursor=examined[-1] if examined and len(examined) < len(remaining)
-                    else None)
+            return envelopes, skipped
+        return read_export_page(self, cursor, self._keys(), read)
 
     # -- reading -------------------------------------------------------------
 

@@ -53,6 +53,75 @@ MANIFEST = "RELEASE.json"
 #: other, so a release that carried only the Python would separate the two halves of one
 #: contract revision — which is exactly what §10.3 forbids.
 CARRIED = ("deployment", "integrations")
+# These are the inputs to this project's setuptools wheel and its paired artifacts.
+# Private instance configuration, environments and unrelated work never enter a release.
+SOURCE_DIRS = ("src", *CARRIED)
+SOURCE_FILES = ("pyproject.toml", "uv.lock", "setup.py", "setup.cfg", "MANIFEST.in",
+                "README.md", "LICENSE", "LICENSE.md", "LICENSE.txt")
+
+
+def _source_fingerprints(root: Path) -> list[list[str]]:
+    if root.is_symlink():
+        raise ReleaseError(f"release source root is a symlink: {root}")
+    paths = [root / name for name in SOURCE_FILES if (root / name).is_file()]
+    for name in SOURCE_DIRS:
+        directory = root / name
+        if directory.is_symlink():
+            raise ReleaseError(f"release source directory is a symlink: {directory}")
+        if directory.is_dir():
+            for path in directory.rglob("*"):
+                if "__pycache__" in path.parts or path.suffix == ".pyc":
+                    continue
+                if path.is_symlink():
+                    raise ReleaseError(f"release source contains a symlink: {path}")
+                if path.is_file():
+                    paths.append(path)
+    for path in paths:
+        if path.is_symlink():
+            raise ReleaseError(f"release source contains a symlink: {path}")
+    return [[str(path.relative_to(root)), content_digest(path.read_bytes()),
+             str(path.stat().st_mode & 0o777)]
+            for path in sorted(paths)]
+
+
+def _freeze_source(root: Path, into: Path, fingerprints: list[list[str]]) -> None:
+    """Build and carry only bytes approved by the plan, not a later working tree."""
+    into.mkdir()
+    for relative, expected, mode in fingerprints:
+        origin = root / relative
+        if origin.is_symlink() or any(parent.is_symlink() for parent in origin.parents
+                                     if parent != root and parent.is_relative_to(root)):
+            raise ReleaseError("release source became a symlink after review")
+        body = origin.read_bytes()
+        if content_digest(body) != expected:
+            raise ReleaseError("release source changed while freezing the approved snapshot")
+        destination = into / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(body)
+        destination.chmod(int(mode))
+    if _source_fingerprints(root) != fingerprints:
+        raise ReleaseError("release source file set changed while freezing the approved snapshot")
+
+
+def _registerable_snapshot(root: Path, source_digest: str) -> str:
+    """Give frozen bytes their own git pin without committing the user's checkout."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_AUTHOR_DATE="2000-01-01T00:00:00+00:00",
+                       GIT_COMMITTER_DATE="2000-01-01T00:00:00+00:00",
+                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+    command = ["git", "-C", str(root), "-c", "core.hooksPath=" + os.devnull,
+               "-c", "user.name=Hermes Memory Release", "-c", "user.email=release@localhost",
+               "-c", "commit.gpgsign=false"]
+    for arguments in (["init", "--quiet"], ["add", "--all"],
+                      ["commit", "--quiet", "-m", "Reviewed snapshot " + source_digest]):
+        result = subprocess.run([*command, *arguments], env=environment,
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise ReleaseError("snapshot git registration failed: " + result.stderr[:200])
+    commit, dirty = _revision(root)
+    if not commit or dirty:
+        raise ReleaseError("snapshot registration is not a clean immutable git pin")
+    return commit
 
 
 class ReleaseError(ValueError):
@@ -89,7 +158,7 @@ def _python(into: Path, *, backend: bool = False) -> Path:
 
 def plan(*, settings, into: Path | str, source: Path | str | None = None,
          wheel: Path | str | None = None, environ: Mapping[str, str] | None = None,
-         backend: bool = True) -> dict[str, Any]:
+         backend: bool = True, snapshot: bool = False) -> dict[str, Any]:
     """The actions this staging would take, and the digest an approval is taken against.
 
     Nothing is written and nothing is fetched: the wheel is located, not built, and a build
@@ -100,6 +169,7 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
     root = Path(source).expanduser() if source else source_checkout()
     blocking: list[str] = []
     actions: list[str] = []
+    source_fingerprints: list[list[str]] = []
 
     if root is None or not (root / "pyproject.toml").is_file():
         blocking.append("no source checkout was found and none was named; `--source` has to "
@@ -108,6 +178,10 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
         tree: dict[str, list[str]] = {}
         fingerprints: list[list[str]] = []
     else:
+        try:
+            source_fingerprints = _source_fingerprints(root)
+        except ReleaseError as error:
+            blocking.append(str(error))
         tree = {name: sorted(str(path.relative_to(root))
                              for path in (root / name).rglob("*")
                              if path.is_file() and "__pycache__" not in path.parts)
@@ -117,12 +191,12 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
         # signature over a list of filenames.
         fingerprints = [[name, relative,
                          content_digest((root / relative).read_bytes())]
-                        for name, files in sorted(tree.items()) for relative in files]
-        missing = [name for name, files in tree.items() if not files]
+                        for name, files in sorted(tree.items()) for relative in files] if not blocking else []
+        missing = [name for name in CARRIED if not tree.get(name)]
         blocking += [f"{root / name} carries no files; this release would ship a runtime "
                      "whose service templates or plugin are missing" for name in missing]
 
-    if target.exists() and any(target.iterdir()):
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
         blocking.append(f"{target} exists and is not empty; a release is staged side by side "
                         "and then switched, never merged into the one that is running")
     if target.is_symlink():
@@ -134,16 +208,22 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
         blocking.append(f"{distribution} is not a file")
     commit, dirty = _revision(root) if root is not None else (None, False)
     if commit:
-        actions.append(f"stage commit {commit[:12]} of {root}")
+        actions.append(f"{'snapshot based on' if snapshot else 'stage commit'} {commit[:12]} of {root}")
     named = re.fullmatch(r"[0-9a-f]{40}", target.name)
     if named and commit and target.name != commit:
         blocking.append(f"{target} is named for commit {target.name[:12]}, but the source at "
                         f"{root} is at {commit[:12]}; a release tree that claims a revision it "
                         "does not hold is worse than one that claims none")
-    if commit and dirty:
+    if snapshot and distribution is not None:
+        blocking.append("snapshot staging builds its reviewed source; a prebuilt wheel cannot prove that pairing")
+    if snapshot and named:
+        blocking.append("a working-tree snapshot cannot be named as a clean git commit")
+    if commit and dirty and not snapshot:
         blocking.append(f"{root} has uncommitted changes; the wheel would be built from bytes "
                         "no revision names, and the release would record a commit it is not. "
                         "Commit them, or stage from a clean checkout")
+    if snapshot:
+        actions.append("stage an explicitly reviewed working-tree snapshot; its base commit is not its identity")
     actions.append(f"build the wheel from {root}" if distribution is None
                    else f"stage from {distribution}")
     actions.append(f"create the runtime environment at {target}")
@@ -168,9 +248,13 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
                      "dirty" if dirty else "clean",
                      wheel_digest or "build-at-apply",
                      BACKEND_SPEC if backend else "no-backend",
-                     json.dumps(fingerprints, sort_keys=True)])
+                     json.dumps(fingerprints, sort_keys=True),
+                     "snapshot" if snapshot else "revision", source_fingerprints])
     return {"into": str(target), "source": str(root or ""), "wheel": str(distribution or ""),
             "source_commit": commit or "", "source_dirty": bool(dirty),
+            "snapshot": snapshot, "source_fingerprints": source_fingerprints,
+            "source_digest": digest(source_fingerprints),
+            "wheel_digest": wheel_digest,
             "backend": backend, "actions": actions, "carried": tree,
             "fingerprints": fingerprints, "blocking": blocking, "review_digest": review}
 
@@ -178,7 +262,8 @@ def plan(*, settings, into: Path | str, source: Path | str | None = None,
 def apply(*, settings, into: Path | str, source: Path | str | None = None,
           wheel: Path | str | None = None, actor: str, review: str,
           environ: Mapping[str, str] | None = None, backend: bool = True,
-          runner: Callable | None = None, verbose: bool = False) -> dict[str, Any]:
+          runner: Callable | None = None, verbose: bool = False,
+          snapshot: bool = False) -> dict[str, Any]:
     """Build the tree. Refused unless the digest still describes the plan that was shown.
 
     ``runner`` defaults to ``subprocess.run``; the tests hand in a recorder, because a
@@ -189,7 +274,7 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
         raise ReleaseError("staging names who approved it; an anonymous release is a "
                            "dependency nobody accepted")
     staged = plan(settings=settings, into=into, source=source, wheel=wheel,
-                  environ=environ, backend=backend)
+                  environ=environ, backend=backend, snapshot=snapshot)
     if staged["blocking"]:
         raise ReleaseError("; ".join(staged["blocking"]))
     if staged["review_digest"] != review:
@@ -207,9 +292,22 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
     # record name an artefact that only this release holds.
     scratch = Path(tempfile.mkdtemp(prefix="hermes-memory-wheel-"))
     try:
+        frozen = scratch / "source"
+        _freeze_source(root, frozen, staged["source_fingerprints"])
         distribution = Path(staged["wheel"])
         if not distribution.is_file():
-            distribution = _build_wheel(root, into=scratch, run=run)
+            # Setuptools rewrites egg-info while building. Keep its mutable workspace
+            # separate from the approved inputs retained and carried by this release.
+            build_source = scratch / "build-source"
+            shutil.copytree(frozen, build_source)
+            distribution = _build_wheel(build_source, into=scratch, run=run)
+        else:
+            body = distribution.read_bytes()
+            if content_digest(body) != staged["wheel_digest"]:
+                raise ReleaseError("prebuilt wheel changed after review")
+            kept_input = scratch / distribution.name
+            kept_input.write_bytes(body)
+            distribution = kept_input
         _run(run, ["uv", "venv", str(target), "--quiet"], stage="runtime venv")
         environments = [target]
         if backend:
@@ -226,15 +324,25 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
             kept.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(distribution, kept)
             distribution = kept
-        carry(source=root, into=target, names=tuple(staged["carried"]))
+        carry(source=frozen, into=target, names=tuple(staged["carried"]))
+        if snapshot:
+            shutil.copytree(frozen, target / "source")
+            registration_source = target / "source"
+            registration_commit = _registerable_snapshot(registration_source, staged["source_digest"])
+        else:
+            registration_source = root
+            registration_commit = staged["source_commit"]
         manifest = {**{key: staged[key] for key in
                        ("into", "source", "source_commit", "source_dirty", "backend",
+                        "snapshot", "source_digest", "source_fingerprints",
                         "review_digest")},
                     # The wheel that was actually installed, and its bytes: a plan that
                     # named none built one, and a release record that could not say which
                     # artefact the environments hold would answer no question at all.
                     "wheel": str(distribution),
                     "wheel_digest": content_digest(distribution.read_bytes()),
+                    "registration_source": str(registration_source),
+                    "registration_commit": registration_commit,
                     "backend_spec": BACKEND_SPEC if backend else None,
                     "framework_version": _version(),
                     "staged_by": actor.strip(), "python": sys.version.split()[0],
@@ -255,7 +363,8 @@ def apply(*, settings, into: Path | str, source: Path | str | None = None,
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     report = {**staged, "performed": True, "staged": str(target),
-              "wheel": str(distribution), **verify(settings=settings, into=target,
+              "wheel": str(distribution), "wheel_digest": content_digest(distribution.read_bytes()),
+              **verify(settings=settings, into=target,
                                                    environ=environ)}
     if verbose:
         report["note"] = "the pointer was not moved; see `upgrade --release` for the switch"
@@ -288,6 +397,32 @@ def verify(*, settings, into: Path | str,
         if not (target / pair).exists():
             missing.append(str(target / pair))
     plugin = sorted((target / "integrations" / "hermes-memory").glob("*.py"))
+    try:
+        manifest = json.loads((target / MANIFEST).read_text(encoding="utf-8"))
+        recorded = manifest.get("source_fingerprints")
+        if recorded is not None:
+            if not isinstance(recorded, list) or manifest.get("source_digest") != digest(recorded):
+                missing.append("release source manifest digest is inconsistent")
+            else:
+                for entry in recorded:
+                    if not isinstance(entry, list) or len(entry) != 3:
+                        missing.append("release source manifest entry is malformed")
+                        break
+                    relative, expected, mode = entry
+                    path = Path(relative)
+                    if path.is_absolute() or ".." in path.parts:
+                        missing.append("release source manifest path escapes the release")
+                        break
+                    if path.parts and path.parts[0] in CARRIED:
+                        artifact = target / path
+                        if (not artifact.is_file() or artifact.is_symlink()
+                                or content_digest(artifact.read_bytes()) != expected
+                                or str(artifact.stat().st_mode & 0o777) != mode):
+                            missing.append(f"reviewed release artifact changed: {relative}")
+                if manifest.get("snapshot") and _source_fingerprints(target / "source") != recorded:
+                    missing.append("retained release source snapshot changed")
+    except (OSError, ValueError, TypeError):
+        missing.append("release manifest or retained source snapshot cannot be verified")
     return {"complete": not missing, "starts": wanted,
             "plugin_files": len(plugin),
             "plugin_digest": digest([[p.name, content_digest(p.read_bytes())] for p in plugin])

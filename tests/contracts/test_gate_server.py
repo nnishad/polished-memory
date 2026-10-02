@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import threading
 import time
+import urllib.error
 
 import pytest
 
 from hermes_memory.processing.gate_server import (GateApp, _apply_cap,
-                                                    _usage_tokens, upstream_url)
+                                                    _usage_tokens, upstream_url,
+                                                    urllib_upstream)
 from hermes_memory.processing.resource_gate import ResourceGate
 from hermes_memory.processing.routes import RouteTable, Route
 from hermes_memory.storage.evidence import EvidenceStore
@@ -18,6 +21,7 @@ REMOTE = "remote-9b"
 GPU = "local-gpu"
 
 TABLE = RouteTable({
+    "rerank": Route("rerank", GPU, "rerank", "http://127.0.0.1:8185", "cred-rerank", "interactive", 0),
     "foreground": Route("foreground", REMOTE, "chat", "http://127.0.0.1:8080/v1", "cred-chat",
                         "interactive", 1024),
     "embeddings": Route("embeddings", GPU, "embeddings", "http://127.0.0.1:11434/v1",
@@ -117,6 +121,71 @@ def test_an_unknown_credential_selects_no_upstream(harness):
     assert upstream.calls == []
 
 
+@pytest.mark.parametrize("path,token", [("/v1/rerank", "cred-chat"),
+    ("/v1/chat/completions", "cred-emb"), ("/v1/embeddings", "cred-rerank")])
+def test_credentials_are_bound_to_operation(harness, path, token):
+    app, gate, upstream = harness
+    assert call(app, path, token=token)["status"] == 403
+    assert not upstream.calls and not gate.held()
+
+
+def test_rerank_gate_forwards_validates_and_accounts_actual_tokens(harness):
+    from hermes_memory.models.reranker import MODEL
+    app, gate, upstream = harness
+    upstream.body = json.dumps({"results": [{"index": 0, "relevance_score": .9}],
+                                "usage": {"input_tokens": 120, "total_tokens": 120}}).encode()
+    response = call(app, "/v1/rerank", token="cred-rerank",
+                    body={"model": MODEL, "query": "q", "documents": ["d"], "return_documents": False})
+    assert response["status"] == 200
+    assert upstream.calls[0]["url"] == "http://127.0.0.1:8185/v1/rerank"
+    assert "max_tokens" not in upstream.calls[0]["payload"]
+    assert not gate.held()
+    assert response["body"]["usage"]["total_tokens"] == 120
+
+
+def test_rerank_gate_refuses_native_silent_zero_fallback(harness):
+    from hermes_memory.models.reranker import MODEL
+    app, gate, upstream = harness
+    upstream.body = b'{"results": [], "usage": {"input_tokens": 120, "total_tokens": 120}}'
+    response = call(app, "/v1/rerank", token="cred-rerank",
+                    body={"model": MODEL, "query": "q", "documents": ["d"]})
+    assert response["status"] == 502 and not gate.held()
+
+
+def test_actual_dispatch_time_is_charged(harness, monkeypatch):
+    import hermes_memory.processing.gate_server as module
+    app, gate, _ = harness
+    ticks = iter((100.0, 100.75))
+    monkeypatch.setattr(module, "monotonic", lambda: next(ticks))
+    response = call(app)
+    assert response["status"] == 200
+    row = gate.db.execute("SELECT detail FROM gate_ledger WHERE event='released' ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert json.loads(row[0])["seconds"] == .75
+
+
+def test_invalid_rerank_usage_cannot_poison_budget(harness):
+    from hermes_memory.models.reranker import MODEL
+    app, gate, upstream = harness
+    upstream.body = b'{"results": [], "usage": {"input_tokens": 100, "total_tokens": 999999999}}'
+    assert call(app, "/v1/rerank", token="cred-rerank",
+                body={"model": MODEL, "query": "q", "documents": ["d"]})["status"] == 502
+    row = gate.db.execute("SELECT detail FROM gate_ledger WHERE event='released' ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert json.loads(row[0])["tokens"] == 0
+    assert json.loads(row[0])["outcome"] == "malformed"
+
+
+def test_rerank_shares_embeddings_gpu_slot(harness):
+    from hermes_memory.models.reranker import MODEL
+    app, gate, upstream = harness
+    held = gate.acquire(route="embeddings", holder="synthetic", resource=GPU, priority=1, ttl=60)
+    try:
+        assert call(app, "/v1/rerank", token="cred-rerank",
+                    body={"model": MODEL, "query": "q", "documents": ["d"]})["status"] == 429
+        assert not upstream.calls
+    finally:
+        gate.release(held, outcome="succeeded")
+
+
 def test_a_credential_cannot_name_its_own_upstream(harness):
     """The caller supplies no URL by construction; only the route table does."""
     app, _, upstream = harness
@@ -134,6 +203,38 @@ def test_a_chat_request_is_forwarded_with_the_upstream_credential(harness):
     assert sent["headers"]["Authorization"] == "Bearer real-upstream-secret-a"
     assert "cred-chat" not in json.dumps(sent["headers"])
     assert gate.usage()[REMOTE]["tokens"] == 42
+
+
+@pytest.mark.parametrize("code, released", [
+    (errno.ECONNREFUSED, True), (errno.EHOSTUNREACH, True),
+    (errno.ENETUNREACH, True), (errno.ETIMEDOUT, False),
+    (errno.ECONNRESET, False), (errno.EPIPE, False),
+])
+def test_only_established_connect_failures_free_the_slot(harness, monkeypatch, code, released):
+    app, gate, _ = harness
+
+    def fail(*args, **kwargs):
+        raise urllib.error.URLError(OSError(code, "synthetic transport failure"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    app.upstream = urllib_upstream()
+    response = call(app)
+    assert response["status"] == (502 if released else 504)
+    assert bool(gate.unresolved()) is not released
+    assert response["body"]["error"]["type"] == (
+        "connection_failed" if released else "uncertain")
+
+
+def test_timeout_without_connect_evidence_stays_uncertain(harness, monkeypatch):
+    app, gate, _ = harness
+
+    def fail(*args, **kwargs):
+        raise TimeoutError("answer was not received")
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    app.upstream = urllib_upstream()
+    assert call(app)["status"] == 504
+    assert gate.unresolved()
 
 
 def test_embeddings_use_the_gpu_slot_and_a_different_upstream(harness):

@@ -1,8 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+evals/.venv-reranker/
 *.egg-info/
 .pytest_cache/
+build/
 *.db
 *.db-wal
 *.db-shm

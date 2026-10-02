@@ -173,8 +173,22 @@ class McpSource(SourceAdapter):
         return report
 
     def read_page(self, cursor: str | None) -> Page:
-        answer = self._ask(cursor)
+        import json
+        remote, offset, expected = cursor, 0, None
+        prefix = "mcp-page-v1:"
+        if cursor and cursor.startswith(prefix):
+            try:
+                remote, offset, expected = json.loads(cursor[len(prefix):])
+                if not isinstance(offset, int) or offset < 0:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise CursorExpired("invalid MCP page cursor") from None
+        answer = self._ask(remote)
         items = _items_of(answer)
+        stamp = digest(json.dumps(items, sort_keys=True, default=lambda value: {
+            "bytes_hex": value.hex()} if isinstance(value, bytes) else repr(value)))
+        if expected is not None and expected != stamp:
+            raise CursorExpired("MCP page changed while resuming; restart the source scan")
         position = _position_of(answer)
         envelopes: list[dict[str, Any]] = []
         skipped: list[Skipped] = []
@@ -185,20 +199,18 @@ class McpSource(SourceAdapter):
             if produced is None:
                 skipped.append(Skipped(reference, reason))
                 continue
-            size = len(produced["text"].encode("utf-8"))
+            if index < offset:
+                continue
+            size = len(json.dumps(produced, ensure_ascii=False).encode("utf-8"))
+            if size > self.capabilities.max_bytes_per_page:
+                skipped.append(Skipped(reference, "record exceeds the page byte bound"))
+                continue
             if envelopes and (len(envelopes) >= self.capabilities.max_records_per_page
                               or used + size > self.capabilities.max_bytes_per_page):
-                # The page is full. With a cursor from the server this item comes back
-                # on the next read; without one there is nowhere to resume from, so the
-                # rest of the answer is reported as what this page could not carry
-                # rather than dropped in silence.
-                if position is None:
-                    skipped.append(Skipped(
-                        f"{self.map.name}#page-full",
-                        f"{len(items) - index} more items came with this answer and the "
-                        "server offers no position to resume from; a smaller page, or a "
-                        "tool that paginates, is how they get read"))
-                break
+                # Server cursors advance past whole responses. Replay the same
+                # response with a content-bound local offset until its tail is consumed.
+                return Page(envelopes=tuple(envelopes), skipped=tuple(skipped),
+                            next_cursor=prefix + json.dumps([remote, index, stamp], separators=(",", ":")))
             used += size
             envelopes.append(produced)
         if len(items) > _MAX_ITEMS:

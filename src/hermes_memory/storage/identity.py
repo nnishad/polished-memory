@@ -9,6 +9,8 @@ produced it so the decision can be judged rather than trusted.
 """
 from __future__ import annotations
 
+from ..storage.transactions import write_transaction
+
 import json
 import re
 from typing import Any, Sequence
@@ -65,8 +67,7 @@ class IdentityStore:
         namespace = _check_namespace(namespace)
         kept, normalized = normalize_account(namespace, identifier)
         account_id = "acct_" + digest([namespace, normalized])[:32]
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "INSERT INTO identity_accounts(id, namespace, identifier, normalized, label, "
                 "state, created_at) VALUES(?,?,?,?,?, 'active', ?) "
@@ -74,10 +75,6 @@ class IdentityStore:
                 "label=COALESCE(excluded.label, identity_accounts.label)",
                 (account_id, namespace, kept, normalized, label, now()),
             )
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return account_id
 
     def get_account(self, account_id: str) -> dict[str, Any] | None:
@@ -149,15 +146,13 @@ class IdentityStore:
         # so a second rule pointing at the same two accounts reopens the same row
         # rather than colliding with it.
         candidate_id = "cand_" + digest([pair[0], pair[1]])[:32]
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             existing = self.db.execute(
                 "SELECT state FROM identity_candidates WHERE id=?", (candidate_id,)).fetchone()
             if existing:
                 # A rejected candidate is durable: re-proposing must not quietly
                 # revive a decision the owner already made.
                 if existing["state"] in (REJECTED, CONFIRMED):
-                    self.db.execute("COMMIT")
                     return {"candidate_id": candidate_id, "state": existing["state"],
                             "reopened": False}
                 self.db.execute(
@@ -166,7 +161,6 @@ class IdentityStore:
                     (rule, version, basis, json.dumps(list(evidence), sort_keys=True),
                      proposed_by, proposed_kind, now(), candidate_id),
                 )
-                self.db.execute("COMMIT")
                 return {"candidate_id": candidate_id, "state": PENDING, "reopened": False}
             self.db.execute(
                 "INSERT INTO identity_candidates(id, account_a, account_b, rule, rule_version, "
@@ -179,10 +173,6 @@ class IdentityStore:
             self.store._audit("identity_propose", candidate_id,
                               {"rule": rule, "proposed_by": proposed_by,
                                "proposed_kind": proposed_kind, "evidence": len(evidence)})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"candidate_id": candidate_id, "state": PENDING, "reopened": True,
                 "rule": rule, "rule_version": version}
 
@@ -206,11 +196,9 @@ class IdentityStore:
         """Owner-only. Creates the canonical edge and refuses overlapping claims."""
         self._require_owner(actor)
         _check_reason(reason)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             candidate = self._candidate_or_raise(candidate_id)
             if candidate["state"] == CONFIRMED:
-                self.db.execute("COMMIT")
                 return {"state": CONFIRMED, "edge_id": None,
                         "note": "already confirmed; no second edge was created"}
             if candidate["state"] == REJECTED:
@@ -240,18 +228,13 @@ class IdentityStore:
             )
             self.store._audit("identity_confirm", edge_id,
                               {"actor": actor, "candidate": candidate_id})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"state": CONFIRMED, "edge_id": edge_id}
 
     def reject(self, *, candidate_id: str, actor: str, reason: str) -> dict[str, Any]:
         """Owner-only, and durable: a rejection survives later re-proposals."""
         self._require_owner(actor)
         _check_reason(reason)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             candidate = self._candidate_or_raise(candidate_id)
             if candidate["state"] == CONFIRMED:
                 raise EvidenceError(
@@ -263,23 +246,17 @@ class IdentityStore:
                 (REJECTED, actor, now(), reason, candidate_id),
             )
             self.store._audit("identity_reject", candidate_id, {"actor": actor})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"state": REJECTED, "candidate_id": candidate_id}
 
     def revoke(self, *, edge_id: str, actor: str, reason: str) -> dict[str, Any]:
         self._require_owner(actor)
         _check_reason(reason)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             edge = self.db.execute(
                 "SELECT * FROM identity_edges WHERE id=?", (edge_id,)).fetchone()
             if edge is None:
                 raise EvidenceError(f"unknown identity edge {edge_id!r}")
             if edge["state"] != "active":
-                self.db.execute("COMMIT")
                 return {"state": edge["state"], "note": "already revoked"}
             self.db.execute(
                 "UPDATE identity_edges SET state='revoked', revoked_at=?, revoked_by=?, "
@@ -287,10 +264,6 @@ class IdentityStore:
                 (now(), actor, reason, edge_id),
             )
             self.store._audit("identity_revoke", edge_id, {"actor": actor})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"state": "revoked", "edge_id": edge_id}
 
     def _require_owner(self, actor: str) -> None:
@@ -395,8 +368,7 @@ class IdentityStore:
             "SELECT id, evidence, state FROM identity_candidates WHERE state IN (?,?)",
             (PENDING, CONFIRMED)).fetchall()
         stale, needs_review = [], []
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             for row in rows:
                 cited = json.loads(row["evidence"])
                 alive = [rid for rid in cited
@@ -417,10 +389,6 @@ class IdentityStore:
                 # decisions and say none.
                 self.store._audit("identity_invalidate", "identity_candidates",
                                   {"stale": len(stale), "needs_review": len(needs_review)})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"stale": stale, "confirmed_needing_review": needs_review}
 
     # -- topics --------------------------------------------------------------
@@ -434,8 +402,7 @@ class IdentityStore:
             raise EvidenceError("topic must be nonempty text of at most 500 characters")
         if self.get_account(account_id) is None:
             raise EvidenceError(f"unknown account {account_id!r}")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "INSERT INTO topic_links(id, account_id, topic, kind, source_record_id, "
                 "observed_at) VALUES(?,?,?,?,?,?) "
@@ -445,10 +412,6 @@ class IdentityStore:
                 ("topic_" + digest([account_id, topic, kind])[:32], account_id, topic.strip(),
                  kind, source_record_id, now()),
             )
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
 
     def accounts_for_topic(self, topic: str, *, kind: str = "structural") -> list[str]:
         rows = self.db.execute(

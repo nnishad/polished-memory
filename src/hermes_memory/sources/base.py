@@ -123,6 +123,8 @@ class SourceAdapter:
         """Stamp an adapter's own source name onto a normalised record."""
         if not self.source:
             raise EvidenceError("adapter must declare a source name")
+        if isinstance(values.get("text"), str):
+            values["text"] = redact_secrets(values["text"])
         values["source"] = self.source
         return values
 
@@ -154,6 +156,8 @@ def normalize_time(value: Any) -> tuple[str | None, str, str | None]:
     if not isinstance(value, str):
         return None, "unknown", "source time was not text"
     text = value.strip()
+    if len(text) > 100:
+        return None, "unknown", "source time exceeded the timestamp limit"
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:

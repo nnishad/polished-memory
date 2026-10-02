@@ -161,7 +161,7 @@ def deliver_once(outbox: Any, *, policy: DeliveryPolicy,
 
     body = f"{correlation(artifact)}\n{artifact.payload}"
     try:
-        outbox.attempt(artifact_id=artifact.id, token=claim.token)
+        outbox.attempt(artifact_id=artifact.id, token=claim.token, at=at)
     except Exception as error:
         # The handover never began, so nothing can have left. Say so and stop: this
         # is the only path that may report a refusal without an uncertain state.
@@ -308,7 +308,8 @@ def local_sink(hermes_home: str | Path, *, directory: str = "memory/delivered"):
 
 def command_sink(command: str | Sequence[str], *, destination: str | None = None,
                  timeout_s: float = 90.0,
-                 env_extra: Sequence[str] = ()) -> Callable[[str], Any]:
+                 env_extra: Sequence[str] = (),
+                 hermes_home: str | Path | None = None) -> Callable[[str], Any]:
     """A transport that is somebody else's program: pipe the body in, read its answer out.
 
     `hermes send -t telegram:<chat-id> --json` is what this exists for. The gateway already
@@ -342,19 +343,28 @@ def command_sink(command: str | Sequence[str], *, destination: str | None = None
                                        and isinstance(os.environ.get(key), str)}
                                   | {name: os.environ[name] for name in env_extra
                                      if name.isidentifier()
-                                     and isinstance(os.environ.get(name), str)})
+                                     and isinstance(os.environ.get(name), str)}
+                                  | ({"HERMES_HOME": str(Path(hermes_home).resolve())}
+                                     if hermes_home is not None else {}))
         text = finished.stdout.decode("utf-8", "replace")
+        answered = _answered(text)
+        if isinstance(answered, dict) and answered.get("success") is False \
+                and not answered.get("partial_success"):
+            return {"sent": False, "error": str(answered.get("error") or "transport refused")[:200]}
         if finished.returncode != 0:
             raise RuntimeError(f"{Path(argv[0]).name} exited {finished.returncode}: "
                                f"{finished.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        if not isinstance(answered, dict) or (answered.get("success") is not True
+                                              and answered.get("sent") is not True):
+            raise RuntimeError("transport exited without an explicit positive receipt; delivery uncertain")
         receipt: dict[str, Any] = {"sent": True}
-        answered = _answered(text)
         if isinstance(answered, dict):
             reported = str(answered.get("chat_id") or "").strip()
             if address and reported and reported != address:
                 raise RuntimeError(f"{Path(argv[0]).name} reported sending to {reported!r}, "
                                    f"which is not the approved destination {address!r}")
-            for key in ("platform", "chat_id", "message_id"):
+            for key in ("platform", "chat_id", "message_id", "thread_id", "mirrored",
+                        "session_key", "session_id", "transport_profile"):
                 if answered.get(key) is not None:
                     receipt[key] = answered[key]
             if not answered.get("success", True):
@@ -369,6 +379,7 @@ def command_sink(command: str | Sequence[str], *, destination: str | None = None
             receipt["verified"] = True
         return receipt
 
+    send.hermes_home = str(Path(hermes_home).resolve()) if hermes_home is not None else None
     return send
 
 
@@ -382,7 +393,7 @@ def sink_for(settings, hermes_home: str | Path) -> tuple[Callable | None, str | 
     destination = str(getattr(settings, "delivery_target", None) or "")
     command = tuple(getattr(settings, "delivery_command", ()) or ())
     if command:
-        return command_sink(command, destination=destination), " ".join(command)
+        return command_sink(command, destination=destination, hermes_home=hermes_home), " ".join(command)
     if destination.lower().startswith("local:"):
         home = Path(hermes_home)
         return local_sink(home), str(home / "memory" / "delivered")

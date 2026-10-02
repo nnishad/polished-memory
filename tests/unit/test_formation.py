@@ -34,7 +34,7 @@ from hermes_memory.processing.formation import (DEFAULT_BATCH, KIND, MAX_BATCH, 
 from hermes_memory.processing.instance_gate import gate_path, instance_gate
 from hermes_memory.processing.jobs import (CANCELLED, RETRY_WAIT, SUCCEEDED, UNCERTAIN,
                                            JobQueue)
-from hermes_memory.storage.evidence import EvidenceStore
+from hermes_memory.storage.evidence import EvidenceError, EvidenceStore
 
 OWNER = "jugaadu"
 BANK = "hermes"
@@ -126,6 +126,18 @@ def records(store):
         "SELECT id FROM records ORDER BY ingested_at, id")]
 
 
+def test_invalid_poll_bounds_refuse_before_any_job_is_written(installation):
+    client = Answers()
+    shown = formation_plan(installation)
+    with pytest.raises(ValueError, match="follow_max_polls"):
+        formation_apply(installation, actor=OWNER, review=shown["review_digest"],
+                        client=client, follow_max_polls=0)
+    with EvidenceStore(installation.db_path) as store:
+        assert store.db.execute("SELECT count(*) FROM processing_jobs").fetchone()[0] == 0
+        assert store.db.execute("SELECT count(*) FROM backend_documents").fetchone()[0] == 0
+    assert client.retain_calls == []
+
+
 # -- what the reading sees ---------------------------------------------------
 
 def test_every_live_record_is_unprojected_until_something_says_otherwise(installation):
@@ -164,7 +176,7 @@ def test_a_verified_projection_under_a_superseded_epoch_is_not_coverage(installa
             "a projection confirmed before a reset describes a backend that reset cleared"
 
 
-def test_confirming_a_projection_is_coverage_for_the_epoch_it_was_confirmed_under(
+def test_a_pre_reset_confirmation_cannot_be_promoted_into_current_coverage(
         installation):
     with EvidenceStore(installation.db_path) as store:
         documents = DocumentMap(store, bank_id=BANK)
@@ -174,9 +186,9 @@ def test_confirming_a_projection_is_coverage_for_the_epoch_it_was_confirmed_unde
         store.bump_epoch(reason="reset", actor=OWNER)
         assert count_unprojected(store, bank_id=BANK) == 3
         for record_id in records(store):
-            documents.confirm(record_id, "1")
-        assert count_unprojected(store, bank_id=BANK) == 0, \
-            "a confirmation today is coverage today, not a receipt from an older epoch"
+            with pytest.raises(EvidenceError, match="stale"):
+                documents.confirm(record_id, "1")
+        assert count_unprojected(store, bank_id=BANK) == 3
 
 
 def test_another_bank_s_own_projections_are_not_this_one_s_coverage(installation):
@@ -343,6 +355,23 @@ def test_rotating_a_route_credential_leaves_the_coverage_claim_alone(installatio
     settings = load_settings()
     assert processor_fingerprint(settings, retain_route(settings)) == before, \
         "a key rotation does not invalidate facts already extracted"
+
+
+def test_retention_context_contract_is_part_of_processor_identity(installation, monkeypatch):
+    from hermes_memory.processing import formation
+
+    route = retain_route(installation)
+    before = processor_fingerprint(installation, route)
+    monkeypatch.setattr(formation, "RETAIN_CONTEXT_VERSION", formation.RETAIN_CONTEXT_VERSION + 1)
+    assert processor_fingerprint(installation, route) != before
+
+
+def test_declared_model_changes_affect_processor_identity(installation):
+    from dataclasses import replace
+
+    before = processor_fingerprint(installation, retain_route(installation))
+    changed = replace(installation, text_route=replace(installation.text_route, model="different-model"))
+    assert processor_fingerprint(changed, retain_route(changed)) != before
 
 
 def test_the_wall_clock_in_a_plan_is_not_part_of_the_approval(installation):

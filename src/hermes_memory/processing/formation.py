@@ -33,10 +33,11 @@ from .budgets import Budget, Budgets
 from .instance_gate import instance_gate, status_gate
 from .jobs import JobQueue
 from .routes import build_routes
-from .worker import ESTIMATED_TOKENS_PER_ITEM, FormationWorker
+from .worker import ESTIMATED_TOKENS_PER_ITEM, RETAIN_CONTEXT_VERSION, FormationWorker
+from .worker import FOLLOW_MAX_POLLS, FOLLOW_POLL_S, validate_follow_bounds
 
 __all__ = ["KIND", "ROUTE_NAME", "DEFAULT_BATCH", "MAX_BATCH", "MAX_JOBS",
-           "FormationError", "retain_route", "processor_fingerprint", "unprojected",
+           "FormationError", "retain_route", "processor_manifest", "processor_fingerprint", "unprojected",
            "count_unprojected", "formation_plan", "formation_apply", "formation_reconcile",
            "backend_client"]
 
@@ -66,6 +67,26 @@ def retain_route(settings) -> Any:
     return build_routes(settings, credentials=settings.route_credentials).by_name(ROUTE_NAME)
 
 
+def processor_manifest(settings, route) -> dict[str, Any]:
+    """Declared processor inputs only; unknown backend overrides stay unknown.
+
+    This is not a generation registry or a claim that live vector dimensions and
+    per-bank prompt settings have been probed. Credentials never belong here.
+    """
+    text = settings.text_route
+    embeddings = settings.embeddings_route
+    return {"version": "processor-manifest-v1", "kind": KIND,
+            "backend_version": PINNED_VERSION, "bank_id": settings.bank_id,
+            "resource": route.resource, "operation": route.operation,
+            "text_upstream": route.upstream, "output_cap": int(route.max_output_tokens),
+            "text_model": text.model if text else None,
+            "embedding_model": embeddings.model if embeddings else None,
+            "embedding_upstream": embeddings.base_url if embeddings else None,
+            "retain_context_version": RETAIN_CONTEXT_VERSION,
+            "source_context_version": 2,
+            "bank_prompt_config": None, "embedding_dimensions": None}
+
+
 def processor_fingerprint(settings, route) -> str:
     """Which processor produced a piece of coverage.
 
@@ -74,8 +95,7 @@ def processor_fingerprint(settings, route) -> str:
     proves nothing about this one. Credentials are deliberately absent: rotating a key
     does not invalidate a fact that was already extracted.
     """
-    return digest([KIND, PINNED_VERSION, settings.bank_id, route.resource, route.operation,
-                   route.upstream, int(route.max_output_tokens)])[:24]
+    return digest(processor_manifest(settings, route))[:24]
 
 
 def unprojected(store, *, bank_id: str, limit: int = DEFAULT_BATCH,
@@ -99,7 +119,7 @@ def count_unprojected(store, *, bank_id: str, epoch: int | None = None) -> int:
 
 
 def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
-                   gate: Any = None) -> dict[str, Any]:
+                   gate: Any = None, generation_id: str | None = None) -> dict[str, Any]:
     """What a bounded pass would do, computed without a connection to anything.
 
     No store is opened on a path that could migrate it, no socket is dialled and no
@@ -161,10 +181,32 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
         pending = 0
         selected: list[dict[str, str]] = []
         queue: dict[str, int] = {}
+        target_bank = settings.bank_id
         if store is not None:
+            from ..backend.generations import GenerationRegistry
+            if store.db.execute("SELECT 1 FROM sqlite_master WHERE name='projection_generations'").fetchone():
+                registry = GenerationRegistry(store, family_bank=settings.bank_id)
+                generation = registry.get(generation_id) if generation_id else registry.active()
+                if not generation_id and generation is None and store.db.execute(
+                        "SELECT 1 FROM projection_generations WHERE backend=? AND family_bank=?",
+                        (BACKEND, settings.bank_id)).fetchone():
+                    blocking.append("no active current generation; prepare/select a shadow rebuild")
+                if generation_id and generation is None:
+                    blocking.append("unknown generation for this profile's configured bank")
+                if generation:
+                    generation_id = generation["id"]
+                    target_bank = generation["bank_id"]
+                    if generation["epoch"] != store.epoch() or generation["state"] == "retired":
+                        blocking.append("generation is stale or retired; prepare a current shadow rebuild")
+                    if route and not generation["legacy"]:
+                        import json
+                        if json.loads(generation["manifest"]) != processor_manifest(settings, route):
+                            blocking.append("processor configuration changed; prepare another shadow generation")
+            elif generation_id:
+                blocking.append("projection generation schema is not installed")
             epoch = store.epoch()
-            pending = count_unprojected(store, bank_id=settings.bank_id, epoch=epoch)
-            selected = unprojected(store, bank_id=settings.bank_id, limit=limit, epoch=epoch)
+            pending = count_unprojected(store, bank_id=target_bank, epoch=epoch)
+            selected = unprojected(store, bank_id=target_bank, limit=limit, epoch=epoch)
             queue = _queue_counts(store)
             if not pending:
                 blocking.append("nothing is unprojected: every live record already has a "
@@ -178,7 +220,8 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
         planned = budget["planned"]
         actionable = {
             "plan_version": PLAN_VERSION, "profile": settings.profile,
-            "bank_id": settings.bank_id, "route": ROUTE_NAME if route else "unset",
+            "bank_id": target_bank, "generation_id": generation_id,
+            "route": ROUTE_NAME if route else "unset",
             "resource": resource,
             "upstream": route.upstream if route else "unset",
             "priority": route.priority if route else "unset",
@@ -227,7 +270,9 @@ def formation_plan(settings, *, limit: int = DEFAULT_BATCH,
 def formation_apply(settings, *, actor: str, review: str | None = None,
                     under_allowance: str | None = None, limit: int = DEFAULT_BATCH,
                     max_jobs: int = MAX_JOBS, client: Any = None,
-                    worker_id: str | None = None) -> dict[str, Any]:
+                    worker_id: str | None = None, generation_id: str | None = None,
+                    follow_poll_s: float = FOLLOW_POLL_S,
+                    follow_max_polls: int = FOLLOW_MAX_POLLS) -> dict[str, Any]:
     """Perform exactly the bounded pass that was shown, and account for every part of it.
 
     Two doors, one work. ``review`` is the digest of a list somebody read: it has to match the
@@ -256,11 +301,12 @@ def formation_apply(settings, *, actor: str, review: str | None = None,
                              "the digest it prints")
     if not isinstance(max_jobs, int) or not 1 <= max_jobs <= MAX_JOBS:
         raise FormationError(f"max_jobs must be between 1 and {MAX_JOBS}")
+    validate_follow_bounds(follow_poll_s, follow_max_polls)
 
     from ..storage.evidence import EvidenceStore
 
     with instance_gate(settings) as gate:
-        proposal = formation_plan(settings, limit=limit, gate=gate)
+        proposal = formation_plan(settings, limit=limit, gate=gate, generation_id=generation_id)
         if review is not None and review != proposal["review_digest"]:
             raise FormationError("the review digest does not match what would happen now. "
                                  "Run `hermes-memory form` again and approve the plan it "
@@ -298,10 +344,12 @@ def formation_apply(settings, *, actor: str, review: str | None = None,
                 tokens=proposal["token_budget"])}, scope=BUDGET_SCOPE)
             holder = FormationWorker(
                 store=store, jobs=jobs, gate=gate, budgets=budgets,
-                documents=DocumentMap(store, bank_id=settings.bank_id),
-                client=client or backend_client(settings),
+                documents=DocumentMap(store, bank_id=proposal["bank_id"],
+                                      generation_id=proposal["generation_id"]),
+                client=client or backend_client(settings, bank_id=proposal["bank_id"]),
                 routes=build_routes(settings, credentials=settings.route_credentials),
                 slot_queue_s=settings.gate_queue_s,
+                follow_poll_s=follow_poll_s, follow_max_polls=follow_max_polls,
                 worker_id=(worker_id or f"form-{actor.strip()}")[:120])
             spent_before = int(budgets.used(route.resource)["tokens"])
             drained = holder.drain(max_jobs=max_jobs)
@@ -337,12 +385,14 @@ def formation_apply(settings, *, actor: str, review: str | None = None,
                 "drain": drained,
                 "budget": budgets.report(),
                 "allowance": allowance,
-                "unprojected_after": count_unprojected(store, bank_id=settings.bank_id),
+                "bank_id": proposal["bank_id"], "generation_id": proposal["generation_id"],
+                "unprojected_after": count_unprojected(store, bank_id=proposal["bank_id"]),
                 "performed": performed,
             }
 
 
-def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = None) -> dict:
+def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = None,
+                        generation_id: str | None = None) -> dict:
     """Ask the backend what became of submissions this machine cannot account for.
 
     A worker that stopped waiting leaves an operation identity on the row and nothing more;
@@ -360,9 +410,18 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
     empty = {"settled": 0, "verified": 0, "pending": 0, "absent": 0, "unreachable": 0,
              "stopped_operations": []}
     with EvidenceStore(settings.db_path) as store:
-        docs = DocumentMap(store, bank_id=settings.bank_id)
+        bank_id = settings.bank_id
+        if generation_id:
+            from ..backend.generations import GenerationRegistry
+            generation = GenerationRegistry(store, family_bank=settings.bank_id).get(generation_id)
+            if generation is None:
+                raise FormationError("unknown generation for this profile's configured bank")
+            # Reconcile the submitted bank, including retired/stale generations.
+            # Confirmation still cannot promote stale input into current coverage.
+            bank_id = generation["bank_id"]
+        docs = DocumentMap(store, bank_id=bank_id)
         asked = docs.outstanding(limit=limit)
-        outcome = docs.reconcile(client=client or backend_client(settings), limit=limit) \
+        outcome = docs.reconcile(client=client or backend_client(settings, bank_id=bank_id), limit=limit) \
             if asked else empty
         # The answers are read from the projection ledger rather than from what this pass
         # collected. A job left uncertain by an older run of this door carries a submission
@@ -395,7 +454,7 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
             "ok": True,
             "performed_at": now(),
             "profile": settings.profile,
-            "bank_id": settings.bank_id,
+            "bank_id": bank_id,
             "limit": int(limit),
             "asked": [{"record_id": row["record_id"], "state": row["state"],
                        "operation_id": row["operation_id"]} for row in asked],
@@ -429,7 +488,7 @@ def formation_reconcile(settings, *, limit: int = DEFAULT_BATCH, client: Any = N
         }
 
 
-def backend_client(settings) -> Any:
+def backend_client(settings, *, bank_id: str | None = None) -> Any:
     """The configured backend, addressed by the installation rather than by a caller.
 
     The API key is read from scoped secret storage at the moment of use and appears in no
@@ -439,7 +498,7 @@ def backend_client(settings) -> Any:
 
     if not settings.hindsight_url:
         raise FormationError("no backend endpoint is configured")
-    return HindsightClient(base_url=settings.hindsight_url, bank_id=settings.bank_id,
+    return HindsightClient(base_url=settings.hindsight_url, bank_id=bank_id or settings.bank_id,
                            api_key=scoped_secret(settings, settings.hindsight_api_key_env))
 
 
@@ -498,7 +557,8 @@ def _enqueue(jobs: JobQueue, proposal: dict[str, Any], *, route) -> dict[str, An
         outcome = jobs.enqueue(
             kind=KIND, inputs=[item["record_id"]], input_revision=item["revision"],
             route=route, processor_fingerprint=proposal["processor_fingerprint"],
-            priority=route.priority, token_budget=int(proposal["per_job_tokens"]))
+            priority=route.priority, token_budget=int(proposal["per_job_tokens"]),
+            generation_id=proposal["generation_id"], target_bank=proposal["bank_id"])
         created += int(outcome["created"])
         existing += not int(outcome["created"])
     return {"created": created, "existing": existing, "records": created + existing,

@@ -66,6 +66,8 @@ class Job:
     # and the process that said so is gone" — the second is unreconciled work.
     lease: str | None = None
     lease_until: float | None = None
+    generation_id: str | None = None
+    target_bank: str | None = None
 
 
 # Whether a job is overdue is asked of the queue, not of the row: `claim` compares a deadline
@@ -91,7 +93,8 @@ class JobQueue:
     def enqueue(self, *, kind: str, inputs: list[str], input_revision: str, route: Route,
                 processor_fingerprint: str, priority: str = "maintenance",
                 max_attempts: int = 3, token_budget: int = 50_000,
-                deadline: float | None = None) -> dict[str, Any]:
+                deadline: float | None = None, generation_id: str | None = None,
+                target_bank: str | None = None) -> dict[str, Any]:
         if not inputs or len(inputs) > 500:
             raise EvidenceError("a job covers between 1 and 500 inputs")
         if priority not in PRIORITY:
@@ -105,10 +108,19 @@ class JobQueue:
                                 "per processor, not per kind")
         # Identity is derived from the work, not from a counter, so re-enqueueing
         # the same revision under the same fingerprint is one job rather than two.
-        job_id = "job_" + digest([kind, route.name, sorted(inputs), input_revision,
-                                  processor_fingerprint])[:32]
+        identity = [kind, route.name, sorted(inputs), input_revision,
+                    processor_fingerprint, self.store.epoch()]
+        if generation_id is not None or target_bank is not None:
+            identity.extend([generation_id, target_bank])
+        job_id = "job_" + digest(identity)[:32]
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            if generation_id is not None:
+                generation = self.db.execute("SELECT bank_id,epoch,state FROM projection_generations "
+                                             "WHERE id=?", (generation_id,)).fetchone()
+                if (generation is None or generation["bank_id"] != target_bank
+                        or generation["epoch"] != self.store.epoch() or generation["state"] == "retired"):
+                    raise EvidenceError("job generation/target bank is not currently writable")
             existing = self.db.execute("SELECT id, state FROM processing_jobs WHERE id=?",
                                        (job_id,)).fetchone()
             if existing and existing["state"] not in (QUARANTINED, CANCELLED):
@@ -117,13 +129,17 @@ class JobQueue:
             self.db.execute(
                 "INSERT INTO processing_jobs(id, kind, state, priority, resource, route, epoch, "
                 "processor_fingerprint, inputs, input_revision, max_attempts, token_budget, "
-                "deadline, created_at, updated_at) "
-                "VALUES(?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at",
+                "deadline, created_at, updated_at,generation_id,target_bank) "
+                "VALUES(?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at, "
+                "epoch=excluded.epoch, attempts=0, tokens_used=0, lease=NULL, lease_until=NULL, "
+                "submission_id=NULL, backend_operation_id=NULL, last_error=NULL, not_before=NULL, "
+                "completed_at=NULL, deadline=excluded.deadline, max_attempts=excluded.max_attempts, "
+                "token_budget=excluded.token_budget",
                 (job_id, kind, QUEUED, PRIORITY[priority], route.resource, route.name,
                  self.store.epoch(), processor_fingerprint,
                  json.dumps(sorted(inputs), sort_keys=True), input_revision, max_attempts,
-                 token_budget, deadline, now(), now()),
+                 token_budget, deadline, now(), now(), generation_id, target_bank),
             )
             self.db.execute("COMMIT")
         except BaseException:
@@ -137,7 +153,7 @@ class JobQueue:
 
     # -- dispatch ------------------------------------------------------------
 
-    def claim(self, *, worker: str, ttl: float = 120.0) -> Job | None:
+    def claim(self, *, worker: str, ttl: float = 120.0, partition: tuple | None = None) -> Job | None:
         """Lease the most urgent eligible job, honouring priority then age.
 
         An overdue job is not claimed: handing out work that has already blown
@@ -162,8 +178,16 @@ class JobQueue:
                 WHERE (state=? OR (state=? AND (not_before IS NULL OR not_before <= ?)))
                   AND epoch=? AND attempts < max_attempts
                   AND (deadline IS NULL OR deadline > ?)
+                  AND (?=0 OR ((generation_id IS ? OR (?=1 AND generation_id IS NULL))
+                               AND (target_bank IS ? OR target_bank IS NULL)))
+                  AND (generation_id IS NULL OR EXISTS(SELECT 1 FROM projection_generations g
+                       WHERE g.id=processing_jobs.generation_id AND g.epoch=processing_jobs.epoch
+                       AND g.state IN ('building','active')))
                 ORDER BY priority, created_at, id LIMIT 1
-                """, (QUEUED, RETRY_WAIT, moment, now_epoch, moment)).fetchone()
+                """, (QUEUED, RETRY_WAIT, moment, now_epoch, moment, int(partition is not None),
+                       partition[0] if partition else None,
+                       int(bool(partition and partition[0] and partition[0].startswith("legacy:"))),
+                       partition[1] if partition else None)).fetchone()
             if row is None:
                 self.db.execute("COMMIT")
                 return None
@@ -186,6 +210,7 @@ class JobQueue:
         """
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self._require_claim(job)
             row = self.db.execute("SELECT state FROM processing_jobs WHERE id=?",
                                   (job.id,)).fetchone()
             if row is None:
@@ -205,7 +230,7 @@ class JobQueue:
     def begin_submission(self, job: Job, *, submission_id: str,
                          operation_id: str | None = None) -> None:
         """Record the submission identity *before* the request leaves the process."""
-        self._transition(job.id, SUBMITTING, submission_id=submission_id,
+        self._transition(job.id, SUBMITTING, claim=job, submission_id=submission_id,
                          operation_id=operation_id)
 
     def mark_running(self, job: Job, *, operation_id: str | None = None) -> None:
@@ -215,7 +240,7 @@ class JobQueue:
         names no operation, and inventing an id here would give ``cancel --job`` a thing to
         ask a backend about that the backend never heard of.
         """
-        self._transition(job.id, RUNNING, operation_id=operation_id)
+        self._transition(job.id, RUNNING, claim=job, operation_id=operation_id)
 
     def complete(self, job: Job, *, covered: list[str], tokens: int = 0,
                  seconds: float = 0.0) -> dict[str, Any]:
@@ -236,7 +261,7 @@ class JobQueue:
             self.partial(job, covered=len(covered), reason=f"{len(missing)} input(s) uncovered")
             return {"state": RETRY_WAIT, "covered": len(covered), "uncovered": missing,
                     "complete": False}
-        self._transition(job.id, SUCCEEDED, tokens=tokens, seconds=seconds)
+        self._transition(job.id, SUCCEEDED, claim=job, tokens=tokens, seconds=seconds)
         return {"state": SUCCEEDED, "covered": len(covered), "uncovered": [], "complete": True}
 
     def retry(self, job: Job, *, error: str, backoff: float = 30.0) -> str:
@@ -247,6 +272,7 @@ class JobQueue:
             if fresh is None or fresh.state in TERMINAL:
                 self.db.execute("COMMIT")
                 return fresh.state if fresh else CANCELLED
+            self._require_claim(job)
             attempts = fresh.attempts + 1
             state = QUARANTINED if attempts >= fresh.max_attempts else RETRY_WAIT
             self.db.execute(
@@ -273,6 +299,7 @@ class JobQueue:
                 # decision the attempt budget already closed.
                 self.db.execute("COMMIT")
                 return fresh.state
+            self._require_claim(job)
             state = QUARANTINED if fresh.attempts + 1 >= fresh.max_attempts else RETRY_WAIT
             self.db.execute(
                 "UPDATE processing_jobs SET state=?, attempts=?, last_error=?, updated_at=? "
@@ -286,7 +313,7 @@ class JobQueue:
 
     def uncertain(self, job: Job, *, reason: str) -> None:
         """We do not know whether the backend did it. The slot stays claimed."""
-        self._transition(job.id, UNCERTAIN, error=reason, release_lease=True)
+        self._transition(job.id, UNCERTAIN, claim=job, error=reason, release_lease=True)
 
     def settle_established(self, identities: list[str], *, actor: str) -> int:
         """Close the in-flight work a backend answer has now accounted for.
@@ -468,9 +495,11 @@ class JobQueue:
 
     def _transition(self, job_id: str, state: str, *, submission_id: str | None = None,
                     operation_id: str | None = None, tokens: int = 0, seconds: float = 0.0,
-                    error: str | None = None, release_lease: bool = False) -> None:
+                    error: str | None = None, release_lease: bool = False, claim: Job | None = None) -> None:
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            if claim is not None:
+                self._require_claim(claim)
             row = self.db.execute("SELECT state, attempts FROM processing_jobs WHERE id=?",
                                   (job_id,)).fetchone()
             if row is None:
@@ -497,6 +526,15 @@ class JobQueue:
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
+
+    def _require_claim(self, job: Job) -> None:
+        """Check the original worker fence while holding the write transaction."""
+        current = self.get(job.id)
+        if (current is None or current.epoch != job.epoch or job.epoch != self.store.epoch()
+                or current.lease != job.lease or current.state in TERMINAL
+                or (job.lease is not None and (current.lease_until is None
+                                               or current.lease_until <= self.clock()))):
+            raise EvidenceError("stale job lease or epoch; worker mutation refused")
 
     def _reclaim_expired_leases(self, *, at: float | None = None) -> int:
         """An expired lease becomes uncertain work, never a free retry.
@@ -586,4 +624,5 @@ def _job(row) -> Job:
                max_attempts=row["max_attempts"], tokens_used=row["tokens_used"],
                token_budget=row["token_budget"], deadline=row["deadline"],
                last_error=row["last_error"], lease=row["lease"],
-               lease_until=row["lease_until"])
+               lease_until=row["lease_until"], generation_id=row["generation_id"],
+               target_bank=row["target_bank"])

@@ -3,7 +3,7 @@
 Re-running a retrieval for every turn of one conversation is how a memory
 system becomes the slowest thing in the loop. Caching it is how a forgotten
 secret gets re-served twenty turns later. Both halves are handled here: an
-entry carries the epoch and journal watermark it was assembled under, and a
+entry carries the epoch and transactional context revision it was assembled under, and a
 lookup that cannot reproduce that stamp misses. A reset, a erasure, a hide or a
 correction therefore costs one cache miss, not a policy decision about whether
 to flush.

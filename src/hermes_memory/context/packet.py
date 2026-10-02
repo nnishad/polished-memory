@@ -174,7 +174,7 @@ class Packet:
         for item in self.items:
             when = item.occurred_at or "time unknown"
             cut = "…" if item.span_truncated else ""
-            lines.append(f"- [{item.source} @ {when}] {item.text[:600]}{cut}")
+            lines.append(f"- [{item.source} @ {when}; record_id={item.id}] {item.text[:600]}{cut}")
         for summary in self.summaries:
             text = str(summary.get("body") or "")[:600]
             if text:

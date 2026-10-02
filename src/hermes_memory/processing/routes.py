@@ -148,6 +148,9 @@ def build_routes(settings, *, credentials: dict[str, str] | None = None) -> Rout
         route("vision", resource=vision.resource if vision else "local-gpu", operation="chat",
               upstream=vision.base_url if vision else None, priority="maintenance",
               cap=caps.reflect),
+        route("rerank", resource=settings.reranker_route.resource if settings.reranker_route else "local-gpu",
+              operation="rerank", upstream=settings.reranker_route.base_url if settings.reranker_route else None,
+              priority="interactive", cap=0),
     ):
         if candidate is not None:
             routes[candidate.name] = candidate

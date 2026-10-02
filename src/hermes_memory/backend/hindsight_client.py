@@ -257,9 +257,26 @@ class HindsightClient:
                                        capability="recall"), "recall")
         return RecallOutcome.from_body(body)
 
+    def consolidate(self, *, observation_scopes: list[list[str]]) -> dict[str, Any]:
+        """Explicit scoped async submission; not a scheduler or authority grant."""
+        self.capabilities.require("consolidate")
+        if not isinstance(observation_scopes, list) or not 1 <= len(observation_scopes) <= 32:
+            raise HindsightError("consolidation requires 1–32 explicit tag scopes")
+        for scope in observation_scopes:
+            if (not isinstance(scope, list) or not 1 <= len(scope) <= 16
+                    or any(not isinstance(tag, str) or not tag.strip() or len(tag) > 200
+                           for tag in scope)):
+                raise HindsightError("each consolidation scope requires 1–16 bounded tags")
+        outcome = self._unwrap(self._call("POST", self._path_for("consolidate"),
+                                         {"observation_scopes": observation_scopes},
+                                         capability="consolidate"), "consolidate")
+        if not isinstance(outcome.get("operation_id"), str) or not outcome["operation_id"]:
+            raise HindsightError("consolidation returned no durable operation identity")
+        return outcome
+
     def reflect(self, query: str, *, max_tokens: int = 2048, budget: str = "low",
                 tags: list[str] | None = None,
-                fact_types: list[str] | None = None) -> dict[str, Any]:
+                fact_types: list[str] | None = None, include_support: bool = False) -> dict[str, Any]:
         """Ask the backend to synthesize an answer, and take its sourcing report with it.
 
         ``include.facts`` is asked for always. A synthesized paragraph whose supporting
@@ -287,6 +304,10 @@ class HindsightClient:
         answer = str(body.get("text") or body.get("answer") or "").strip()
         based_on = body.get("based_on") or {}
         memories = list(based_on.get("memories") or [])
+        support = self.hydrate_support(memories) if include_support else ()
+        if include_support:
+            by_id = {fact["id"]: fact for fact in support}
+            memories = [by_id[fact["id"]] for fact in memories]
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         return {"text": answer, "facts": memories,
                 "mental_models": list(based_on.get("mental_models") or []),
@@ -294,7 +315,60 @@ class HindsightClient:
                 "cited_memories": len(memories),
                 "input_tokens": int(usage.get("input_tokens") or 0),
                 "output_tokens": int(usage.get("output_tokens") or 0),
+                **({"source_facts": list(support)} if include_support else {}),
                 "truncated": bool(body.get("truncated"))}
+
+    def get_memory(self, memory_id: str) -> dict[str, Any]:
+        """Read one exact identity in this bank; no text matching or cross-bank join."""
+        if (not isinstance(memory_id, str) or not 1 <= len(memory_id) <= 128
+                or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in memory_id)):
+            raise HindsightError("memory identity must be a bounded path-safe identifier")
+        body = self._unwrap(self._call("GET", self._path_for("get_memory", memory_id=memory_id),
+                                       None, capability="get_memory"), "get_memory")
+        if body.get("id") != memory_id or body.get("bank_id", self.bank_id) != self.bank_id:
+            raise HindsightError("memory lookup returned a different identity or bank")
+        if body.get("state", "valid") != "valid":
+            raise HindsightError("memory lookup returned invalidated evidence")
+        return body
+
+    def hydrate_support(self, facts) -> tuple[dict[str, Any], ...]:
+        """Explicit bounded read-back for the slim ReflectFact wire schema.
+
+        A returned ID is a citation, not canonical authority. These hydrated
+        document references still require SupportResolver and caller checks.
+        Keep this opt-in: reflection is background work, not foreground recall.
+        """
+        if not isinstance(facts, (list, tuple)) or len(facts) > 64:
+            raise HindsightError("reflection support exceeds its 64-identity bound")
+        resolved, visiting = {}, set()
+
+        def walk(identifier, depth=0):
+            if depth > 8 or identifier in visiting:
+                raise HindsightError("reflection support is cyclic or too deep")
+            if identifier in resolved:
+                return
+            if len(resolved) + len(visiting) >= 64:
+                raise HindsightError("reflection support exceeds its 64-identity bound")
+            visiting.add(identifier)
+            body = self.get_memory(identifier)
+            children = body.get("source_memory_ids") or []
+            if not isinstance(children, list) or len(children) > 64:
+                raise HindsightError("reflection source identities are malformed")
+            node = {**body, "source_fact_ids": list(children)}
+            for child in children:
+                if not isinstance(child, str):
+                    raise HindsightError("reflection source identity is malformed")
+                walk(child, depth + 1)
+            visiting.remove(identifier)
+            resolved[identifier] = node
+            if len(json.dumps(list(resolved.values()), ensure_ascii=False).encode()) > 262144:
+                raise HindsightError("reflection support exceeds its byte bound")
+
+        for fact in facts:
+            if not isinstance(fact, dict) or not isinstance(fact.get("id"), str):
+                raise HindsightError("reflection citation has no memory identity")
+            walk(fact["id"])
+        return tuple(resolved.values())
 
     def operation(self, operation_id: str) -> dict[str, Any]:
         self.capabilities.require("get_operation")
@@ -385,6 +459,20 @@ class HindsightClient:
         return result.body
 
 
+def _source_fact_manifest(value) -> tuple[dict[str, Any], ...]:
+    """Preserve authoritative map keys when a backend omits redundant item IDs."""
+    if not isinstance(value, dict) or len(value) > 500:
+        raise HindsightError("source-fact manifest is not a bounded mapping")
+    facts = []
+    for identifier, fact in value.items():
+        if (not isinstance(identifier, str) or not identifier or len(identifier) > 200
+                or not isinstance(fact, dict)
+                or (fact.get("id") is not None and fact["id"] != identifier)):
+            raise HindsightError("source-fact manifest has malformed or conflicting identities")
+        facts.append({**fact, "id": identifier})
+    return tuple(facts)
+
+
 @dataclass(frozen=True)
 class RecallOutcome:
     """Results plus an explicit account of what was truncated.
@@ -414,8 +502,8 @@ class RecallOutcome:
         results = body.get("results") or body.get("memories") or []
         return cls(
             results=tuple(results),
-            source_facts=tuple((include.get("source_facts") or {}).values()
-                               or (body.get("source_facts") or {}).values()),
+            source_facts=_source_fact_manifest(include.get("source_facts")
+                                               or body.get("source_facts") or {}),
             chunks=tuple((include.get("chunks") or body.get("chunks") or {}).values()),
             entities=tuple((include.get("entities") or body.get("entities") or {}).values()),
             truncated=tuple(truncated),

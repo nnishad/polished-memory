@@ -743,6 +743,8 @@ class StatusReporter:
                                  owner_principal=getattr(self.settings, "owner_principal", None))
         allowed, who = inquiries.replies_allowed()
         counts = self._grouped("SELECT state, count(*) AS n FROM inquiries GROUP BY state")
+        transport = self._grouped("SELECT delivery_state AS state, count(*) AS n "
+                                  "FROM inquiries WHERE state='open' GROUP BY delivery_state")
         # Held, not refused: a question inside quiet hours or behind the daily limit has a
         # time on it, and one that has been waiting past its own window is the same fact at a
         # different temperature — which is what the doctor reads off this pair.
@@ -764,6 +766,8 @@ class StatusReporter:
                            ("open", "sent", "answered", "expired", "withdrawn", "void")},
                 "awaiting_answer": int(counts.get("sent", 0)),
                 "queued": int(counts.get("open", 0)),
+                "delivery_uncertain": int(transport.get("uncertain", 0)),
+                "delivery_in_flight": int(transport.get("sending", 0)),
                 "answered": int(counts.get("answered", 0)),
                 "expired": int(counts.get("expired", 0)),
                 "decided_elsewhere": [{"inquiry": str(item.id),

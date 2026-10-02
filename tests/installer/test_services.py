@@ -241,6 +241,24 @@ def test_a_template_naming_a_path_outside_the_installation_is_refused(instance, 
         render(settings, environ=environment(), templates=forged_dir)
 
 
+@pytest.mark.parametrize("line", [
+    f"ExecStart={RELEASE}-other/bin/hermes-memory",
+    f"ExecStart={RELEASE}/../other/bin/hermes-memory",
+    "ExecStart=-/outside/bin/hermes-memory", "ReadWritePaths=/bin",
+    "ReadWritePaths=/binary-private", "ReadWritePaths=-/outside"])
+def test_location_guard_uses_path_boundaries_and_understands_systemd_prefixes(instance, tmp_path, line):
+    _, settings = instance
+    forged = tmp_path / "templates"
+    forged.mkdir()
+    for name in UNITS:
+        text = (services.template_root() / name).read_text()
+        if name == RUNTIME_UNIT:
+            text += "\n" + line + "\n"
+        (forged / name).write_text(text)
+    with pytest.raises(InstallationError, match="outside"):
+        render(settings, environ=environment(), templates=forged)
+
+
 def test_a_token_nobody_answered_is_an_error_not_an_installed_unit(instance, tmp_path):
     _, settings = instance
     forged = tmp_path / "templates"

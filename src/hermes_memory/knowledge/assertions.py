@@ -13,6 +13,8 @@ still hold the sentence they said it in, checked byte for byte.
 """
 from __future__ import annotations
 
+from ..storage.transactions import write_transaction
+
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -133,16 +135,14 @@ class AssertionStore:
         assertion_id = "asr_" + digest([subject, predicate, value, unit, record_id,
                                         start, end, window[0], window[1]])[:32]
         status = CONFIRMED if evidence_kind in CONFIRMABLE else CANDIDATE
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             existing = self.db.execute("SELECT * FROM assertions WHERE id=?",
                                        (assertion_id,)).fetchone()
             if existing:
-                self.db.execute("COMMIT")
                 return {"id": assertion_id, "status": existing["status"], "created": False,
                         "quote_start": start, "quote_end": end}
             stamp = now()
-            if superseded is not None:
+            if superseded is not None and status == CONFIRMED:
                 self.db.execute("UPDATE assertions SET status=?, revision=revision+1 "
                                 "WHERE id=?", (SUPERSEDED, supersedes))
             self.db.execute(
@@ -159,10 +159,6 @@ class AssertionStore:
             self.store._audit("assertion_propose", assertion_id,
                               {"kind": kind, "evidence_kind": evidence_kind,
                                "status": status, "by": proposed_by, "supersedes": supersedes})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": assertion_id, "status": status, "created": True,
                 "quote_start": start, "quote_end": end,
                 "confirmed_by": proposed_by if status == CONFIRMED else None,
@@ -186,17 +182,17 @@ class AssertionStore:
         if not supported:
             raise EvidenceError(
                 f"cannot confirm an assertion its own evidence no longer supports: {why}")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
+            # Candidate replacement becomes effective only with this decision.
+            if row["supersedes"]:
+                self._target(row["supersedes"], subject=row["subject"], predicate=row["predicate"])
+                self.db.execute("UPDATE assertions SET status=?, revision=revision+1 WHERE id=?",
+                                (SUPERSEDED, row["supersedes"]))
             self.db.execute(
                 "UPDATE assertions SET status=?, confirmed_by=?, confirmed_at=?, "
                 "revision=revision+1 WHERE id=?", (CONFIRMED, actor, now(), assertion_id))
             self.store._audit("assertion_confirm", assertion_id,
                               {"actor": actor, "reason": reason[:200]})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": assertion_id, "status": CONFIRMED, "changed": True,
                 "confirmed_by": actor}
 
@@ -205,17 +201,12 @@ class AssertionStore:
         self._require_owner(actor)
         _reason(reason)
         self._target(assertion_id)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "UPDATE assertions SET status=?, confirmed_by=NULL, revision=revision+1 "
                 "WHERE id=?", (RETRACTED, assertion_id))
             self.store._audit("assertion_retract", assertion_id,
                               {"actor": actor, "reason": reason[:200]})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": assertion_id, "status": RETRACTED, "reason": reason}
 
     # -- reading -------------------------------------------------------------

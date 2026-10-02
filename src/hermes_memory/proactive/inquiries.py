@@ -40,6 +40,7 @@ from typing import Any, Callable, Iterator
 
 from ..ids import digest, new_id, now, timestamp
 from ..storage.evidence import EvidenceError
+from ..storage.transactions import write_transaction
 from .policy import AttentionPolicy
 
 __all__ = ["DEFAULT_TTL_S", "FENCES", "Inquiry", "InquiryStore", "REPLIES_STAGE",
@@ -83,6 +84,9 @@ def code_for() -> str:
 
 def code_in(text: str) -> str | None:
     """The code inside a reply, if the owner's answer carried one."""
+    answer = _ANSWER.fullmatch(str(text or "").strip())
+    if answer and answer.group("code"):
+        return answer.group("code").upper()
     found = _CODE_IN_TEXT.search(str(text or "").upper())
     return found.group(0) if found else None
 
@@ -97,19 +101,21 @@ YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "
                        "exactly"})
 NO_WORDS = frozenset({"no", "n", "nope", "nah", "dont", "never", "stop", "reject",
                       "rejected", "deny", "denied", "refuse", "refused", "wrong"})
+_ANSWER = re.compile(
+    r"(?P<word>" + "|".join(sorted(YES_WORDS | NO_WORDS)) + r")"
+    r"(?:\s+(?P<code>[" + ALPHABET + r"]{6}))?[.!]?", re.IGNORECASE)
 
 
 def _polarity(text: str) -> str | None:
-    """``"yes"``, ``"no"``, or None when the reply does not say.
+    """An explicit yes/no command, not sentiment extracted from arbitrary prose.
 
     Both words in one reply is also None: "no, not that one, yes the other" is a conversation,
     not a decision, and the owner is still holding the code that can have either ending.
     """
-    plain = str(text or "").lower().replace("'", "").replace("’", "")
-    words = set(re.sub(r"[^a-z0-9]+", " ", plain).split())
-    said_yes = bool(words & YES_WORDS)
-    said_no = bool(words & NO_WORDS)
-    return "yes" if said_yes and not said_no else "no" if said_no and not said_yes else None
+    answer = _ANSWER.fullmatch(str(text or "").strip())
+    if answer is None:
+        return None
+    return "yes" if answer.group("word").lower() in YES_WORDS else "no"
 
 
 def fence(store, *, decision: str, subject_id: str) -> dict[str, Any]:
@@ -215,8 +221,9 @@ class Inquiry:
         local = _parse(self.expires_at).astimezone()
         lines.append(f"Until {local.strftime('%d %b %H:%M')} — after that it has to be "
                      "asked again.")
-        lines.append(f"To settle it by reply, say so and give the code: `yes {code}`. "
-                     "`no` stops the asking and decides nothing.")
+        lines.append(f"To settle it by reply, use `yes {code}`. "
+                     f"`no {code}` stops the asking and decides nothing; "
+                     "it does not reject the underlying proposal.")
         lines.append(f"It reaches you on {destination}, and settles nothing without the "
                      "code. Otherwise reply `hermes-memory owner` for the door.")
         return "\n".join(lines)
@@ -234,14 +241,8 @@ class InquiryStore:
 
     @contextmanager
     def _writing(self) -> Iterator[Any]:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             yield self.db
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        else:
-            self.db.execute("COMMIT")
 
     # -- the owner's switch --------------------------------------------------
 
@@ -276,6 +277,13 @@ class InquiryStore:
     def ask(self, *, decision: str, subject_id: str, question: str,
             topic: str = "general", choices: tuple[str, ...] = (),
             ttl_s: int = DEFAULT_TTL_S, reason: str | None = None) -> dict[str, Any]:
+        with self._writing():
+            return self._ask(decision=decision, subject_id=subject_id, question=question,
+                             topic=topic, choices=choices, ttl_s=ttl_s, reason=reason)
+
+    def _ask(self, *, decision: str, subject_id: str, question: str,
+             topic: str, choices: tuple[str, ...], ttl_s: int,
+             reason: str | None) -> dict[str, Any]:
         """Open one question about one thing, and hold it until the owner may be asked.
 
         Nothing is sent from here: the caller that owns a transport calls ``send_next``, so a
@@ -318,8 +326,13 @@ class InquiryStore:
                 with self._writing():
                     self.db.execute(
                         "UPDATE inquiries SET state='open', asked_at=?, expires_at=?, "
-                        "next_try_at=?, reason=NULL, code_digest=NULL, updated_at=? WHERE id=?",
-                        (asked, expires, asked, asked, identifier))
+                        "next_try_at=?, reason=NULL, code_digest=NULL, updated_at=?, epoch=?, "
+                        "question=?, choices=?, topic=?, delivery_state='pending', "
+                        "lease_token=NULL, lease_until=NULL, held_by=NULL, proof=NULL, "
+                        "correlation=NULL, sent_at=NULL, answered_at=NULL, answer=NULL, "
+                        "answer_channel=NULL, settled=NULL WHERE id=?",
+                        (asked, expires, asked, asked, self.store.epoch(), text,
+                         json.dumps(list(options)), topic, identifier))
                     self.store._audit("inquiry_reopened", identifier,
                                       {"was": existing.state, "decision": decision,
                                        "subject": subject})
@@ -428,14 +441,69 @@ class InquiryStore:
 
     def _send_one(self, *, sink: Callable[[str], Any], destination: str,
                   holder: str) -> dict[str, Any]:
+        # Admission is committed before I/O. A crash after this point is an unknown
+        # send, never an automatically retryable lease timeout.
+        with self._writing():
+            prepared = self._prepare_send(destination=destination, holder=holder,
+                                          profile_home=getattr(sink, "hermes_home", None))
+        if "body" not in prepared:
+            return prepared
+        inquiry = self.get(prepared["inquiry"])
+        token, body = prepared["token"], prepared["body"]
+        try:
+            proof = sink(body)
+        except Exception as error:
+            proof = {"error": f"{type(error).__name__}: {str(error)[:180]}"}
+        explicit = isinstance(proof, dict) and type(proof.get("sent")) is bool
+        sent = explicit and proof["sent"] is True
+        failed = explicit and proof["sent"] is False
+        status = "sent" if sent else "failed" if failed else "uncertain"
+        reason = ("the owner was asked" if sent else
+                  f"delivery {status}: {str((proof or {}).get('error', 'no explicit acknowledgement'))[:200]}"
+                  if isinstance(proof, dict) else "delivery uncertain: no explicit acknowledgement")
+        stamp = now()
+        with self._writing():
+            changed = self.db.execute(
+                "UPDATE inquiries SET state=?, delivery_state=?, sent_at=?, updated_at=?, "
+                "proof=?, correlation=?, lease_token=NULL, lease_until=NULL, held_by=NULL, "
+                "reason=? WHERE id=? AND lease_token=? AND state='open' AND epoch=?",
+                ("sent" if sent else "open", "pending" if failed else status,
+                 stamp if sent else None, stamp, json.dumps(_proof(proof)),
+                 f"hermes-memory question {inquiry.id} {digest(body)[:12]}",
+                 None if sent else reason, inquiry.id, token, inquiry.epoch)).rowcount
+            # Keep the transport fact even when expiry/revocation superseded its question.
+            safe = _proof(proof)
+            self.db.execute(
+                "UPDATE inquiry_deliveries SET state=?, proof=?, reason=?, platform=?, "
+                "chat_id=?, message_id=?, thread_id=?, updated_at=? WHERE id=?",
+                (status, json.dumps(safe), reason, safe.get("platform"),
+                 str(safe["chat_id"]) if safe.get("chat_id") is not None else None,
+                 str(safe["message_id"]) if safe.get("message_id") is not None else None,
+                 str(safe["thread_id"]) if safe.get("thread_id") is not None else None,
+                 stamp, token))
+            self.store._audit("inquiry_delivery", inquiry.id,
+                              {"delivery": token, "state": status, "current": bool(changed),
+                               "channel": destination, "proof": safe})
+        return {"attempted": True, "sent": bool(sent and changed), "ok": bool(sent and changed),
+                "inquiry": inquiry.id, "delivery": token, "delivery_state": status,
+                "reason": reason if changed else "delivery completed for a superseded question"}
+
+    def _prepare_send(self, *, destination: str, holder: str,
+                      profile_home: str | None) -> dict[str, Any]:
         moment = now()
+        self.expire_due()
         row = self.db.execute(
-            "SELECT * FROM inquiries WHERE state='open' AND (next_try_at IS NULL OR "
-            "next_try_at<=?) ORDER BY asked_at, id LIMIT 1", (moment,)).fetchone()
+            "SELECT * FROM inquiries WHERE state='open' AND delivery_state='pending' "
+            "AND lease_token IS NULL AND expires_at>? AND (next_try_at IS NULL OR "
+            "next_try_at<=?) ORDER BY asked_at, id LIMIT 1", (moment, moment)).fetchone()
         if row is None:
             return {"attempted": False, "sent": False, "ok": True,
                     "reason": "nothing is being asked"}
         inquiry = Inquiry.from_row(row)
+        if inquiry.epoch != self.store.epoch():
+            self._void(inquiry.id, reason="the archive epoch changed before delivery")
+            return {"attempted": True, "sent": False, "ok": True,
+                    "inquiry": inquiry.id, "reason": "question generation revoked"}
         allowed, who = self.replies_allowed()
         if not allowed:
             self._void(inquiry.id, reason=f"a reply settles nothing here: {who}")
@@ -458,45 +526,101 @@ class InquiryStore:
         with self._writing():
             claimed = self.db.execute(
                 "UPDATE inquiries SET lease_token=?, lease_until=?, held_by=?, "
-                "attempts=attempts+1, code_digest=?, updated_at=? WHERE id=? AND "
-                "state='open'",
+                "attempts=attempts+1, code_digest=?, updated_at=?, delivery_state='sending' "
+                "WHERE id=? AND state='open' AND delivery_state='pending' AND lease_token IS NULL",
                 (token, _seconds() + 300.0, holder,
                  digest(["inquiry-code", inquiry.id, code]), now(), inquiry.id)).rowcount
             if not int(claimed or 0):
                 return {"attempted": False, "sent": False, "ok": True,
                         "reason": "someone else is already asking this one"}
-        try:
-            proof = sink(body)
-        except Exception as error:
-            # The bytes may already have gone. A question can be re-asked and a duplicate
-            # message is only an annoyance, so the lease is released rather than held: this
-            # is the one place where trying again is the lesser failure.
-            self.db.execute("UPDATE inquiries SET lease_token=NULL, lease_until=NULL, "
-                            "held_by=NULL, reason=?, updated_at=? WHERE id=?",
-                            (f"the transport said: {type(error).__name__}: "
-                             f"{str(error)[:180]}", now(), inquiry.id))
-            return {"attempted": True, "sent": False, "ok": False, "inquiry": inquiry.id,
-                    "reason": f"the question did not reach the transport: {str(error)[:180]}"}
-        stamp = now()
         self.db.execute(
-            "UPDATE inquiries SET state='sent', sent_at=?, updated_at=?, proof=?, "
-            "correlation=?, lease_token=NULL, lease_until=NULL, held_by=NULL, reason=NULL "
-            "WHERE id=? AND lease_token=?",
-            (stamp, stamp, json.dumps(_proof(proof), ensure_ascii=False)[:2000],
-             f"hermes-memory question {inquiry.id} {digest(body)[:12]}",
-             inquiry.id, token))
-        self.store._audit("inquiry_sent", inquiry.id,
-                          {"decision": inquiry.decision, "subject": inquiry.subject_id,
-                           "digest": inquiry.subject_digest[:16], "channel": destination,
-                           "proof": _proof(proof)})
-        return {"attempted": True, "sent": True, "ok": True, "inquiry": inquiry.id,
-                "reason": "the owner was asked, and the code went only to the channel they "
-                          "named"}
+            "INSERT INTO inquiry_deliveries(id,inquiry_id,epoch,destination,profile_home,"
+            "body_digest,state,created_at,updated_at) VALUES(?,?,?,?,?,?,'sending',?,?)",
+            (token, inquiry.id, inquiry.epoch, destination, profile_home, digest(body), moment, moment))
+        return {"inquiry": inquiry.id, "token": token, "body": body}
 
     # -- answering -----------------------------------------------------------
 
+    def for_native_reply(self, *, platform: str, chat_id: str, message_id: str,
+                         thread_id: str, profile_home: str) -> tuple[Inquiry, str] | None:
+        """Resolve a persisted send, never a quotation, nearest question or latest session."""
+        rows = self.db.execute(
+            "SELECT inquiry_id,id,epoch,thread_id,body_digest FROM inquiry_deliveries "
+            "WHERE state='sent' AND platform=? AND chat_id=? AND message_id=? "
+            "AND profile_home=?",
+            (platform, chat_id, message_id, profile_home)).fetchall()
+        matches = [row for row in rows if str(row["thread_id"] or "") == thread_id]
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        inquiry = self.get(row["inquiry_id"])
+        if inquiry is None or inquiry.epoch != int(row["epoch"]):
+            return None
+        # Reopening replaces the active delivery even within the same epoch.
+        expected = f"hermes-memory question {inquiry.id} {row['body_digest'][:12]}"
+        if str(row_value(self.db, "correlation", inquiry.id) or "") != expected:
+            return None
+        return inquiry, str(row["id"])
+
+    def answer_native(self, *, reply: str, platform: str, chat_id: str,
+                      message_id: str, thread_id: str, profile_home: str,
+                      transport_home: str, author_id: str) -> dict[str, Any]:
+        """Trusted host ingress only; model tools cannot provide this transport attestation.
+
+        Natural short replies require a Telegram owner DM and the same credential home
+        that sent the question. Shared-bot satellites fail closed. Irreversible forgetting
+        keeps the explicit code confirmation protocol.
+        """
+        with self._writing():
+            if platform != "telegram" or author_id != chat_id or not author_id \
+                    or transport_home != profile_home:
+                return {"ok": False, "settled": False, "reason": "native reply identity is not an owner DM"}
+            matched = self.for_native_reply(platform=platform, chat_id=chat_id,
+                                            message_id=message_id, thread_id=thread_id,
+                                            profile_home=profile_home)
+            if matched is None:
+                return {"ok": False, "settled": False, "reason": "no unique current question matches this reply"}
+            inquiry, delivery = matched
+            if inquiry.decision == "forgetting" and not code_in(reply):
+                return {"ok": False, "settled": False, "inquiry": inquiry.id,
+                        "reason": "forgetting requires the explicit yes/no code confirmation"}
+            parsed = _ANSWER.fullmatch(reply.strip())
+            has_code = bool(parsed and parsed.group("code"))
+            return self._answer(reply=reply, inquiry_id=inquiry.id,
+                                channel=f"{platform}:{chat_id}",
+                                native_delivery=delivery if not has_code else None)
+
+    def dossier(self, inquiry: Inquiry) -> dict[str, Any]:
+        """Direct, attributed context. No code or ability to authorize is exposed here."""
+        preview = None
+        if inquiry.decision in FENCES:
+            table, keys, _, _ = FENCES[inquiry.decision]
+            values = inquiry.subject_id.split("@") if table == "lessons" else [inquiry.subject_id]
+            row = self.db.execute(f"SELECT * FROM {table} WHERE " +
+                                  " AND ".join(f"{key}=?" for key in keys), values).fetchone()
+            if row:
+                preview = dict(row)
+        else:
+            row = self.db.execute("SELECT preview FROM erasure_ledger WHERE id=?",
+                                  (inquiry.subject_id,)).fetchone()
+            preview = json.loads(row[0]) if row else None
+        return {"inquiry": inquiry.id, "question": inquiry.question, "decision": inquiry.decision,
+                "subject": inquiry.subject_id, "subject_digest": inquiry.subject_digest,
+                "epoch": inquiry.epoch, "state": inquiry.state,
+                "delivery_state": row_value(self.db, "delivery_state", inquiry.id),
+                "expires_at": inquiry.expires_at, "stands_as_shown": self.stands_as_shown(inquiry),
+                "current_subject": preview, "reason": inquiry.reason, "outcome": inquiry.settled,
+                "authority": "Framework proposal/context, not a user instruction or authorization"}
+
     def answer(self, *, reply: str, inquiry_id: str | None = None,
                channel: str | None = None) -> dict[str, Any]:
+        # Lock before reading the generation, grants, epoch and subject. Nested owner
+        # operations use savepoints; they cannot commit the inquiry's transaction.
+        with self._writing():
+            return self._answer(reply=reply, inquiry_id=inquiry_id, channel=channel)
+
+    def _answer(self, *, reply: str, inquiry_id: str | None,
+                channel: str | None, native_delivery: str | None = None) -> dict[str, Any]:
         """Settle one question with the owner's reply, or say precisely why it did not.
 
         The code is the authority and it is checked first. No code, a code that is not live,
@@ -524,7 +648,7 @@ class InquiryStore:
             return {"settled": False, "ok": True,
                     "reason": f"no question is open under {code}; it was answered, voided, "
                               "or the code is a guess"}
-        if code is None:
+        if code is None and native_delivery is None:
             return {"settled": False, "ok": True, "inquiry": inquiry.id,
                     "reason": "the reply points at a question but carries no code: the code "
                               "is what says this came from the owner rather than from "
@@ -553,7 +677,7 @@ class InquiryStore:
             return {"settled": False, "ok": False, "inquiry": inquiry.id,
                     "reason": f"the question is {inquiry.state}, so there is nothing live to "
                               "answer"}
-        if digest(["inquiry-code", inquiry.id, code]) != str(row_value(
+        if native_delivery is None and digest(["inquiry-code", inquiry.id, code]) != str(row_value(
                 self.db, "code_digest", inquiry.id) or ""):
             self.db.execute("UPDATE inquiries SET attempts=attempts+1, updated_at=?, "
                             "reason=? WHERE id=?",
@@ -705,8 +829,9 @@ def _proof(value: Any) -> dict[str, Any]:
     """What the transport said about a question, keeping only the parts that are facts."""
     if isinstance(value, dict):
         return {key: item for key, item in value.items()
-                if key in ("sent", "platform", "chat_id", "message_id", "verified",
-                           "correlation", "path", "sha256")}
+                if key in ("sent", "platform", "chat_id", "message_id", "thread_id", "verified",
+                           "correlation", "path", "sha256", "mirrored", "session_key",
+                           "session_id", "transport_profile")}
     return {"reported": str(value)[:200]} if value else {}
 
 

@@ -27,6 +27,7 @@ its own connection string leaks the whole machine's memory into a journal.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import json
 import sys
@@ -64,6 +65,18 @@ RETRY_KEY = "_retry_count"
 FOLD_KEY = "_fold_members"
 BANK_KEYS = ("bank_id", "_bank_id")
 TYPE_KEYS = ("operation_type", "type")
+
+# Database operation names and executor payload discriminators are distinct at
+# the pinned revision. These policies attribute work; they do not grant inference
+# or turn on automatic consolidation. Each model hop still uses the owned gate.
+TASK_POLICIES = {
+    "retain": ("retain", frozenset({"batch_retain", "retain"})),
+    "consolidation": ("consolidate", frozenset({"consolidation"})),
+    "refresh_mental_model": ("reflect", frozenset({"refresh_mental_model"})),
+    "graph_maintenance": (None, frozenset({"graph_maintenance"})),
+    "vector_index_maintenance": (None, frozenset({"vector_index_maintenance"})),
+}
+DB_TASK_TIMEOUT_S = 300.0  # native graph passes have a 240-second budget
 
 TERMINAL = frozenset({"finished", "cancelled", "refused"})
 
@@ -484,7 +497,10 @@ def attribute_tasks(memory: Any, ledger: OperationLedger, *, worker_id: str,
             raise LauncherRefused(f"operation {row['operation_id']}: {reason}")
         ledger.mark(row["operation_id"], "running")
         try:
-            await memory.execute_task(task)
+            if resource == "backend-db":
+                await asyncio.wait_for(memory.execute_task(task), timeout=DB_TASK_TIMEOUT_S)
+            else:
+                await memory.execute_task(task)
         except Exception as error:
             # Not "failed": the request may be sitting in a model server's queue still.
             ledger.mark(row["operation_id"], "uncertain", error=error)
@@ -494,7 +510,7 @@ def attribute_tasks(memory: Any, ledger: OperationLedger, *, worker_id: str,
 
 
 def memory_arguments(modules: Mapping[str, Any], *, tenant_extension: Any = None,
-                     operation_validator: Any = None) -> dict[str, Any]:
+                     operation_validator: Any = None, db_url: str | None = None) -> dict[str, Any]:
     """The engine arguments the pinned worker main passes: no migrations, worker backend.
 
     Workers do not run migrations — the API process owns the schema — and a
@@ -506,6 +522,8 @@ def memory_arguments(modules: Mapping[str, Any], *, tenant_extension: Any = None
                  "task_backend": modules["WorkerTaskBackend"](),
                  "tenant_extension": tenant_extension,
                  "operation_validator": operation_validator}
+    if db_url is not None:
+        arguments["db_url"] = db_url
     _accepts(modules["MemoryEngine"], arguments, what="MemoryEngine")
     return arguments
 
@@ -541,7 +559,8 @@ def poller_arguments(memory: Any, modules: Mapping[str, Any], *, config: Any,
 
 def compose(*, modules: Mapping[str, Any], config: Any, worker_id: str,
             ledger: OperationLedger, routes: Any = None,
-            tenant_extension: Any = None, operation_validator: Any = None) -> dict[str, Any]:
+            tenant_extension: Any = None, operation_validator: Any = None,
+            db_url: str | None = None) -> dict[str, Any]:
     """Perform the pinned construction against whatever ``modules`` actually holds.
 
     The order is the upstream one — engine first, then the poller that reads its private
@@ -550,7 +569,7 @@ def compose(*, modules: Mapping[str, Any], config: Any, worker_id: str,
     than an argument silently ignored at three in the morning.
     """
     engine_arguments = memory_arguments(modules, tenant_extension=tenant_extension,
-                                        operation_validator=operation_validator)
+                                        operation_validator=operation_validator, db_url=db_url)
     memory = modules["MemoryEngine"](**engine_arguments)
     poller = poller_arguments(memory, modules, config=config, worker_id=worker_id,
                               ledger=ledger, routes=routes,
@@ -627,6 +646,46 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
+async def worker_database(settings, config, *, sleep, ready=None, inspect_instance=None,
+                          wait_s: float = DB_WAIT_SECONDS) -> str:
+    """The API owns pg0 startup/migrations; the worker only reads its resolved DSN."""
+    import asyncio
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlsplit
+
+    configured = str(_field(config, "database_url") or "")
+    if configured != "pg0" and not configured.startswith("pg0://"):
+        return configured
+
+    if ready is None:
+        def ready():
+            try:
+                with urllib.request.urlopen(settings.hindsight_url.rstrip("/") + "/health",
+                                            timeout=3) as response:
+                    return response.status == 200
+            except (urllib.error.URLError, TimeoutError, OSError):
+                return False
+
+    waited = 0.0
+    while not await asyncio.to_thread(ready):
+        if waited >= wait_s:
+            raise LauncherRefused("API-owned embedded database is not ready; worker did not start it")
+        await sleep(DB_POLL_SECONDS)
+        waited += DB_POLL_SECONDS
+
+    if inspect_instance is None:
+        from hindsight_api.pg0 import parse_pg0_url
+        from pg0 import Pg0
+        parsed = parse_pg0_url(configured)
+        inspect_instance = Pg0(name=parsed.instance_name).info
+    info = await asyncio.to_thread(inspect_instance)
+    uri = str(info.uri or "")
+    if not info.running or urlsplit(uri).scheme not in {"postgres", "postgresql"}:
+        raise LauncherRefused("API answered but its embedded database has no running PostgreSQL DSN")
+    return uri
+
+
 def _launch(settings, *, modules: Mapping[str, Any], config: Any,
             worker_id: str) -> int:
     """Compose, then hand the poller to the event loop. One refusal above, one path here."""
@@ -634,6 +693,7 @@ def _launch(settings, *, modules: Mapping[str, Any], config: Any,
 
     with GateStore(gate_path(settings)) as ledger_store:
         ledger = OperationLedger(ledger_store)
+        database_url = None
 
         def build() -> dict[str, Any]:
             built = compose(
@@ -643,7 +703,7 @@ def _launch(settings, *, modules: Mapping[str, Any], config: Any,
                          "WorkerPoller": modules["hindsight_api.worker.poller"].WorkerPoller,
                          "config": modules["hindsight_api.config"]},
                 config=config, worker_id=worker_id, ledger=ledger,
-                routes=_routes(settings))
+                routes=_routes(settings), db_url=database_url)
             if not getattr(built["memory"]._backend, "supports_worker_poller", False):
                 # The pinned main exits here rather than running operations inline in a
                 # process that was not asked to run them.
@@ -652,10 +712,13 @@ def _launch(settings, *, modules: Mapping[str, Any], config: Any,
             return dict(built)
 
         async def run() -> None:
+            nonlocal database_url
             # The hold is asked of the ledger before the engine is asked for anything: an
             # installation whose owner stopped the models has a queue nobody may drain, and
             # a worker that exited over that would be restarted into the same exit until its
             # start limit silenced the unit for the rest of the hold.
+            await wait_for_inference(ledger_store, sleep=asyncio.sleep)
+            database_url = await worker_database(settings, config, sleep=asyncio.sleep)
             built = await bring_up(build, ledger_store, sleep=asyncio.sleep)
             memory = built["memory"]
             poller = built["poller_factory"](**built["poller_arguments"])
@@ -750,10 +813,26 @@ def _resource_for(task: Any, routes: Any) -> tuple[str | None, str | None]:
     alternative — borrowing a route that happens to exist — is how one profile's work ends
     up charged to another's allowance.
     """
+    kind = _kind(task)
+    # Without poller metadata, only an explicitly known executor discriminator
+    # may select a policy; a mismatched claimed operation/payload is refused.
+    if kind == "batch_retain" and not task.get("operation_type"):
+        kind = "retain"
+    policy = TASK_POLICIES.get(kind)
+    if policy is None:
+        return None, f"operation type {kind!r} matches no configured route or task policy"
+    wanted, payload_types = policy
+    payload_type = task.get("type")
+    if payload_type is not None and (not isinstance(payload_type, str)
+                                      or payload_type not in payload_types):
+        return None, "operation type and executor payload type disagree"
+    if wanted is None:
+        # Pinned graph maintenance only drains/relinks/prunes DB queues; it has
+        # its own deadline and one poller slot, not an imaginary inference route.
+        return "backend-db", None
     if routes is None:
         return None, "no route table is configured, so this operation cannot be charged " \
                      "to a physical resource"
-    wanted = _kind(task)
     try:
         route = routes.by_name(wanted)
     except Exception:

@@ -117,21 +117,23 @@ def _new_message(db, params, moment: str) -> Verdict:
                                 "an address")
     row = db.execute(
         """
-        -- Address matching only for the existence check. Whether that message is
+        -- Typed author matching only for the existence check. Whether that message is
         -- retrievable by this caller is decided at delivery by the same identity
         -- rules every other read goes through; here we only answer "did something
         -- arrive", and a hidden record did arrive.
         SELECT r.id FROM records r
         WHERE r.deleted = 0 AND r.ingested_at > ?
-          AND (EXISTS (SELECT 1 FROM json_each(json_extract(r.metadata, '$.account_ids'))
-                       WHERE value = ?)
+          AND (json_extract(r.metadata, '$.author_account_id') = ?
+               OR json_extract(r.metadata, '$.sender_account_id') = ?
                OR EXISTS (SELECT 1 FROM identity_accounts a
-                          WHERE a.id = ?
-                            AND instr(r.metadata, a.identifier) > 0))
+                          WHERE a.id = ? AND a.identifier IN (
+                            json_extract(r.metadata, '$.author'),
+                            json_extract(r.metadata, '$.sender'),
+                            json_extract(r.metadata, '$.from.address'))))
         ORDER BY r.ingested_at DESC LIMIT 1
-        """, (since, account, account)).fetchone()
+        """, (since, account, account, account)).fetchone()
     if row:
-        return Verdict(SATISFIED, "a message citing that account was ingested", row["id"])
+        return Verdict(SATISFIED, "a message authored by that account was ingested", row["id"])
     gap = _coverage_gap(db, since, moment)
     if gap:
         return Verdict(UNKNOWN, gap)
@@ -154,11 +156,19 @@ def _source_update(db, params, moment: str) -> Verdict:
 
 def _threshold(db, params, moment: str) -> Verdict:
     row = db.execute(
-        "SELECT a.id, a.value, a.unit FROM assertions a WHERE a.subject=? AND a.predicate=? "
-        "AND a.status='confirmed' ORDER BY a.confirmed_at DESC LIMIT 1",
-        (str(params["subject"]), str(params["predicate"])) ).fetchone()
-    if row is None:
+        "SELECT a.id, a.value, a.unit FROM assertions a JOIN records r ON r.id=a.record_id "
+        "WHERE a.subject=? AND a.predicate=? AND a.category='measurement' "
+        "AND a.status='confirmed' AND r.deleted=0 "
+        "AND NOT EXISTS (SELECT 1 FROM record_visibility v WHERE v.record_id=r.id AND v.hidden=1) "
+        "AND (a.valid_from IS NULL OR a.valid_from<=?) AND (a.valid_to IS NULL OR a.valid_to>=?) "
+        "AND substr(r.text,a.quote_start+1,a.quote_end-a.quote_start)=a.quote "
+        "ORDER BY a.confirmed_at DESC",
+        (str(params["subject"]), str(params["predicate"]), moment, moment) ).fetchall()
+    if not row:
         return Verdict(UNKNOWN, "nothing has been measured for that subject")
+    if len({(item["value"], item["unit"]) for item in row}) > 1:
+        return Verdict(UNKNOWN, "current measurements conflict; threshold cannot be established")
+    row = row[0]
     if str(row["unit"] or "") != str(params["unit"]):
         return Verdict(UNKNOWN,
                        f"the only measurement is in {row['unit']!r}, not {params['unit']!r}")

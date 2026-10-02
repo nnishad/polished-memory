@@ -2283,7 +2283,7 @@ def stubbed(monkeypatch):
     from hermes_memory.processing import formation
 
     backend = Answers()
-    monkeypatch.setattr(formation, "backend_client", lambda settings: backend)
+    monkeypatch.setattr(formation, "backend_client", lambda settings, **kwargs: backend)
     return backend
 
 
@@ -2379,7 +2379,7 @@ def test_form_reconcile_reports_a_question_the_backend_could_not_answer(forming,
 
     from hermes_memory.processing import formation
 
-    monkeypatch.setattr(formation, "backend_client", lambda settings: Unreachable())
+    monkeypatch.setattr(formation, "backend_client", lambda settings, **kwargs: Unreachable())
     code, report = run("form", "--reconcile")
     assert code == 0 and report["unreachable"] == 1 and report["verified"] == 0
     with EvidenceStore(forming.db_path) as store:

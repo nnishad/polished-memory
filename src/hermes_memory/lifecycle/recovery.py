@@ -33,7 +33,8 @@ __all__ = ["Recovery", "Ledger", "LEDGER_TABLES"]
 # older than it was; these record decisions that stay made. Listed parent first:
 # the rows go back in this order and come off in the reverse, or the foreign keys
 # the restored copy still holds trip on the way through.
-LEDGER_TABLES = ("erasure_ledger", "erasure_targets", "tombstones")
+LEDGER_TABLES = ("erasure_ledger", "erasure_targets", "erasure_fences", "delivery_fences",
+                 "inquiry_fences", "tombstones")
 PRE_RESTORE = "pre-restore"
 
 
@@ -45,13 +46,14 @@ class Ledger:
     checkpoints: dict[str, int] = field(default_factory=dict)
     tables: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     banks: tuple[str, ...] = ()
+    generations: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {"epoch": self.epoch, "consumers": len(self.checkpoints),
                 "intents": len(self.tables.get("erasure_ledger") or []),
                 "obligations": len(self.tables.get("erasure_targets") or []),
                 "tombstones": len(self.tables.get("tombstones") or []),
-                "banks": list(self.banks)}
+                "banks": list(self.banks), "generations": len(self.generations)}
 
 
 class Recovery:
@@ -206,7 +208,7 @@ class Recovery:
         guard = self._copy_aside(item.id)
         try:
             self._install(item.database)
-            applied = self.apply(carried, bank_id=bank_id)
+            applied = self.apply(carried, bank_id=bank_id, advance_epoch=True)
         except BaseException as failure:
             # A failed restore leaves a store that is neither the old one nor the
             # restored one. Put back what was there before anything was promised.
@@ -230,7 +232,7 @@ class Recovery:
             # their markers have nothing to mark.
             note += (f" {applied['tombstones_without_a_record']} erasure intent(s) name "
                      "records this snapshot does not contain; their deletion obligations "
-                     "are carried and their tombstones are not.")
+                     "and independent replay fences are carried; FK-bound markers are omitted.")
         return {"restored": snapshot_id, "epoch": carried.epoch, **applied,
                 "pre_restore_backup": str(guard), "note": note}
 
@@ -238,10 +240,13 @@ class Recovery:
 
     def carry(self) -> Ledger:
         """Copy the durable forgetting record out of the live database."""
-        carried = Ledger(epoch=self.store.epoch(),
+        generations = [dict(row) for row in self.db.execute(
+            "SELECT * FROM projection_generations ORDER BY id")]
+        carried = Ledger(epoch=self.store.epoch(), generations=generations,
                          banks=tuple(sorted({
                              str(row["bank_id"]) for row in self.db.execute(
-                                 "SELECT DISTINCT bank_id FROM backend_documents")})))
+                                 "SELECT DISTINCT bank_id FROM backend_documents")}
+                             | {str(row["bank_id"]) for row in generations})))
         for table in LEDGER_TABLES:
             carried.tables[table] = [dict(row) for row in
                                      self.db.execute(f"SELECT * FROM {table}")]
@@ -249,7 +254,8 @@ class Recovery:
             carried.checkpoints[str(row["consumer"])] = int(row["seq"])
         return carried
 
-    def apply(self, carried: Ledger, *, bank_id: str | None = None) -> dict[str, Any]:
+    def apply(self, carried: Ledger, *, bank_id: str | None = None,
+              advance_epoch: bool = False) -> dict[str, Any]:
         """Write the kept decisions into the restored copy and honour the tombstones.
 
         All of it in one transaction, before the file is used: there is no moment in
@@ -258,13 +264,47 @@ class Recovery:
         self.db.execute("BEGIN IMMEDIATE")
         orphans: list[str] = []
         try:
-            # Empty the ledger before refilling it, children first: the copy that
-            # just landed has its own intents, and clearing the parent table under
-            # them is a foreign-key failure rather than a restore.
+            # Banks created after the donor snapshot still exist remotely. Keep their
+            # identities even when they have no documents; losing this registry would
+            # lose the only reset/erasure target for a late remote completion.
+            generations = {str(row["id"]): dict(row) for row in self.db.execute(
+                "SELECT * FROM projection_generations")}
+            for row in carried.generations:
+                prior = generations.get(str(row["id"]))
+                if prior and any(prior[key] != row[key] for key in
+                                 ("backend", "family_bank", "bank_id", "epoch", "manifest", "legacy")):
+                    raise EvidenceError("generation identity changed across restore")
+                generations[str(row["id"])] = row
+            # No donor projection is coverage for a new restore epoch. Retiring all
+            # histories also prevents fallback to an unregistered legacy bank.
+            self.db.execute("UPDATE projection_generations SET state='retired'")
+            for row in generations.values():
+                values = {**row, "state": "retired" if advance_epoch else row["state"]}
+                columns = sorted(values)
+                updates = ", ".join(f"{column}=excluded.{column}" for column in columns if column != "id")
+                self.db.execute(
+                    f"INSERT INTO projection_generations({', '.join(columns)}) "
+                    f"VALUES({', '.join('?' * len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",
+                    [values[column] for column in columns])
+            # Keep snapshot decisions too: a fresh installation has no carried
+            # ledger, and replacing the donor's ledger with that empty set would
+            # discard its erasure history. Current decisions win on the same key.
+            merged = {}
+            for table in LEDGER_TABLES:
+                primary = [str(row["name"]) for row in sorted(
+                    self.db.execute(f"PRAGMA table_info({table})"), key=lambda row: row["pk"])
+                           if row["pk"]]
+                if not primary:
+                    raise EvidenceError(f"{table} has no primary key; cannot merge erasure history")
+                rows = [dict(row) for row in self.db.execute(f"SELECT * FROM {table}")]
+                rows.extend(carried.tables.get(table) or [])
+                merged[table] = list({tuple(row[column] for column in primary): row
+                                      for row in rows}.values())
+            # Refill children after parents, preserving referential integrity.
             for table in reversed(LEDGER_TABLES):
                 self.db.execute(f"DELETE FROM {table}")
             for table in LEDGER_TABLES:
-                rows = carried.tables.get(table) or []
+                rows = merged[table]
                 if not rows:
                     continue
                 if table == "tombstones":
@@ -297,16 +337,27 @@ class Recovery:
                     "seq=MAX(consumer_checkpoints.seq, excluded.seq), "
                     "updated_at=excluded.updated_at", (consumer, seq, now()))
             reapplied = self._honour_tombstones()
+            # Never resend an artifact whose handoff may already have happened.
+            self.db.execute("UPDATE outbox SET state='uncertain', reason='handoff predates restore', "
+                            "lease_token=NULL, lease_until=NULL WHERE state IN ('prepared','leased') "
+                            "AND id IN (SELECT artifact_id FROM delivery_fences)")
+            self.db.execute("UPDATE inquiries SET delivery_state='uncertain', lease_token=NULL, "
+                            "lease_until=NULL WHERE state='open' "
+                            "AND id IN (SELECT inquiry_id FROM inquiry_fences)")
             epoch = self._keep_epoch_monotonic(carried.epoch)
+            if advance_epoch:
+                epoch += 1
+                self.db.execute("UPDATE memory_epoch SET value=? WHERE id=1", (epoch,))
+                self.db.execute("UPDATE connectors SET lease=NULL, holder=NULL, lease_until=NULL")
             dropped = self._refuse_old_bank(bank_id)
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
         return {"reapplied": reapplied, "epoch": epoch, "obligations":
-                len(carried.tables.get("erasure_targets") or []),
-                "intents": len(carried.tables.get("erasure_ledger") or []),
-                "tombstones": len(carried.tables.get("tombstones") or []),
+                len(merged["erasure_targets"]),
+                "intents": len(merged["erasure_ledger"]),
+                "tombstones": len(merged["tombstones"]),
                 "tombstones_without_a_record": len(orphans),
                 "orphaned_tombstones": orphans[:20],
                 "stale_projections_dropped": dropped}
@@ -314,12 +365,12 @@ class Recovery:
     def _honour_tombstones(self) -> int:
         """Take back anything the snapshot still has that has since been forgotten."""
         rows = self.db.execute(
-            "SELECT t.record_id, t.fingerprint FROM tombstones t JOIN records r "
-            "ON r.id = t.record_id WHERE r.deleted=0").fetchall()
+            "SELECT t.record_id, t.fingerprint FROM erasure_fences t JOIN records r "
+            "ON r.id = t.record_id").fetchall()
         for row in rows:
             standing = self.db.execute("SELECT fingerprint FROM records WHERE id=?",
                                        (row["record_id"],)).fetchone()
-            if str(standing["fingerprint"]) != str(row["fingerprint"] or ""):
+            if row["fingerprint"] and str(standing["fingerprint"]) != str(row["fingerprint"]):
                 # The same id carrying different bytes is not the record that was
                 # forgotten. Refuse rather than guess which of them is real.
                 raise EvidenceError(
@@ -327,6 +378,8 @@ class Recovery:
                     "tombstone records; refusing to guess which is the erased one")
             self.db.execute("UPDATE records SET deleted=1 WHERE id=?", (row["record_id"],))
             self.db.execute("DELETE FROM record_fts WHERE id=?", (row["record_id"],))
+            from ..storage.blobs import BlobStore
+            BlobStore(self.store).release([row["record_id"]], db=self.db)
             self.db.execute(
                 "INSERT INTO record_visibility(record_id, hidden, replacement_id, reason, "
                 "changed_at) VALUES(?,1,NULL,'erased after this snapshot',?) "
@@ -355,10 +408,13 @@ class Recovery:
         if bank_id is None:
             return 0
         stale = int(self.db.execute(
-            "SELECT count(*) FROM backend_documents WHERE bank_id != ?",
+            "SELECT count(*) FROM backend_documents b WHERE bank_id != ? "
+            "AND NOT EXISTS(SELECT 1 FROM projection_generations g WHERE g.id=b.generation_id AND g.legacy=0)",
             (bank_id,)).fetchone()[0])
         if stale:
-            self.db.execute("DELETE FROM backend_documents WHERE bank_id != ?", (bank_id,))
+            self.db.execute("DELETE FROM backend_documents WHERE bank_id != ? "
+                "AND NOT EXISTS(SELECT 1 FROM projection_generations g "
+                "WHERE g.id=backend_documents.generation_id AND g.legacy=0)", (bank_id,))
         return stale
 
     # -- file handling -------------------------------------------------------

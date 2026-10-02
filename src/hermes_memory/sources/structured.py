@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..ids import now
+from ..ids import now, digest
 from ..storage.measurements import summarise
 from .base import Capabilities, Page, Skipped, SourceAdapter, normalize_time
 
@@ -67,39 +67,17 @@ class StructuredSource(SourceAdapter):
                 "content_read": False, "observed_at": now()}
 
     def read_page(self, cursor: str | None) -> Page:
-        keys = self._keys()
-        remaining = [key for key in keys if cursor is None or key > cursor]
-        limit = self.capabilities.max_records_per_page
-        envelopes: list[dict[str, Any]] = []
-        skipped: list[Skipped] = []
-        examined: list[str] = []
-        for key in remaining:
-            if len(envelopes) >= limit or len(examined) >= limit * 4:
-                break
+        from .export_paging import read_export_page
+        def read(key):
             size = self._size_of(key)
-            examined.append(key)
             if size is None:
-                skipped.append(Skipped(key, "stat failed or the file disappeared"))
-                continue
+                return [], [Skipped(key, "stat failed or the file disappeared")]
             if size > self.capabilities.max_bytes_per_page:
-                # Reported rather than filtered out of the listing: a fixture that is
-                # too big to read is the one thing an operator has to be able to find.
-                skipped.append(Skipped(
-                    key, f"{size} bytes exceeds the {self.capabilities.max_bytes_per_page} "
-                    "byte per-page bound"))
-                continue
+                return [], [Skipped(key, f"{size} bytes exceeds the byte per-page bound")]
             rows, gaps = self._rows(key)
-            skipped.extend(gaps)
-            if self.per_sample:
-                envelopes.extend(row[1] for row in rows if row[1] is not None)
-            else:
-                for item in self._series(key, rows):
-                    envelopes.append(item)
-            if len(envelopes) >= limit:
-                break
-        return Page(envelopes=tuple(envelopes), skipped=tuple(skipped),
-                    next_cursor=examined[-1] if examined and len(examined) < len(remaining)
-                    else None)
+            produced = [row[1] for row in rows if row[1] is not None] if self.per_sample else self._series(key, rows)
+            return produced, gaps
+        return read_export_page(self, cursor, self._keys(), read)
 
     # -- reading -------------------------------------------------------------
 
@@ -173,7 +151,7 @@ class StructuredSource(SourceAdapter):
         moment = normalize_time(_first(record, TIME_KEYS))
         occurred, precision, note = moment
         return self.envelope(
-            source_id=f"{key}#{position}", revision="1", kind="measurement",
+            source_id=f"{key}#{position}", revision=digest(record)[:32], kind="measurement",
             text=f"{measure} {number}{(' ' + unit) if unit else ''} at "
                  f"{occurred or 'an unplaced time'}",
             observed_at=now(), occurred_at=occurred, occurred_precision=precision,
@@ -202,7 +180,8 @@ class StructuredSource(SourceAdapter):
             span = (f", range {summary['min']} to {summary['max']}"
                     if summary["min"] is not None else "")
             out.append(self.envelope(
-                source_id=f"{key}#series:{device}:{measure}:{unit}", revision="1",
+                source_id=f"{key}#series:{device}:{measure}:{unit}",
+                revision=digest([item["revision"] for item in samples])[:32],
                 kind="measurement_series",
                 text=f"{measure} from {device}: {summary['count']} samples{named}{middle}{span}",
                 observed_at=now(),

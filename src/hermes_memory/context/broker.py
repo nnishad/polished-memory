@@ -19,6 +19,7 @@ from dataclasses import replace
 from typing import Any, Callable, Iterable
 
 from ..ids import digest
+from ..backend.support import SupportError, SupportResolver
 from ..storage.identity import (citations_in_scope, evidence_accounts, IdentityStore,
                            in_scope)
 from .cache import PacketCache
@@ -144,12 +145,16 @@ class ContextBroker:
 
         # Typed claims are checked, attributable and short, so they go in before
         # the raw spans that would crowd them out.
-        asserted, assertion_conflicts, assertion_note, spent = self._assertions(query, spent)
+        asserted, assertion_conflicts, assertion_note, spent = self._assertions(query, spent, caller=caller,
+                                                                             sources=sources, window=window)
         conflicts = conflicts + assertion_conflicts
         if assertion_note:
             truncated.append("assertions")
 
         for evidence in considered:
+            if len(items) >= limit:
+                truncated.append("results")
+                break
             cost = self.estimate(evidence.text) + 12
             if spent + cost > self.budget_tokens:
                 truncated.append("packet")
@@ -167,14 +172,21 @@ class ContextBroker:
 
         # Readings of the scopes this answer touched, taken after the evidence so a digest
         # never crowds out the record it was written from.
-        readings, spent, dropped_readings, reading_note = self._summaries(considered, spent)
+        readings, spent, dropped_readings, reading_note = self._summaries(
+            considered, spent, caller=caller, sources=sources, window=window)
         if dropped_readings:
             truncated.append("summaries")
 
         facts: tuple[dict[str, Any], ...] = ()
         derived_state, derived_detail = "not_attempted", ""
         if include_derived:
-            facts, derived_state, derived_detail, derived_truncated = self._derive(query, limit)
+            facts, derived_state, derived_detail, derived_truncated, source_facts = self._derive(query, limit)
+            checked = tuple(fact for fact in facts
+                            if self._fact_allowed(fact, caller=caller, sources=sources, window=window,
+                                                  source_facts=source_facts))
+            if len(checked) != len(facts):
+                derived_state, derived_detail = "partial", "unverified or unauthorized fact provenance withheld"
+            facts = checked
             truncated.extend(derived_truncated)
             # Derived text is charged too. A backend that returns an essay would
             # otherwise overrun the ceiling the caller asked us to hold.
@@ -190,12 +202,21 @@ class ContextBroker:
             facts = tuple(kept)
 
         items, revoked, store_moved = self._recheck(items, stamp=(epoch, revision))
+        store_moved = store_moved or scope != self._scope(
+            query, limit=limit, include_derived=include_derived, sources=sources,
+            window=window, account_id=caller, commitments=commitments, lessons=lessons)
         if revoked:
             truncated.append("revoked_during_recall")
         if store_moved:
             # A reset or trust revocation happened while we were on the network.
             # The packet still says what it found, but it cannot be reused.
             truncated.append("store_moved")
+            # Do not deliver derivative sections built under a stale authority stamp.
+            facts, asserted, readings, kept_lessons, conflicts = (), (), (), (), ()
+            evidence = [self.store.get(item.id) for item in items]
+            authorized, _ = self._authorize([e for e in evidence if e is not None], account_id=caller)
+            current = {e.id for e in authorized}
+            items = [item for item in items if item.id in current]
 
         notes = [text for text in (outcome.detail, derived_detail, assertion_note,
                                    reading_note) if text]
@@ -236,18 +257,18 @@ class ContextBroker:
     def _derive(self, query, limit):
         """Ask the backend, and give up on deadline rather than making the turn late."""
         if self.client is None:
-            return (), "not_configured", "", ()
+            return (), "not_configured", "", (), ()
         try:
             outcome = self._recall_within_deadline(query)
         except FutureTimeout:
             # The request was abandoned, not cancelled: the socket stays open
             # until the client's own timeout fires. Nothing downstream may
             # conclude that the backend did no work.
-            return (), "timeout", f"derived channel exceeded {self.derived_timeout_s}s", ()
+            return (), "timeout", f"derived channel exceeded {self.derived_timeout_s}s", (), ()
         except Exception as error:
             # Unreachable, 5xx, unsupported capability, paused stage: to the
             # caller these all mean this half of the answer is missing.
-            return (), "unavailable", f"{type(error).__name__}: {error}"[:200], ()
+            return (), "unavailable", f"{type(error).__name__}: {error}"[:200], (), ()
         truncated = [str(name) for name in outcome.truncated]
         facts = tuple(dict(fact) for fact in tuple(outcome.results)[:limit])
         if len(outcome.results) > limit:
@@ -255,7 +276,7 @@ class ContextBroker:
         complete = getattr(outcome, "provenance_complete", not truncated)
         state = "available" if complete else "partial"
         detail = "" if complete else "provenance came back truncated"
-        return facts, state, detail, tuple(dict.fromkeys(truncated))
+        return facts, state, detail, tuple(dict.fromkeys(truncated)), outcome.source_facts
 
     def _recall_within_deadline(self, query):
         executor = self._executor()
@@ -332,7 +353,7 @@ class ContextBroker:
             return PARTIAL
         return PARTIAL if degraded else SUPPORTED
 
-    def _assertions(self, query, spent):
+    def _assertions(self, query, spent, *, caller, sources, window):
         """Time-valid typed claims about what the archive asserts, plus their disputes."""
         if self.assertions is None:
             return (), (), "", spent
@@ -344,6 +365,9 @@ class ContextBroker:
             return (), (), f"assertions could not be read: {error}"[:160], spent
         kept: list[dict[str, Any]] = []
         for assertion in found:
+            if not self._fact_allowed({"record_id": assertion.record_id}, caller=caller,
+                                      sources=sources, window=window):
+                continue
             cost = self.estimate(f"{assertion.subject} {assertion.predicate} "
                                  f"{assertion.value}") + 24
             if spent + cost > self.budget_tokens:
@@ -353,11 +377,30 @@ class ContextBroker:
         conflicts: list[str] = []
         for subject in dict.fromkeys(item["subject"] for item in kept):
             for clash in self.assertions.contradictions(subject=subject):
+                if not all(self._fact_allowed({"record_id": item.record_id}, caller=caller,
+                                              sources=sources, window=window) for item in clash.assertions):
+                    continue
                 values = " vs ".join(sorted({item.value for item in clash.assertions})[:3])
                 conflicts.append(f"{clash.subject} {clash.predicate} is disputed: {values}")
         return tuple(kept), tuple(dict.fromkeys(conflicts)), "", spent
 
-    def _summaries(self, considered, spent):
+    def _fact_allowed(self, fact, *, caller, sources, window, source_facts=()):
+        """Only locally resolved canonical provenance may cross the context boundary."""
+        try:
+            ids = SupportResolver(self.store, bank_id=getattr(self.client, "bank_id", None),
+                                  source_facts=source_facts).resolve(fact)
+        except (SupportError, TypeError, ValueError):
+            return False
+        evidence = [self.store.get(identifier) for identifier in ids]
+        if any(item is None or not self.store.live_and_visible(item.id)
+               or not _usable(item, sources=sources, window=window) for item in evidence):
+            return False
+        allowed = self._authorize(evidence, account_id=caller)[1] == 0
+        if allowed:
+            fact["record_ids"] = list(ids)
+        return allowed
+
+    def _summaries(self, considered, spent, *, caller=None, sources=None, window=None):
         """The current reading of each scope this answer touches, if one is on file.
 
         Scopes are read off the authorized evidence rather than guessed from the query's
@@ -371,13 +414,19 @@ class ContextBroker:
         kept: list[dict[str, Any]] = []
         for scope in self._scopes(considered):
             try:
-                current = self.summaries.latest(scope)
+                current = self.summaries.latest(scope, account_id=caller)
             except Exception as error:
                 # A section that could not be read is missing, not empty: the caller is
                 # told, and the readings that were already paid for stay in.
                 return tuple(kept), spent, dropped + 1, (
                     f"summaries could not be read: {error}"[:160])
             for summary in current[:1]:
+                support = self.summaries.ledger.resolve(summary.id, account_id=caller)
+                if (not support.evidence or support.verified != support.cited
+                        or any(not _usable(item, sources=sources, window=window)
+                               for item in support.evidence)):
+                    dropped += 1
+                    continue
                 text = summary.body[:_SUMMARY_SPAN]
                 cost = self.estimate(text) + 20
                 if spent + cost > self.budget_tokens:
@@ -476,6 +525,8 @@ class ContextBroker:
                  f"sources={','.join(sorted(options['sources'] or ())) or '-'}",
                  f"window={options['window'] or '-'}",
                  f"account={options['account_id'] or '-'}",
+                 # Natural edge expiry changes authority without a database write.
+                 f"joined={digest(self.identity.group(options['account_id'])) if options['account_id'] else '-'}",
                  f"budget={self.budget_tokens}",
                  # Whether readings are on changes the answer, so a packet warmed without
                  # them is never handed to a caller that expects them.

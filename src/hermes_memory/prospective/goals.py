@@ -12,6 +12,8 @@ a due time that the zone does not contain is refused rather than quietly shifted
 """
 from __future__ import annotations
 
+from ..storage.transactions import write_transaction
+
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -121,8 +123,7 @@ class GoalStore:
         stamp = now()
         status = ACTIVE if proposed_kind == "owner" else CANDIDATE
 
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             if self.db.execute("SELECT 1 FROM goals WHERE id=?", (goal_id,)).fetchone():
                 raise EvidenceError(f"goal {goal_id!r} already exists")
             self.db.execute(
@@ -145,10 +146,6 @@ class GoalStore:
             self.store._audit("goal_propose", goal_id,
                               {"status": status, "by": proposed_by, "due_at": instant,
                                "conditions": len(checked)})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": goal_id, "status": status, "revision": 1, "due_at": instant,
                 "note": (None if status == ACTIVE else
                          "a proposal from outside the owner is a candidate: it schedules "
@@ -160,8 +157,7 @@ class GoalStore:
         goal = self._row(goal_id)
         if goal["status"] != CANDIDATE:
             return {"id": goal_id, "status": goal["status"], "changed": False}
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "UPDATE goals SET status=?, confirmed_by=?, updated_at=? WHERE id=?",
                 (ACTIVE, actor, now(), goal_id))
@@ -173,10 +169,6 @@ class GoalStore:
                            zone=goal["timezone"], precision=goal["due_precision"],
                            checked=self._conditions_of(goal_id, goal["revision"]))
             self.store._audit("goal_activate", goal_id, {"actor": actor})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": goal_id, "status": ACTIVE, "changed": True,
                 "revision": goal["revision"]}
 
@@ -202,8 +194,7 @@ class GoalStore:
             return {"id": goal_id, "status": goal["status"], "changed": False,
                     "note": "already settled; nothing was re-decided"}
         moment = timestamp(at) if at else now()
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "UPDATE goals SET status=?, decided_at=?, decided_by=?, updated_at=? "
                 "WHERE id=?", (status, moment, actor, moment, goal_id))
@@ -214,10 +205,6 @@ class GoalStore:
             suppressed = self.events.cancel(goal_id, reason=reason, db=self.db)
             self.store._audit(f"goal_{status}", goal_id,
                               {"actor": actor, "suppressed_events": suppressed})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": goal_id, "status": status, "changed": True,
                 "suppressed_events": suppressed}
 
@@ -252,8 +239,7 @@ class GoalStore:
             else self._conditions_of(goal_id, goal["revision"])
         revision = int(goal["revision"]) + 1
 
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "UPDATE goals SET revision=?, due_at=?, due_precision=?, timezone=?, "
                 "statement=?, updated_at=? WHERE id=?",
@@ -269,10 +255,6 @@ class GoalStore:
                                precision=precision, checked=checked)
             self.store._audit("goal_revise", goal_id,
                               {"actor": actor, "revision": revision, "due_at": instant})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": goal_id, "revision": revision, "due_at": instant, "status": goal["status"],
                 "superseded_events": self.db.execute(
                     "SELECT count(*) FROM due_events WHERE goal_id=? AND state=? "
@@ -292,8 +274,7 @@ class GoalStore:
             raise EvidenceError(
                 "this snooze ends before the goal is due, so it would suppress nothing; "
                 "revise the due time instead")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute("UPDATE goals SET snoozed_until=?, updated_at=? WHERE id=?",
                             (moment, now(), goal_id))
             self._history(goal_id, revision=goal["revision"], status=goal["status"],
@@ -301,10 +282,6 @@ class GoalStore:
                           zone=goal["timezone"], statement=goal["statement"], by=actor,
                           reason=f"snoozed until {moment}: {_text(reason, 'reason', 500)}")
             self.store._audit("goal_snooze", goal_id, {"actor": actor, "until": moment})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": goal_id, "snoozed_until": moment}
 
     # -- reading -------------------------------------------------------------

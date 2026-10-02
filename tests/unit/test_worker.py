@@ -97,6 +97,96 @@ def test_a_job_runs_and_frees_its_slot(harness):
     assert harness.jobs.get(job_id).tokens_used == 321
 
 
+def test_retain_preserves_speaker_context_and_utterance_anchor(harness):
+    record = harness.store.commit(envelope(
+        source="hermes", text="Mujhe chai nahi chahiye", occurred_at=None,
+        occurred_precision="unknown", metadata={
+            "role": "user", "origin": "owner-statement", "independent": True,
+            "author": {"name": "Priya", "id": "u1", "credential": "do-not-project"},
+            "session_id": "conversation-1", "source_context_version": 2,
+            "utterance_at": "2026-10-02T12:00:00.000Z",
+            "utterance_time_basis": "host-turn-start", "secret": "do-not-project"}))["id"]
+    harness.enqueue(record)
+    harness.worker.run_once()
+    item = submissions(harness.transport)[0][2]["items"][0]
+    assert item["metadata"]["role"] == "user"
+    assert item["metadata"]["session_id"] == "conversation-1"
+    assert "secret" not in item["metadata"]
+    assert item["metadata"]["author_name"] == "Priya"
+    assert "credential" not in str(item["metadata"])
+    assert item["timestamp"] == "2026-10-02T12:00:00+00:00"
+    assert "utterance" in item["context"]
+    assert harness.store.get(record).occurred_at is None
+
+
+def test_retain_does_not_use_ambiguous_metadata_as_an_event_date(harness):
+    record = harness.store.commit(envelope(
+        source="hermes", occurred_at=None, occurred_precision="unknown",
+        metadata={"source_context_version": 2, "utterance_at": "2026-10-02", "role": []}))["id"]
+    harness.enqueue(record)
+    assert harness.worker.run_once().state == "succeeded"
+    item = submissions(harness.transport)[0][2]["items"][0]
+    assert item["timestamp"] is None
+    assert "unknown" in item["context"]
+
+
+def test_retain_attributes_assistant_first_person_to_the_model(harness):
+    record = harness.store.commit(envelope(
+        source="hermes", text="I prefer tea", metadata={
+            "role": "assistant", "origin": "model-output", "independent": False}))["id"]
+    harness.enqueue(record)
+    assert harness.worker.run_once().state == "succeeded"
+    item = submissions(harness.transport)[0][2]["items"][0]
+    assert item["metadata"]["independent"] == "False"
+    assert "assistant/model output" in item["context"]
+    assert "not automatically to the owner" in item["context"]
+
+
+def test_legacy_pending_operation_keeps_its_original_payload_contract(harness):
+    record = harness.record()
+    old = harness.docs.begin(record, "1", async_submission=True, context_version=1)
+    harness.enqueue(record)
+    harness.worker.run_once()
+    payload = submissions(harness.transport)[0][2]
+    assert payload["operation_id"] == old["submission_id"]
+    assert payload["items"][0] == {"content": harness.store.get(record).text,
+                                    "timestamp": harness.store.get(record).occurred_at,
+                                    "document_id": old["document_id"],
+                                    "metadata": {"source": "gmail", "record_id": record}}
+
+
+def test_same_operation_identity_cannot_change_payload_bytes(harness):
+    from hermes_memory.processing.worker import _retain_item
+
+    record = harness.record()
+    mapping = harness.docs.begin(record, "1", async_submission=True)
+    item = _retain_item(harness.store.get(record), document_id=mapping["document_id"])
+    harness.docs.pin_payload(record, "1", item)
+    before = harness.store.watermark()
+    harness.docs.pin_payload(record, "1", item)
+    assert harness.store.watermark() == before, "an identical retry need not invalidate context"
+    with pytest.raises(EvidenceError, match="payload changed"):
+        harness.docs.pin_payload(record, "1", {**item, "context": "different extractor"})
+    assert harness.transport.calls == []
+
+
+def test_projection_cannot_mislabel_a_canonical_revision(harness):
+    record = harness.record()
+    with pytest.raises(EvidenceError, match="canonical input revision"):
+        harness.docs.begin(record, "2", async_submission=True)
+
+
+def test_unknown_legacy_payload_contract_is_not_guessed_or_resubmitted(harness):
+    record = harness.record()
+    harness.docs.begin(record, "1", async_submission=True)
+    harness.store.db.execute("UPDATE backend_documents SET retain_context_version=0 WHERE record_id=?",
+                             (record,))
+    harness.enqueue(record)
+    result = harness.worker.run_once()
+    assert result.state != "succeeded"
+    assert harness.transport.calls == []
+
+
 class Watches:
     """The transport, asked to report what the queue said at the moment it was called."""
 
@@ -556,6 +646,48 @@ def test_a_still_running_operation_is_awaited_not_guessed(harness):
     assert len(script.asks) == 3, "two looks that said not yet, a third that said done"
     assert harness.waits == [0.5, 0.5], "each unfinished answer costs one bounded wait"
     assert len(submissions(harness.transport)) == 1, "waiting for the work is not resending it"
+
+
+def test_follow_stops_at_job_deadline_without_claiming_backend_cancelled(harness):
+    record = harness.record()
+    moment = [time.time()]
+    job_id = harness.jobs.enqueue(kind="retain", inputs=[record], input_revision="1",
+        route=RETAIN, processor_fingerprint=FINGERPRINT, deadline=moment[0] + 0.75)["job_id"]
+    harness.worker.clock = lambda: moment[0]
+    harness.worker.sleeper = lambda delay: (harness.waits.append(delay),
+                                           moment.__setitem__(0, moment[0] + delay))
+    script = waiting_for(harness, *[TransportResult(200, {"status": "processing"})] * 5)
+    outcome = harness.worker.run_once()
+    assert outcome.state == UNCERTAIN
+    assert "deadline" in outcome.detail and "reconcile" in outcome.detail
+    assert len(script.asks) == 2
+    assert harness.waits == [0.5, 0.25]
+    assert harness.jobs.get(job_id).backend_operation_id
+    assert harness.gate.blocked_resources() == []
+
+
+def test_local_cancellation_stops_polling_and_does_not_confirm_projection(harness):
+    record = harness.record()
+    job_id = harness.enqueue(record)
+    script = waiting_for(harness, TransportResult(200, {"status": "processing"}))
+    harness.worker.sleeper = lambda _: harness.jobs.cancel(
+        job_id, actor="owner", reason="stop this local pass")
+    outcome = harness.worker.run_once()
+    assert outcome.state == "cancelled"
+    assert len(script.asks) == 1
+    assert harness.docs.state(record, "1") != VERIFIED
+    assert "owner: stop this local pass" == harness.jobs.get(job_id).last_error
+    assert harness.gate.blocked_resources() == []
+
+
+@pytest.mark.parametrize("field,value", [("follow_poll_s", 0), ("follow_poll_s", float("nan")),
+    ("follow_poll_s", float("inf")), ("follow_max_polls", 0), ("follow_max_polls", 721),
+    ("follow_max_polls", True)])
+def test_invalid_follow_bounds_are_refused(harness, field, value):
+    with pytest.raises(ValueError, match=field):
+        FormationWorker(store=harness.store, jobs=harness.jobs, gate=harness.gate,
+            budgets=harness.budgets, documents=harness.docs, client=harness.client,
+            routes=ROUTES, worker_id="invalid", **{field: value})
 
 
 def test_the_device_is_handed_back_before_the_engine_is_waited_for(harness):

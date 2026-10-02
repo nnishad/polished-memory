@@ -13,9 +13,12 @@ answer is not on the ledger.
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
+import json
 from typing import Any
 
-from hermes_memory.config import load_settings, scoped_secret
+from hermes_memory.config import (load_settings, scoped_secret, env_file_values,
+                                 validate_inference_route, _deadline)
 from hermes_memory.install.profiles import (InstallationError, Profile,
                                             ProfileRegistry)
 
@@ -86,7 +89,21 @@ class Activity:
 
     def secret(self, name: str | None) -> str | None:
         """This profile's credential, or None. Never another profile's."""
-        return scoped_secret(self.settings, name)
+        if not name:
+            return None
+        try:
+            from agent.secret_scope import get_secret, serves_routed_profile
+        except ImportError:
+            return scoped_secret(self.settings, name)
+        prefix = self.settings.credential_scope.strip().upper().replace("-", "_")
+        scoped = get_secret(f"{prefix}_{name}") if prefix else None
+        if scoped:
+            return scoped
+        # Under a host-bound secret scope, a bare name is already profile-local.
+        # Without that scope, a named profile may not borrow process credentials.
+        if self.settings.profile == "default" or serves_routed_profile():
+            return get_secret(name)
+        return None
 
     def close(self) -> None:
         if self._registry is not None:
@@ -104,11 +121,47 @@ def bind(hermes_home: str | Path, *, settings: Any = None) -> Activity:
     was only supposed to consult.
     """
     base = settings if settings is not None else load_settings()
+    profile_config = Path(hermes_home) / "hermes-memory.json"
+    legacy = Path(hermes_home) / "hermes-memory.env"
+    values = {}
+    if profile_config.exists():
+        values = json.loads(profile_config.read_text(encoding="utf-8"))
+        if not isinstance(values, dict):
+            raise BindingError("hermes-memory.json must contain a settings object")
+        allowed = {"data_dir", "hindsight_url", "allowed_inference_hosts", "foreground_deadline_s"}
+        if set(values) - allowed:
+            raise BindingError("unrecognized profile memory settings")
+    elif legacy.exists():
+        allowed = {"HERMES_MEMORY_DATA_DIR", "HERMES_MEMORY_HINDSIGHT_URL",
+                   "HERMES_MEMORY_ALLOWED_INFERENCE_HOSTS", "HERMES_MEMORY_FOREGROUND_DEADLINE_S"}
+        values = {key.removeprefix("HERMES_MEMORY_").lower(): value
+                  for key, value in env_file_values(legacy).items() if key in allowed}
     ledger = ProfileRegistry.reading(base)
     try:
         profile = ledger.resolve(hermes_home)
+        overrides = {}
+        if "allowed_inference_hosts" in values:
+            hosts = frozenset(host.strip().lower() for host in
+                              str(values["allowed_inference_hosts"]).split(",") if host.strip())
+            if not hosts <= base.allowed_inference_hosts:
+                raise BindingError("profile settings cannot widen the instance's approved hosts")
+            overrides["allowed_inference_hosts"] = hosts
+        if "hindsight_url" in values:
+            url = str(values["hindsight_url"]).strip()
+            validate_inference_route(url, overrides.get("allowed_inference_hosts",
+                                                        base.allowed_inference_hosts))
+            if url.rstrip("/") == str(base.admission_url or "").rstrip("/"):
+                raise BindingError("the Hindsight endpoint cannot be the model admission gate")
+            overrides["hindsight_url"] = url
+        if "foreground_deadline_s" in values:
+            overrides["foreground_deadline_s"] = _deadline(str(values["foreground_deadline_s"]))
+        # data_dir is an enrollment proposal, not authority to move a profile's store.
+        base = replace(base, **overrides)
     except InstallationError as error:
         ledger.db.close()
         raise BindingError(unenrolled_reason(hermes_home,
                                             fresh=ledger.detached)) from error
+    except Exception:
+        ledger.db.close()
+        raise
     return Activity(ledger, profile, profile.scoped(base))

@@ -941,6 +941,89 @@ MIGRATIONS: Sequence[Migration] = (
     Migration("0011_learning", LEARNING_STATEMENTS),
     Migration("0012_source_gaps", SOURCE_GAP_STATEMENTS),
     Migration("0013_inquiries", INQUIRY_STATEMENTS),
+    Migration("0014_inquiry_delivery", (
+        "ALTER TABLE inquiries ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'pending' "
+        "CHECK(delivery_state IN ('pending','sending','sent','uncertain'))",
+        "UPDATE inquiries SET delivery_state='sent' WHERE state IN ('sent','answered')",
+        "UPDATE inquiries SET delivery_state='uncertain' WHERE state='open' "
+        "AND lease_token IS NOT NULL",
+        """CREATE TABLE inquiry_deliveries(
+            id TEXT PRIMARY KEY, inquiry_id TEXT NOT NULL REFERENCES inquiries(id),
+            epoch INTEGER NOT NULL, destination TEXT NOT NULL, profile_home TEXT,
+            body_digest TEXT NOT NULL, state TEXT NOT NULL
+                CHECK(state IN ('sending','sent','failed','uncertain')),
+            platform TEXT, chat_id TEXT, message_id TEXT, thread_id TEXT,
+            proof TEXT, reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX inquiry_delivery_reply ON inquiry_deliveries(platform,chat_id,message_id)",
+    )),
+    Migration("0015_durable_fences", (
+        "CREATE TABLE erasure_fences(record_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+        "intent_id TEXT NOT NULL, deleted_at TEXT NOT NULL)",
+        "INSERT INTO erasure_fences SELECT record_id,fingerprint,intent_id,deleted_at FROM tombstones",
+        # Older restores may already have discarded FK-bound orphan markers.
+        # Confirmed owner intent still names the IDs and must fence future replay.
+        "INSERT OR IGNORE INTO erasure_fences SELECT j.value,'',l.id,l.confirmed_at "
+        "FROM erasure_ledger l,json_each(l.preview,'$.records') j WHERE l.confirmed_at IS NOT NULL",
+        "DELETE FROM attachments WHERE record_id IN (SELECT id FROM records WHERE deleted=1)",
+        "UPDATE blob_contents SET refs=(SELECT count(*) FROM attachments a WHERE a.sha256=blob_contents.sha256)",
+        "DELETE FROM blob_chunks WHERE sha256 IN (SELECT sha256 FROM blob_contents WHERE refs=0)",
+        "DELETE FROM blob_contents WHERE refs=0",
+        "CREATE TRIGGER tombstone_fence AFTER INSERT ON tombstones BEGIN "
+        "INSERT OR REPLACE INTO erasure_fences VALUES(NEW.record_id,NEW.fingerprint,"
+        "NEW.intent_id,NEW.deleted_at); END",
+        "CREATE TABLE delivery_fences(artifact_id TEXT PRIMARY KEY, attempted_at TEXT NOT NULL)",
+        "INSERT INTO delivery_fences SELECT id,updated_at FROM outbox WHERE state IN "
+        "('attempted','uncertain','accepted_unverified','confirmed')",
+        "CREATE TRIGGER outbox_delivery_fence AFTER UPDATE OF state ON outbox "
+        "WHEN NEW.state IN ('attempted','uncertain','accepted_unverified','confirmed') BEGIN "
+        "INSERT OR IGNORE INTO delivery_fences VALUES(NEW.id,NEW.updated_at); END",
+        "CREATE TABLE inquiry_fences(inquiry_id TEXT PRIMARY KEY, attempted_at TEXT NOT NULL)",
+        "INSERT OR IGNORE INTO inquiry_fences SELECT inquiry_id,created_at FROM inquiry_deliveries "
+        "WHERE state IN ('sending','sent','uncertain')",
+        "CREATE TRIGGER inquiry_delivery_fence AFTER INSERT ON inquiry_deliveries "
+        "WHEN NEW.state IN ('sending','sent','uncertain') BEGIN "
+        "INSERT OR IGNORE INTO inquiry_fences VALUES(NEW.inquiry_id,NEW.created_at); END",
+        "CREATE TABLE context_revision(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL)",
+        "INSERT INTO context_revision VALUES(1,0)",
+    ) + tuple(
+        f"CREATE TRIGGER context_{table}_{operation.lower()} AFTER {operation} ON {table} "
+        "BEGIN UPDATE context_revision SET value=value+1 WHERE id=1; END"
+        for table in ("records", "record_visibility", "record_dependencies", "identity_edges", "identity_accounts",
+                      "assertions", "summaries", "lessons", "derived_citations", "backend_documents")
+        for operation in ("INSERT", "UPDATE", "DELETE")
+    )),
+    Migration("0016_retain_payload_contract", (
+        # Old mappings do not declare which formatter ran. Never infer that from
+        # the Hindsight version: an uninstalled/custom source build may differ.
+        "ALTER TABLE backend_documents ADD COLUMN retain_context_version INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE backend_documents ADD COLUMN retain_payload_digest TEXT",
+    )),
+    Migration("0017_projection_generations", (
+        """CREATE TABLE projection_generations(
+            id TEXT PRIMARY KEY, backend TEXT NOT NULL, family_bank TEXT NOT NULL,
+            bank_id TEXT NOT NULL, epoch INTEGER NOT NULL, manifest TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('building','active','retired')),
+            legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1)),
+            created_at TEXT NOT NULL, activated_at TEXT,
+            UNIQUE(backend,bank_id))""",
+        "CREATE UNIQUE INDEX projection_active ON projection_generations(backend,family_bank) "
+        "WHERE state='active'",
+        "INSERT INTO projection_generations SELECT 'legacy:'||backend||':'||bank_id,backend,"
+        "bank_id,bank_id,max(desired_epoch),'{\"version\":\"legacy-unknown\"}',"
+        "CASE WHEN max(desired_epoch)=(SELECT value FROM memory_epoch WHERE id=1) "
+        "THEN 'active' ELSE 'retired' END,1,'legacy',NULL "
+        "FROM backend_documents GROUP BY backend,bank_id",
+        "ALTER TABLE backend_documents ADD COLUMN generation_id TEXT REFERENCES projection_generations(id)",
+        "ALTER TABLE backend_documents ADD COLUMN input_manifest TEXT",
+        "UPDATE backend_documents SET generation_id='legacy:'||backend||':'||bank_id",
+        "ALTER TABLE processing_jobs ADD COLUMN generation_id TEXT REFERENCES projection_generations(id)",
+        "ALTER TABLE processing_jobs ADD COLUMN target_bank TEXT",
+    ) + tuple(
+        f"CREATE TRIGGER context_projection_generations_{operation.lower()} AFTER {operation} "
+        "ON projection_generations BEGIN UPDATE context_revision SET value=value+1 WHERE id=1; END"
+        for operation in ("INSERT", "UPDATE", "DELETE")
+    )),
 )
 
 

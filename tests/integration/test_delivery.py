@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -28,6 +29,19 @@ MORNING = "2026-09-15T09:00:00+00:00"
 EPOCH = 1_789_462_800.0
 
 
+def _awake(at: float) -> tuple[str, str]:
+    """A quiet window that cannot contain *at*: it opens five hours later.
+
+    A drain revalidates against the wall clock it runs at, and the owner's default quiet
+    hours (21:00-07:30) hold everything back for most of the day. There is no "never
+    quiet" setting to ask for, so the memories these tests build are awake by
+    construction: otherwise the same suite passes in the afternoon and fails at 06:00,
+    and the failure says nothing about the drain.
+    """
+    late = datetime.fromtimestamp(at, timezone.utc) + timedelta(hours=5)
+    return late.strftime("%H:%M"), (late + timedelta(minutes=30)).strftime("%H:%M")
+
+
 def a_ready_pipeline(store, *, moment=MORNING, at=EPOCH):
     """goal -> due event -> intent -> decision -> artifact, as the pipeline writes it.
 
@@ -38,8 +52,10 @@ def a_ready_pipeline(store, *, moment=MORNING, at=EPOCH):
     policy = AttentionPolicy(store, owner_principal=OWNER)
     # An artifact only leases out of a memory whose owner has agreed to be told: shadow
     # mode is the default, and a drain that ignored it would be the switch nobody pulled.
+    quiet_from, quiet_until = _awake(at)
     policy.configure(actor=OWNER, timezone_name=UTC, max_immediate_per_day=10,
-                     cooldown_minutes=0, shadow=False)
+                     cooldown_minutes=0, shadow=False, quiet_from=quiet_from,
+                     quiet_until=quiet_until)
     events = DueEventLog(store)
     goals = GoalStore(store, events=events, owner_principal=OWNER)
     subject = Outbox(store, policy=policy, owner_principal=OWNER)
@@ -295,7 +311,8 @@ def test_concurrent_drains_never_close_each_other_s_delivery(store, queue, tmp_p
             with EvidenceStore(store.path) as own:
                 outcomes.append(deliver_ready(own, policy=allowed(),
                                               sink=local_sink(tmp_path / f"h{worker}"),
-                                              limit=12, holder=f"drain-{worker}"))
+                                              limit=12, holder=f"drain-{worker}",
+                                              at=EPOCH))
         except Exception as error:
             errors.append(f"{type(error).__name__}: {str(error)[:160]}")
 

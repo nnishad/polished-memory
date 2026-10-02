@@ -629,7 +629,8 @@ def test_a_page_stops_at_its_byte_budget_rather_than_its_count(tmp_path):
     adapter.capabilities = replace(adapter.capabilities, max_bytes_per_page=100_000)
     page = adapter.read_page(None)
     assert len(page.envelopes) == 1
-    assert page.next_cursor == "1.eml"
+    assert page.next_cursor.startswith("export-v1:")
+    assert adapter.read_page(page.next_cursor).envelopes[0]["metadata"]["path"] == "2.eml"
 
 
 def test_more_attachments_than_the_list_holds_are_capped_and_said(tmp_path):

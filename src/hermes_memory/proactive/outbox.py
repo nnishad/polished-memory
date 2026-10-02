@@ -155,6 +155,11 @@ class Outbox:
             raise EvidenceError(f"unknown decision {decision_id!r}; an artifact answers a "
                                 "recorded decision, not an intention on its own")
         text = _payload_text(payload)
+        evidence = tuple(evidence)
+        if len(evidence) > 100 or any(not isinstance(item, str) for item in evidence):
+            raise EvidenceError("evidence must contain at most 100 record IDs")
+        if len(json.dumps(evidence, ensure_ascii=False)) > 4000:
+            raise EvidenceError("evidence manifest exceeds 4000 characters")
         bound = recipient or self.owner_principal
         if bound is None:
             raise EvidenceError("no owner principal is named, so nobody may be addressed")
@@ -281,7 +286,7 @@ class Outbox:
                 (reason[:400], now(), artifact_id))
         return self.get(artifact_id)
 
-    def attempt(self, *, artifact_id: str, token: str) -> Artifact:
+    def attempt(self, *, artifact_id: str, token: str, at: float | None = None) -> Artifact:
         """Say that the handover has begun, before beginning it.
 
         This is the write that makes a crash survivable: an artifact stuck in
@@ -297,6 +302,14 @@ class Outbox:
                 raise EvidenceError(f"unknown artifact {artifact_id!r}")
             if row["state"] != "leased" or row["lease_token"] != token:
                 raise EvidenceError(_refusal_reason(str(row["state"])))
+            moment = self._now() if at is None else float(at)
+            eligibility = self.revalidate(artifact_id, at=moment)
+            if row["lease_until"] is None or row["lease_until"] <= moment:
+                raise EvidenceError("handoff lease expired; reconcile before delivery")
+            if not eligibility.ok:
+                raise EvidenceError(f"handoff refused: {eligibility.reason}")
+            if connection.execute("SELECT 1 FROM delivery_fences WHERE artifact_id=?", (artifact_id,)).fetchone():
+                raise EvidenceError("handoff already recorded; reconcile instead of resending")
             connection.execute(
                 "UPDATE outbox SET state='attempted', updated_at=? WHERE id=?",
                 (now(), artifact_id))

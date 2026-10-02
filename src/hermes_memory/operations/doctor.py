@@ -457,6 +457,10 @@ class Doctor:
         """
         report = self.status.questions()
         loop = self.status.delivery_loop()
+        if report.get("delivery_uncertain") or report.get("delivery_in_flight"):
+            return Finding("questions", WARN, "question delivery needs reconciliation",
+                           "An unknown send is not automatically retried. Check transport receipts; "
+                           "withdraw the old question before deliberately asking a fresh generation.", report)
         stale = int(self.db.execute(
             "SELECT count(*) FROM inquiries WHERE state IN ('open','sent') AND "
             "expires_at<=?", (now(),)).fetchone()[0])

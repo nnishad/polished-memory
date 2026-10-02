@@ -49,43 +49,17 @@ class FileSource(SourceAdapter):
                 "content_read": False, "observed_at": now()}
 
     def read_page(self, cursor: str | None) -> Page:
-        keys = [key for key in self._keys() if cursor is None or key > cursor]
-        limit = self.capabilities.max_records_per_page
-        byte_budget = self.capabilities.max_bytes_per_page
-        # Bounded by files examined as well as records returned: a directory of
-        # unreadable files would otherwise yield an endless run of empty pages.
-        scan_cap = limit * 4
-        envelopes: list[dict[str, Any]] = []
-        skipped: list[Skipped] = []
-        examined: list[str] = []
-        used = 0
-        for key in keys:
-            if len(envelopes) >= limit or len(examined) >= scan_cap:
-                break
+        from .export_paging import read_export_page
+        def read(key):
             path = self.root / key
-            # Every examined key advances the cursor, including one that yielded
-            # nothing, so a gap is passed over once rather than retried forever.
             size = self._size_of(path)
             if size is None:
-                skipped.append(Skipped(key, "stat failed or the file disappeared"))
-                examined.append(key)
-                continue
+                return [], [Skipped(key, "stat failed or the file disappeared")]
             if size > _MAX_FILE_BYTES:
-                skipped.append(Skipped(
-                    key, f"{size} bytes exceeds the {_MAX_FILE_BYTES} byte per-file bound"))
-                examined.append(key)
-                continue
-            if used and used + size > byte_budget:
-                break
+                return [], [Skipped(key, f"{size} bytes exceeds the {_MAX_FILE_BYTES} byte per-file bound")]
             produced, reason = self._read(path, key)
-            examined.append(key)
-            if produced is None:
-                skipped.append(Skipped(key, reason))
-                continue
-            envelopes.extend(produced)
-            used += size
-        return Page(envelopes=tuple(envelopes), skipped=tuple(skipped),
-                    next_cursor=examined[-1] if len(examined) < len(keys) and examined else None)
+            return (produced, []) if produced is not None else ([], [Skipped(key, reason)])
+        return read_export_page(self, cursor, self._keys(), read)
 
     def _size_of(self, path: Path) -> int | None:
         try:
@@ -135,7 +109,7 @@ class FileSource(SourceAdapter):
         return self.envelope(
             source_id=key, revision=_revision(key, raw), kind="file", text=text,
             observed_at=now(), occurred_at=occurred, occurred_precision=precision,
-            metadata={"path": key, "bytes": len(raw), "mtime": _mtime_of(path),
+            metadata={"path": key, "bytes": len(raw),
                       "media_type": _media_type(path.suffix),
                       **({"time_note": note} if note else {})},
         )
@@ -159,7 +133,7 @@ class FileSource(SourceAdapter):
                 kind=str(item.get("kind") or "file_record"), text=body, observed_at=now(),
                 occurred_at=occurred, occurred_precision=precision,
                 metadata={"path": key, "index": index, "bytes": len(raw),
-                          "mtime": _mtime_of(path), "media_type": "application/json",
+                          "media_type": "application/json",
                           "time_basis": str(item.get("time_basis") or "source field"),
                           **({"time_note": note} if note else {})},
             ))

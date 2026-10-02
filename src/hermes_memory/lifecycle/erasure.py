@@ -1,6 +1,8 @@
 """C4 — forgetting: preview, owner confirmation, tombstone and derived cleanup."""
 from __future__ import annotations
 
+from ..storage.transactions import write_transaction
+
 import json
 from typing import Any, Iterable, Sequence
 
@@ -49,8 +51,7 @@ class ErasureManager:
         rows, dependents, obligations, attachments, artifacts, fingerprint = self._radius(
             [row["id"] for row in targets])
         intent_id = new_id("erase")
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             self.db.execute(
                 "INSERT INTO erasure_ledger(id, source, requested_at, requested_by, "
                 "requester_kind, reason, preview, preview_digest, state, epoch) "
@@ -67,10 +68,6 @@ class ErasureManager:
             self.store._audit("erasure_preview", intent_id,
                               {"actor": actor, "actor_kind": actor_kind,
                                "records": len(targets), "obligations": len(obligations)})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {
             "intent_id": intent_id,
             "preview_digest": fingerprint,
@@ -126,8 +123,7 @@ class ErasureManager:
             raise EvidenceError(
                 f"confirmation requires the owner principal, not {actor!r}"
             )
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             intent = self.db.execute(
                 "SELECT * FROM erasure_ledger WHERE id=?", (intent_id,)).fetchone()
             if intent is None:
@@ -176,10 +172,6 @@ class ErasureManager:
             self.store._audit("erasure_confirm", intent_id,
                               {"actor": actor, "records": len(record_ids),
                                "outstanding": outstanding, "state": state})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"intent_id": intent_id, "state": state, "erased": len(record_ids),
                 "obligations_outstanding": outstanding, "attachments": destroyed,
                 "summaries_withdrawn": withdrawn, "evaluations_staled": staled}
@@ -327,8 +319,7 @@ class ErasureManager:
 
     def verify(self, *, intent_id: str, kind: str, reference: str) -> dict[str, Any]:
         """Mark one obligation verified. The intent completes only when all do."""
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             row = self.db.execute(
                 "SELECT 1 FROM erasure_targets WHERE intent_id=? AND kind=? AND reference=?",
                 (intent_id, kind, reference)).fetchone()
@@ -342,10 +333,6 @@ class ErasureManager:
             if kind == "backend_document":
                 self._settle_mapping(reference)
             outcome = self._retire(intent_id)
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return outcome
 
     def _settle_mapping(self, reference: str) -> None:
@@ -374,8 +361,7 @@ class ErasureManager:
         is the honest state: the local copy is gone, the derived one is not.
         """
         _check_reason(error)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             row = self.db.execute(
                 "SELECT attempts FROM erasure_targets WHERE intent_id=? AND kind=? AND reference=?",
                 (intent_id, kind, reference)).fetchone()
@@ -387,10 +373,6 @@ class ErasureManager:
                 (row["attempts"] + 1, error[:500], intent_id, kind, reference),
             )
             outcome = self._retire(intent_id)
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return outcome
 
     def discharge(self, *, client, limit: int = 20) -> dict[str, Any]:
@@ -594,8 +576,7 @@ class ErasureManager:
         earlier of the two, and only a terminal local state is allowed to win.
         """
         merged = inserted = 0
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             for entry in entries:
                 intent_id = _check_intent_id(entry.get("id"))
                 existing = self.db.execute(
@@ -636,10 +617,6 @@ class ErasureManager:
                     )
             self.store._audit("erasure_ledger_absorb", "erasure_ledger",
                               {"inserted": inserted, "merged": merged})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"inserted": inserted, "merged": merged}
 
     def reapply(self) -> dict[str, Any]:
@@ -649,8 +626,7 @@ class ErasureManager:
         items; restoring it first and honoring the ledger second is the only
         ordering that does not silently undo a deletion.
         """
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             rows = self.db.execute(
                 """
                 SELECT t.record_id, t.intent_id FROM tombstones t
@@ -662,10 +638,6 @@ class ErasureManager:
                 self.db.execute("DELETE FROM record_fts WHERE id=?", (row["record_id"],))
                 journal(self.db, row["record_id"], "erase_reapplied")
             self.store._audit("erasure_reapply", "erasure_ledger", {"records": len(rows)})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"reapplied": len(rows)}
 
 

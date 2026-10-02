@@ -28,6 +28,48 @@ API_KEY = "sk-proj-Ab9ZmQ2xKd7Lp4Rt8Vn1Yc3Eg6Jk0Mq"
 MISSING = object()
 
 
+def test_v2_utterance_time_is_not_the_event_occurrence_time():
+    captured = turn(source_context_version=2,
+                    utterance_at="2026-10-02T23:30:00+05:30",
+                    utterance_time_basis="host-turn-start", utterance_role="user")
+    records, _ = adapter(captured).read_all()
+    user, assistant = records
+    assert user["occurred_at"] is None
+    assert user["metadata"]["utterance_at"] == "2026-10-02T18:00:00+00:00"
+    assert user["metadata"]["utterance_time_basis"] == "host-turn-start"
+    assert assistant["metadata"]["utterance_at"] is None
+
+
+def test_legacy_capture_does_not_gain_context_from_spool_time():
+    record = adapter(turn(created_at="2026-10-02T12:00:00Z")).read_page(None).envelopes[0]
+    assert record["occurred_at"] is None
+    assert "source_context_version" not in record["metadata"]
+    assert "utterance_at" not in record["metadata"]
+
+
+@pytest.mark.parametrize("when", [None, "2026-10-02", "2026-10-02T12:00:00", "bad",
+                                  "2026-10-02T12:00:00." + "1" * 200 + "+00:00"])
+def test_v2_unknown_or_ambiguous_utterance_clock_stays_unknown(when):
+    record = adapter(turn(source_context_version=2, utterance_at=when,
+                          utterance_role="user")).read_page(None).envelopes[0]
+    assert record["metadata"]["utterance_at"] is None
+
+
+@pytest.mark.parametrize("version", [99, True, "2", None])
+def test_unknown_capture_version_is_not_reinterpreted_as_legacy(version):
+    page = adapter(turn(source_context_version=version)).read_page(None)
+    assert not page.envelopes
+    assert "version" in page.skipped[0].reason
+
+
+def test_v2_replay_preserves_the_canonical_fingerprint():
+    captured = turn(source_context_version=2, utterance_role="user",
+                    utterance_at="2026-10-02T23:30:00+05:30")
+    first = adapter(captured).read_page(None).envelopes[0]
+    replay = adapter(captured).read_page(None).envelopes[0]
+    assert prepare_envelope(first).fingerprint == prepare_envelope(replay).fingerprint
+
+
 def iso(**shift) -> str:
     return (datetime.now(timezone.utc) + timedelta(**shift)).isoformat()
 
@@ -275,15 +317,12 @@ def test_a_session_end_whose_messages_cannot_be_attributed_is_not_kept_quietly()
     assert page.skipped[0].reason == "the session end held no message this adapter can keep"
 
 
-def test_a_session_end_bigger_than_one_event_may_hold_reports_what_it_left_out(monkeypatch):
-    from hermes_memory.sources import sdk
-
-    monkeypatch.setattr(sdk, "_MAX_SESSION_MESSAGES", 2)
+def test_a_session_end_preserves_every_message():
     source = adapter(event("se1", kind="session_end", messages=[
         {"role": "user", "text": f"line {index}"} for index in range(5)]))
     envelopes, _ = source.read_all()
 
-    assert [item["source_id"] for item in envelopes] == ["se1#0", "se1#1"]
+    assert [item["source_id"] for item in envelopes] == [f"se1#{index}" for index in range(5)]
     assert envelopes[0]["metadata"]["session_messages"] == 5, \
         "the bound is said in the record, not hidden in a count nobody can recompute"
 
@@ -312,6 +351,24 @@ def test_a_note_removal_is_filed_as_a_report_rather_than_as_a_deletion_event():
     envelopes, _ = source.read_all()
     assert envelopes[0]["metadata"]["native_action"] == "remove"
     assert source.capabilities.deletion_events is False
+
+
+def test_native_empty_remove_keeps_previous_content_and_rejects_forged_origin():
+    envelopes, skipped = adapter(event("n2", kind="native_memory_write", action="remove",
+        target="memory", content="", metadata={"previous_content": "old note",
+        "origin": "owner-statement", "independent": True})).read_all()
+    assert skipped == [] and envelopes[0]["text"] == "old note"
+    assert envelopes[0]["metadata"]["previous_content"] == "old note"
+    assert envelopes[0]["metadata"]["origin"] == "mirrored-native-note"
+    assert envelopes[0]["metadata"]["independent"] is False
+
+
+def test_delegation_keeps_both_parts_as_nonindependent_model_evidence():
+    envelopes, skipped = adapter(event("d1", kind="delegation", task="Find invoice",
+        result="Invoice 42", child_session_id="child")).read_all()
+    assert skipped == [] and len(envelopes) == 2
+    assert [item["source_id"] for item in envelopes] == ["d1#task", "d1#result"]
+    assert all(item["metadata"]["independent"] is False for item in envelopes)
 
 
 def test_an_unsupported_native_action_is_not_invented_into_a_known_one():

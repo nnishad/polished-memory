@@ -86,39 +86,24 @@ class WhatsAppExport(SourceAdapter):
                 "content_read": False, "observed_at": now()}
 
     def read_page(self, cursor: str | None) -> Page:
-        keys = self._keys()
-        remaining = [key for key in keys if cursor is None or key > cursor]
-        limit = self.capabilities.max_records_per_page
-        envelopes: list[dict[str, Any]] = []
-        skipped: list[Skipped] = []
-        examined: list[str] = []
-        for key in remaining:
-            if len(envelopes) >= limit or len(examined) >= limit * 4:
-                break
-            examined.append(key)
+        from .export_paging import read_export_page
+        def read(key):
             size = self._size_of(key)
             if size is None:
-                skipped.append(Skipped(key, "stat failed or the file disappeared"))
-                continue
+                return [], [Skipped(key, "stat failed or the file disappeared")]
             if size > self.capabilities.max_bytes_per_page:
-                skipped.append(Skipped(
-                    key, f"{size} bytes exceeds the {self.capabilities.max_bytes_per_page} "
-                    "byte per-page bound"))
-                continue
+                return [], [Skipped(key, f"{size} bytes exceeds the byte per-page bound")]
             raw = self._raw(key)
             if raw is None:
-                skipped.append(Skipped(key, "read failed or the file is not UTF-8"))
-                continue
+                return [], [Skipped(key, "read failed or the file is not UTF-8")]
+            envelopes, skipped = [], []
             for position, item, reason in self._messages(key, raw):
                 if item is None:
                     skipped.append(Skipped(f"{key}#{position}", reason))
                 else:
                     envelopes.append(item)
-                    if len(envelopes) >= limit:
-                        break
-        return Page(envelopes=tuple(envelopes), skipped=tuple(skipped),
-                    next_cursor=examined[-1] if examined and len(examined) < len(remaining)
-                    else None)
+            return envelopes, skipped
+        return read_export_page(self, cursor, self._keys(), read)
 
     # -- reading -------------------------------------------------------------
 

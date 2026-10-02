@@ -14,6 +14,8 @@ the next read rather than on the next review someone never schedules.
 """
 from __future__ import annotations
 
+from ..storage.transactions import write_transaction
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,8 +124,7 @@ class LessonStore:
         rule = _validate_rule(applicability)
         span_list = [_check_citation(item) for item in evidence][:24]
         self._check_evidence(span_list)
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             newest = self.db.execute("SELECT max(version) FROM lessons WHERE id=?",
                                      (lesson_id,)).fetchone()[0]
             number = int(version) if version else int(newest or 0) + 1
@@ -148,10 +149,6 @@ class LessonStore:
                  proposed_kind, now()))
             self.store._audit("lesson_propose", f"{lesson_id}@{number}", {
                 "by": proposed_by, "kind": proposed_kind, "evidence": len(span_list)})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": lesson_id, "version": number, "status": "candidate",
                 "note": "a proposal is not a rule; it applies to nothing until an "
                         "evaluation or the owner says otherwise"}
@@ -253,6 +250,15 @@ class LessonStore:
             lesson = Lesson.from_row(row)
             ok, why = match(lesson.applicability, task)
             if not ok:
+                continue
+            # Legacy text labels require explicit host-supplied condition truth,
+            # never inferred from a task description. Unknowns fail closed.
+            conditions = task.get("conditions", {})
+            if not isinstance(conditions, Mapping):
+                continue
+            if any(conditions.get(label) is not True for label in lesson.prerequisites):
+                continue
+            if any(conditions.get(label) is not False for label in lesson.exceptions):
                 continue
             if account_id is not None and not self._visible_to(lesson, account_id):
                 continue
@@ -379,8 +385,7 @@ class LessonStore:
 
     def _set(self, lesson_id: str, version: int, status: str, *, actor: str,
              reason: str, evaluation_id: str | None = None) -> dict[str, Any]:
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with write_transaction(self.db):
             cursor = self.db.execute(
                 "UPDATE lessons SET status=?, decided_by=?, decided_at=?, retraction_reason=?"
                 + (", evaluation_id=?" if evaluation_id else "") +
@@ -402,10 +407,6 @@ class LessonStore:
                      int(version)))
             self.store._audit(f"lesson_{status}", f"{lesson_id}@{version}",
                               {"by": actor, "reason": reason[:300]})
-            self.db.execute("COMMIT")
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
         return {"id": f"{lesson_id}@{version}", "status": status, "by": actor}
 
 

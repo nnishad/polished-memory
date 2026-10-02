@@ -136,7 +136,7 @@ def test_a_question_asks_what_it_will_do_before_it_asks(store, waiting, asking, 
 
     assert "It would settle: goal-activation" in body
     assert "answer with the code" not in body, "a bare code is not an instruction"
-    assert "`yes " in body and "`no`" in body and "Until" in body
+    assert "`yes " in body and "`no " in body and "Until" in body
 
 
 # -- answering ----------------------------------------------------------------
@@ -430,7 +430,7 @@ def test_a_transport_that_failed_lets_the_question_be_asked_again(store, waiting
     inquiries.ask(decision="goal-activation", subject_id=identifier, question=FERNS)
 
     def broken(body):
-        raise RuntimeError("the gateway is not running")
+        return {"sent": False, "error": "the gateway is not running"}
 
     failed = inquiries.send_next(sink=broken, destination=CHANNEL, holder="test")
     assert failed["sent"] == 0 and failed["ok"] is False

@@ -28,7 +28,8 @@ class ResetController:
         live = self.db.execute(
             "SELECT id, fingerprint FROM records WHERE deleted=0 ORDER BY id").fetchall()
         banks = self.db.execute(
-            "SELECT DISTINCT backend, bank_id FROM backend_documents ORDER BY backend, bank_id"
+            "SELECT backend,bank_id FROM backend_documents UNION "
+            "SELECT backend,bank_id FROM projection_generations ORDER BY backend,bank_id"
         ).fetchall()
         sources = self.db.execute(
             "SELECT source, generation FROM connectors ORDER BY source").fetchall()
@@ -121,6 +122,8 @@ class ResetController:
                 if row is None:
                     continue
                 self.db.execute("UPDATE records SET deleted=1 WHERE id=?", (record_pk,))
+                from ..storage.blobs import BlobStore
+                BlobStore(self.store).release([record_pk], db=self.db)
                 self.db.execute("DELETE FROM record_fts WHERE id=?", (record_pk,))
                 self.db.execute(
                     "INSERT OR REPLACE INTO tombstones(record_id, intent_id, fingerprint, "

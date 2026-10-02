@@ -26,7 +26,7 @@ from hermes_memory.backend.worker_launcher import (HOLD_POLL_SECONDS, LAUNCHER_V
                                                    inference_hold, main,
                                                    memory_arguments, poller_arguments,
                                                    slot_contract, version_contract,
-                                                   wait_for_inference)
+                                                   wait_for_inference, worker_database)
 from hermes_memory.config import load_settings
 from hermes_memory.processing.instance_gate import (GATE_SCHEMA_VERSION, GateStore,
                                                    gate_path)
@@ -70,7 +70,8 @@ class Engine:
     """
 
     def __init__(self, *, run_migrations, task_backend, tenant_extension,
-                 operation_validator):
+                 operation_validator, db_url=None):
+        self.db_url = db_url
         self.run_migrations = run_migrations
         self.task_backend = task_backend
         self.tenant_extension = tenant_extension
@@ -115,6 +116,42 @@ class TaskBackend:
 
 MODULES = {"MemoryEngine": Engine, "WorkerTaskBackend": TaskBackend, "WorkerPoller": Poller,
            "config": type("ConfigModule", (), {"DEFAULT_DATABASE_SCHEMA": "public"})}
+
+
+def test_embedded_worker_waits_for_api_and_passes_resolved_dsn():
+    from types import SimpleNamespace
+    checks = []
+    slept = []
+    uri = "postgresql://worker:synthetic@127.0.0.1:5432/hindsight"
+
+    def ready():
+        checks.append("ready")
+        return len(checks) >= 2
+
+    def inspect_instance():
+        assert len(checks) >= 2
+        return SimpleNamespace(running=True, uri=uri)
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    resolved = asyncio.run(worker_database(None, Config(database_url="pg0"), sleep=sleep,
+                                          ready=ready, inspect_instance=inspect_instance))
+    assert slept and resolved == uri
+    engine = Engine(**memory_arguments(MODULES, db_url=resolved))
+    assert engine.db_url == uri and engine.run_migrations is False
+
+
+def test_embedded_worker_never_inspects_or_starts_before_api_readiness():
+    async def sleep(seconds):
+        pass
+
+    def forbidden():
+        pytest.fail("worker touched the database before its API owner was ready")
+
+    with pytest.raises(LauncherRefused, match="worker did not start"):
+        asyncio.run(worker_database(None, Config(database_url="pg0"), sleep=sleep,
+                                    ready=lambda: False, inspect_instance=forbidden, wait_s=0))
 
 
 @pytest.fixture()
@@ -307,6 +344,41 @@ def test_an_operation_that_matches_no_route_is_refused_rather_than_charged_to_an
     assert engine.executed == [], "an unchargeable request is not somebody else's budget"
     row = ledger.get("op-1")
     assert row["resource"] is None and row["state"] == "uncertain"
+
+
+@pytest.mark.parametrize(("kind", "route"), [("consolidation", "consolidate"),
+                                            ("refresh_mental_model", "reflect")])
+def test_native_maintenance_kind_uses_its_explicit_route(ledger, kind, route):
+    engine = Engine(**memory_arguments(MODULES))
+    configured = RouteTable({route: Route(route, REMOTE, "chat", "http://127.0.0.1:11434/v1",
+                                         "credential-" + route, "maintenance", 1024)})
+    run(attribute_tasks(engine, ledger, worker_id="w1", routes=configured)(
+        {**TASK, "operation_type": kind, "type": kind}))
+    assert ledger.get("op-1")["state"] == "finished"
+    assert ledger.get("op-1")["resource"] == REMOTE
+
+
+def test_graph_maintenance_is_explicit_bounded_database_work(ledger):
+    engine = Engine(**memory_arguments(MODULES))
+    run(attribute_tasks(engine, ledger, worker_id="w1", routes=None)(
+        {**TASK, "operation_type": "graph_maintenance", "type": "graph_maintenance"}))
+    assert ledger.get("op-1")["resource"] == "backend-db"
+    assert ledger.get("op-1")["state"] == "finished"
+
+
+def test_native_vector_index_maintenance_has_its_own_database_policy(ledger):
+    engine = Engine(**memory_arguments(MODULES))
+    run(attribute_tasks(engine, ledger, worker_id="w1", routes=None)(
+        {**TASK, "operation_type": "vector_index_maintenance", "type": "vector_index_maintenance"}))
+    assert ledger.get("op-1")["resource"] == "backend-db"
+
+
+def test_claimed_operation_cannot_disguise_another_executor_kind(ledger):
+    engine = Engine(**memory_arguments(MODULES))
+    with pytest.raises(LauncherRefused, match="disagree"):
+        run(attribute_tasks(engine, ledger, worker_id="w1", routes=ROUTES)(
+            {**TASK, "type": "consolidation"}))
+    assert engine.executed == []
 
 
 def test_a_task_that_names_no_bank_is_refused_before_it_is_recorded(ledger):

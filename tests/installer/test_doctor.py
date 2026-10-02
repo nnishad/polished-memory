@@ -673,7 +673,9 @@ def test_a_release_manifest_that_is_absent_is_a_failure_with_the_command_to_make
 # -- credentials and fences --------------------------------------------------
 
 def test_a_key_in_the_record_set_is_found_and_not_echoed_back(store):
-    evidence(store, f"here is my key {SECRET} for the api")
+    # Simulate historical pre-redaction storage. New canonical ingress removes keys.
+    evidence(store, "historical record")
+    store.db.execute("UPDATE records SET text=?", (f"here is my key {SECRET} for the api",))
     finding = Doctor(store).credentials_in_records()
     assert finding.severity == FAIL
     assert SECRET not in json.dumps(finding.as_dict())
@@ -989,7 +991,8 @@ def test_no_client_is_built_when_no_backend_is_configured(tmp_path, monkeypatch,
 
 def test_remedies_are_collected_in_the_order_the_checks_ran(store):
     _job(store, state="uncertain")
-    evidence(store, f"here is my key {SECRET} for the api")
+    evidence(store, "historical record")
+    store.db.execute("UPDATE records SET text=?", (f"here is my key {SECRET} for the api",))
     report = Doctor(store, backend=Tripwire()).examine()
     order = [item["check"] for item in report["findings"] if item["remedy"]]
     assert order.index("queue") < order.index("credentials")

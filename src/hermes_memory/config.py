@@ -227,9 +227,11 @@ class Settings:
     text_route: ModelRoute | None = None
     vision_route: ModelRoute | None = None
     embeddings_route: ModelRoute | None = None
+    reranker_route: ModelRoute | None = None
     max_output_tokens: OutputCaps = field(default_factory=OutputCaps)
     route_credentials: dict[str, str] = field(default_factory=dict)
     gate_token: str | None = None
+    admission_url: str | None = None
     # Which enrolled profile these paths belong to. A configuration with no profile
     # name is the installation's own default; a resolved activity always carries one.
     profile: str = DEFAULT_PROFILE
@@ -333,7 +335,8 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
     values = _read_env_file(Path(env_file))
 
     def get(key: str, default: str | None = None) -> str | None:
-        return os.environ.get(f"HERMES_MEMORY_{key}", values.get(f"HERMES_MEMORY_{key}", default))
+        name = f"HERMES_MEMORY_{key}"
+        return os.environ.get(name, values.get(name, default))
 
     def flag(key: str) -> bool:
         return (get(key, "false") or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -397,11 +400,13 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         text_route=_route(get, allowed, "TEXT", default_resource="remote-9b"),
         vision_route=_route(get, allowed, "VISION", default_resource="local-gpu"),
         embeddings_route=_route(get, allowed, "EMBEDDINGS", default_resource="local-gpu"),
+        reranker_route=_route(get, allowed, "RERANKER", default_resource="local-gpu"),
         max_output_tokens=OutputCaps(
             retain=_cap(get, "RETAIN"), consolidate=_cap(get, "CONSOLIDATE"),
             reflect=_cap(get, "REFLECT"), foreground=_cap(get, "FOREGROUND")),
         route_credentials=_credentials(values),
         gate_token=(get("GATE_TOKEN") or "").strip() or None,
+        admission_url=admission or None,
         delivery_enabled=delivery_enabled,
         delivery_target=delivery_target,
         delivery_command=delivery_command,

@@ -35,7 +35,6 @@ _ROLES = frozenset({"user", "assistant", "system", "tool"})
 # One session's transcript is one event, and a host that logs everything would otherwise put an
 # unbounded list inside a single page. The bound is stated rather than discovered: past it the
 # adapter says so in the record's own metadata.
-_MAX_SESSION_MESSAGES = 200
 # Only what a participant said can corroborate anything. Everything else here is a
 # report about the conversation, and reporting it twice must not look like agreement.
 _INDEPENDENT_ROLES = frozenset({"user"})
@@ -150,6 +149,10 @@ class HermesEvents(SourceAdapter):
         if not isinstance(payload, Mapping):
             seen.add(event_id)
             return event_id, None, "the event carried no payload object"
+        version = payload.get("source_context_version", 1)
+        if type(version) is not int or version not in (1, 2):
+            seen.add(event_id)
+            return event_id, None, "unsupported source context version"
         kind = str(payload.get("kind") or "").strip()
         handler = _HANDLERS.get(kind)
         if handler is None:
@@ -177,8 +180,22 @@ class HermesEvents(SourceAdapter):
         occurred, precision, note = normalize_time(
             payload.get("occurred_at") or event.get("timestamp"))
         author = _author(payload.get("author") if "author" in payload else event.get("author"))
+        context: dict[str, Any] = {}
+        utterance_role = None
+        if payload.get("source_context_version") == 2:
+            utterance, utterance_precision, utterance_note = normalize_time(payload.get("utterance_at"))
+            # A date-only value does not locate a spoken utterance within a day.
+            if utterance_precision not in {"second", "minute", "hour"}:
+                utterance, utterance_precision = None, "unknown"
+            utterance_role = payload.get("utterance_role")
+            context = {"source_context_version": 2, "utterance_at": utterance,
+                       "utterance_precision": utterance_precision,
+                       "utterance_time_basis": (_short(payload.get("utterance_time_basis"))
+                                                or "source-field") if utterance else "none",
+                       **({"utterance_note": utterance_note} if utterance_note else {})}
         return _Frame(
             occurred=occurred, precision=precision,
+            utterance_role=utterance_role,
             metadata={
                 "event_id": event_id,
                 "session_id": _short(event.get("session_id")) or None,
@@ -187,17 +204,23 @@ class HermesEvents(SourceAdapter):
                 "author": author or None,
                 "time_basis": "event field" if occurred else "none",
                 **({"time_note": note} if note else {}),
+                **context,
             },
         )
 
     def _stamp(self, frame: _Frame, *, role: str, text: str, kind: str,
                event_id: str, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
         body = text[:MAX_EVENT_CHARS]
+        context = {}
+        if frame.metadata.get("source_context_version") == 2 and role != frame.utterance_role:
+            context = {"utterance_at": None, "utterance_precision": "unknown",
+                       "utterance_time_basis": "none"}
         return self.envelope(
             source_id=event_id, revision="1", kind=kind, text=body, observed_at=now(),
             occurred_at=frame.occurred, occurred_precision=frame.precision,
             metadata={
                 **frame.metadata,
+                **context,
                 "role": role, "origin": _ORIGIN.get(role, role),
                 "independent": role in _INDEPENDENT_ROLES,
                 "text_digest": digest(["v1", body])[:32],
@@ -231,6 +254,7 @@ class _Frame:
     metadata: dict[str, Any]
     occurred: str | None
     precision: str
+    utterance_role: str | None = None
 
 
 def _turn(adapter: HermesEvents, event: Mapping, payload: Mapping,
@@ -281,19 +305,21 @@ def _session_end(adapter: HermesEvents, event: Mapping, payload: Mapping,
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return "the session end carried no message list"
-    frame = adapter._frame(event, payload, event_id)
     produced = []
-    for position, item in enumerate(messages[:_MAX_SESSION_MESSAGES]):
+    for position, item in enumerate(messages):
         if not isinstance(item, Mapping):
             continue
         role = normalize_text(item.get("role"))
         body = normalize_text(item.get("text"))
         if role not in _ROLES or body is None:
             continue
+        message_frame = adapter._frame(event, {**payload, "author": item.get("author"),
+                                               "occurred_at": item.get("timestamp")}, event_id)
         produced.append(adapter._stamp(
-            frame, role=role, text=body, kind="transcript",
+            message_frame, role=role, text=body, kind="transcript",
             event_id=f"{event_id}{PART_SEPARATOR}{position}",
-            extra={"session_position": position, "session_messages": len(messages)}))
+            extra={"session_position": item.get("position", position),
+                   "session_messages": payload.get("turns", len(messages))}))
     if not produced:
         return "the session end held no message this adapter can keep"
     return produced
@@ -310,17 +336,42 @@ def _native_note(adapter: HermesEvents, event: Mapping, payload: Mapping,
     action = normalize_text(payload.get("action"))
     if action not in _NATIVE_ACTIONS:
         return f"unsupported native memory action {action!r}"
+    provenance = payload.get("metadata")
+    allowed = {"previous_content", "old_text", "session_id", "write_origin",
+               "operation_id", "tool_call_id", "pending_id", "platform", "author"}
+    provenance = {key: value for key, value in provenance.items() if key in allowed} \
+        if isinstance(provenance, Mapping) else {}
     content = normalize_text(payload.get("content"))
+    if action == "remove":
+        content = normalize_text(provenance.get("previous_content")) or content
     if content is None:
         return "the native note carried no text"
     target = normalize_text(payload.get("target")) or "unknown"
     return [adapter._stamp(adapter._frame(event, payload, event_id), role="note", text=content,
                            kind="note", event_id=event_id,
-                           extra={"native_action": action, "native_target": target})]
+                           extra={**provenance, "native_action": action,
+                                  "native_target": target, "independent": False})]
+
+
+def _delegation(adapter: HermesEvents, event: Mapping, payload: Mapping,
+                event_id: str) -> list[dict[str, Any]] | str:
+    produced = []
+    frame = adapter._frame(event, payload, event_id)
+    for field in ("task", "result"):
+        text = normalize_text(payload.get(field))
+        if text:
+            produced.append(adapter._stamp(
+                frame, role="assistant", text=text, kind="delegation",
+                event_id=f"{event_id}{PART_SEPARATOR}{field}",
+                extra={"delegation_part": field,
+                       "child_session_id": payload.get("child_session_id"),
+                       "independent": False}))
+    return produced or "the delegation carried no task or result text"
 
 
 _HANDLERS = {"conversation_turn": _turn, "pre_compress": _transcript,
-             "session_end": _session_end, "native_memory_write": _native_note}
+             "session_end": _session_end, "native_memory_write": _native_note,
+             "delegation": _delegation}
 
 
 # -- normalization helpers ---------------------------------------------------

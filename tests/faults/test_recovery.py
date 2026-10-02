@@ -86,6 +86,46 @@ def committed(store, **overrides):
     return store.commit(envelope(**overrides))["id"]
 
 
+def test_restore_keeps_empty_post_snapshot_generation_as_retired(store, snapshots, recovery):
+    from hermes_memory.backend.generations import GenerationRegistry, recall_bank
+
+    committed(store)
+    donor = snapshots.create(reason="before shadow bank", actor=OWNER)["snapshot"]
+    registry = GenerationRegistry(store, family_bank="hermes", owner_principal=OWNER)
+    spec = {"version": "processor-manifest-v1", "text_model": "synthetic"}
+    plan = registry.plan(spec)
+    generation = registry.prepare(spec, actor=OWNER, review=plan["review_digest"])
+    assert generation["bank_id"] in recovery.carry().banks
+    recovery.restore(donor.id, actor=OWNER, bank_id="hermes")
+    assert registry.get(generation["id"])["state"] == "retired"
+    assert generation["bank_id"] in recovery.carry().banks
+    assert recall_bank(store, "hermes") is None
+    assert store.db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_restore_retires_a_post_snapshot_active_generation(store, snapshots, recovery):
+    from hermes_memory.backend.generations import GenerationRegistry, recall_bank
+
+    record = committed(store)
+    donor = snapshots.create(reason="before activated generation", actor=OWNER)["snapshot"]
+    registry = GenerationRegistry(store, family_bank="hermes", owner_principal=OWNER)
+    spec = {"version": "processor-manifest-v1", "text_model": "synthetic",
+            "embedding_dimensions": 1024, "bank_prompt_config": "synthetic-contract"}
+    plan = registry.plan(spec)
+    generation = registry.prepare(spec, actor=OWNER, review=plan["review_digest"])
+    docs = DocumentMap(store, bank_id=generation["bank_id"], generation_id=generation["id"])
+    item = docs.begin(record, "1")
+    docs.pin_payload(record, "1", {"document_id": item["document_id"], "content": "synthetic"})
+    docs.confirm(record, "1")
+    cutover = registry.cutover_plan(generation["id"])
+    registry.activate(generation["id"], actor=OWNER, review=cutover["review_digest"])
+    assert recall_bank(store, "hermes") == generation["bank_id"]
+    recovery.restore(donor.id, actor=OWNER, bank_id="hermes")
+    assert registry.get(generation["id"])["state"] == "retired"
+    assert recall_bank(store, "hermes") is None
+    assert generation["bank_id"] in recovery.carry().banks
+
+
 def scheduled(stack, store):
     """One owner-approved obligation with a live claim on it."""
     stack["goals"].propose(title="Send the invoice", statement="Client waiting.",
@@ -182,6 +222,25 @@ def test_a_snapshot_verifies_itself(store, snapshots):
     assert checked["problems"] == []
     assert checked["records"] == 1
     assert checked["schema"] == len(MIGRATIONS)
+
+
+def test_restore_into_a_fresh_store_keeps_snapshot_erasure_history(
+        tmp_path, store, snapshots, forget):
+    erased = committed(store, source_id="erased-before-backup")
+    forget(erased)
+    committed(store, source_id="retained-in-backup", text="Still visible.")
+    made = snapshots.create(reason="fresh installation recovery", actor=OWNER)["snapshot"]
+    expected = {table: [dict(row) for row in store.db.execute(f"SELECT * FROM {table}")]
+                for table in LEDGER_TABLES}
+    with EvidenceStore(tmp_path / "fresh" / "canonical.db") as fresh:
+        donor = Snapshots(fresh, directory=snapshots.root)
+        recovery = Recovery(fresh, snapshots=donor, owner_principal=OWNER)
+        result = recovery.restore(made.id, actor=OWNER)
+        assert result["tombstones"] == made.tombstones == 1
+        for table in LEDGER_TABLES:
+            assert [dict(row) for row in fresh.db.execute(f"SELECT * FROM {table}")] == expected[table]
+        assert fresh.db.execute("SELECT deleted FROM records WHERE id=?", (erased,)).fetchone()[0] == 1
+        assert recovery.integrity()["ok"]
 
 
 def test_a_snapshot_is_a_whole_store_that_another_database_can_adopt(tmp_path, store,
@@ -712,7 +771,7 @@ def test_the_epoch_never_goes_backwards(store, snapshots, recovery):
 
     recovery.restore(made.id, actor=OWNER)
 
-    assert store.epoch() == 2
+    assert store.epoch() == 3, "restore also fences in-flight pre-restore writers"
     assert recovery.integrity()["records"] == 0
 
 

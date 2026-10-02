@@ -175,7 +175,8 @@ def test_a_wheel_named_by_hand_is_the_one_staged(instance, source, tmp_path):
     report = staged(instance, source, tmp_path, wheel=wheel, runner=fake)
     assert report["performed"] is True
     assert fake.mentioning("uv build") == []
-    assert fake.mentioning(str(wheel))
+    assert fake.mentioning(wheel.name)
+    assert Path(report["wheel"]).read_bytes() == wheel.read_bytes()
 
 
 # -- the pin is one fact, not a copy -----------------------------------------
@@ -196,7 +197,7 @@ def test_both_environments_run_the_same_framework_code(instance, source, tmp_pat
     wheel = a_wheel(tmp_path, name="w-0.1.0-py3-none-any.whl")
     fake = Fake()
     report = staged(instance, source, tmp_path, wheel=wheel, runner=fake)
-    assert [call[call.index("--python") + 1] for call in fake.mentioning(str(wheel))] == [
+    assert [call[call.index("--python") + 1] for call in fake.mentioning(wheel.name)] == [
         str(Path(report["staged"]) / "bin" / "python"),
         str(Path(report["staged"]) / "hindsight" / "bin" / "python")]
 
@@ -394,6 +395,110 @@ def test_a_dirty_checkout_is_not_staged_under_a_clean_commit_name(instance, sour
     assert report["source_dirty"] is True, "the reading says the tree differs before it refuses"
     assert any("uncommitted changes" in line for line in report["blocking"]), \
         "the wheel would be built from bytes no revision names"
+
+
+def test_runtime_bytes_are_part_of_release_review_even_without_git(instance, source, tmp_path):
+    module = source / "src" / "hermes_memory" / "core.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("original\n")
+    into = tmp_path / "release"
+    shown = plan(settings=instance[1], into=into, source=source)
+    module.write_text("changed\n")
+    with pytest.raises(ReleaseError, match="plan changed"):
+        apply(settings=instance[1], into=into, source=source, actor=OWNER,
+              review=shown["review_digest"], runner=Fake())
+    assert not into.exists()
+
+
+def test_build_and_carried_plugin_use_one_frozen_reviewed_source(instance, source, tmp_path):
+    plugin = source / "integrations" / "hermes-memory" / "provider.py"
+    reviewed = plugin.read_bytes()
+
+    class EditDuringBuild(Fake):
+        def __call__(self, argv, **kwargs):
+            if list(argv)[:2] == ["uv", "build"]:
+                frozen = Path(argv[-1])
+                assert frozen != source
+                assert (frozen / "integrations/hermes-memory/provider.py").read_bytes() == reviewed
+                plugin.write_text("not approved\n")
+            return super().__call__(argv, **kwargs)
+
+    report = staged(instance, source, tmp_path, runner=EditDuringBuild())
+    assert (Path(report["staged"]) / "integrations/hermes-memory/provider.py").read_bytes() == reviewed
+
+
+def test_build_backend_mutations_do_not_change_retained_source(instance, source, tmp_path):
+    metadata = source / "src" / "hermes_memory.egg-info" / "SOURCES.txt"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("reviewed metadata\n")
+
+    class RebuildMetadata(Fake):
+        def __call__(self, argv, **kwargs):
+            if list(argv)[:2] == ["uv", "build"]:
+                (Path(argv[-1]) / "src/hermes_memory.egg-info/SOURCES.txt").write_text("regenerated\n")
+            return super().__call__(argv, **kwargs)
+
+    into = tmp_path / "snapshot-release"
+    shown = plan(settings=instance[1], into=into, source=source, snapshot=True)
+    report = apply(settings=instance[1], into=into, source=source, snapshot=True,
+                   actor=OWNER, review=shown["review_digest"], runner=RebuildMetadata())
+    assert report["complete"]
+    assert (into / "source/src/hermes_memory.egg-info/SOURCES.txt").read_text() == "reviewed metadata\n"
+    assert report["wheel_digest"] == content_digest(Path(report["wheel"]).read_bytes())
+
+
+def test_explicit_snapshot_does_not_claim_to_be_its_base_commit(instance, source, tmp_path):
+    commit = a_repository(source)
+    (source / "integrations/hermes-memory/provider.py").write_text("reviewed changes\n")
+    into = tmp_path / "snapshot-release"
+    shown = plan(settings=instance[1], into=into, source=source, snapshot=True)
+    assert shown["blocking"] == [] and shown["source_dirty"]
+    report = apply(settings=instance[1], into=into, source=source, snapshot=True,
+                   actor=OWNER, review=shown["review_digest"], runner=Fake())
+    manifest = json.loads((into / MANIFEST).read_text())
+    assert manifest["source_commit"] == commit
+    assert manifest["snapshot"] and manifest["source_dirty"]
+    assert manifest["source_digest"] == report["source_digest"]
+    assert (into / "source/integrations/hermes-memory/provider.py").read_text() == "reviewed changes\n"
+
+
+def test_snapshot_cannot_pair_unproven_wheel_or_impersonate_a_commit(instance, source, tmp_path):
+    commit = a_repository(source)
+    report = plan(settings=instance[1], into=tmp_path / commit, source=source,
+                  snapshot=True, wheel=a_wheel(tmp_path))
+    assert any("prebuilt wheel" in item for item in report["blocking"])
+    assert any("clean git commit" in item for item in report["blocking"])
+
+
+def test_symlinked_source_artifacts_are_not_allowed(instance, source, tmp_path):
+    outside = tmp_path / "private.txt"
+    outside.write_text("private")
+    (source / "integrations/hermes-memory/secret.txt").symlink_to(outside)
+    report = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert any("symlink" in item for item in report["blocking"])
+
+
+def test_target_file_is_a_reported_blocker_not_a_traceback(instance, source, tmp_path):
+    target = tmp_path / "release"
+    target.write_text("owned elsewhere")
+    report = plan(settings=instance[1], into=target, source=source)
+    assert report["blocking"]
+
+
+def test_verify_detects_changed_carried_artifact(instance, source, tmp_path):
+    report = staged(instance, source, tmp_path, runner=Fake())
+    into = Path(report["staged"])
+    (into / "integrations/hermes-memory/provider.py").write_text("altered\n")
+    checked = verify(settings=instance[1], into=into)
+    assert not checked["complete"]
+    assert any("artifact changed" in item for item in checked["missing"])
+
+
+def test_missing_whole_carried_directory_is_blocking(instance, source, tmp_path):
+    import shutil
+    shutil.rmtree(source / "integrations")
+    report = plan(settings=instance[1], into=tmp_path / "release", source=source)
+    assert any("plugin are missing" in item for item in report["blocking"])
 
 
 def test_a_tree_named_for_another_commit_is_not_staged_there(instance, source, tmp_path):

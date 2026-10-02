@@ -213,6 +213,15 @@ What a reply cannot do:
 - arrive while an operator is holding delivery — a question that cannot be re-asked is not
   one worth taking under a hold.
 - be spent twice. One code, one decision, and a second use is told it was already answered.
+- be collected by the conversation it is about. Hermes has its own interactive question
+  surface, and it is the right tool for a choice the *conversation* needs now — but a pending
+  interactive prompt intercepts the owner's next message, which is the one this reply is
+  waiting for. So `memory_clarify` says so in its note: the archive's decision is answered on
+  the message the archive sent, and the conversation should explain it rather than poll for it.
+  The provider cannot invoke that surface itself — `MemoryProvider.initialize` is handed the
+  home, the platform and the chat, and no session or adapter handle — which is the right
+  boundary, not a missing feature: an owner decision must not be collectable by whichever
+  component happens to be running a turn.
 
 A refusal, a decline and a settle are all durable: `inquiry_asked`, `inquiry_sent`,
 `inquiry_answered`, `inquiry_declined`, `inquiry_refused`, `inquiry_expired`, `inquiry_void`

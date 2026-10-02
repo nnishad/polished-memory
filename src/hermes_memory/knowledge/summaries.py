@@ -20,6 +20,7 @@ from typing import Any, Callable, Sequence
 from ..backend.provenance import COMPLETE, INVALID, PARTIAL, ProvenanceLedger
 from ..ids import digest, now, timestamp
 from ..storage.evidence import EvidenceError, EvidenceStore
+from ..storage.identity import IdentityStore
 
 __all__ = ["SummaryStore", "Summary", "KINDS", "MAX_BODY"]
 
@@ -81,7 +82,7 @@ class SummaryStore:
                  clock: Callable[[], float] = time.time):
         self.store = store
         self.db = store.db
-        self.ledger = ledger or ProvenanceLedger(store)
+        self.ledger = ledger or ProvenanceLedger(store, identity=IdentityStore(store))
         self.owner_principal = owner_principal
         self.clock = clock
 
@@ -109,7 +110,7 @@ class SummaryStore:
             raise EvidenceError("a summary must name the processor version that wrote it")
         if not isinstance(budget_tokens, int) or not 1 <= budget_tokens <= 32_000:
             raise EvidenceError("budget_tokens must be between 1 and 32000")
-        if kind in OWNER_APPROVED and approved_by != self.owner_principal:
+        if kind in OWNER_APPROVED and (not self.owner_principal or approved_by != self.owner_principal):
             raise EvidenceError(
                 f"a {kind} reaches past the evidence, so it needs the owner's approval; "
                 f"got {approved_by!r}")
@@ -120,7 +121,8 @@ class SummaryStore:
         when = timestamp(refresh_after) if refresh_after else None
 
         summary_id = "sum_" + digest([scope, kind, title, body, processor_fingerprint,
-                                      start, end])[:32]
+                                      start, end, account_id, full_coverage, self.store.epoch(),
+                                      sorted(self.ledger._normalize(citations))])[:32]
         previous = self._target(supersedes, scope=scope, kind=kind) if supersedes else None
         revision = 1 if previous is None else int(previous["revision"]) + 1
 
@@ -229,7 +231,8 @@ class SummaryStore:
                 "usable_for_decision": provenance.usable_for_decision,
                 "citations": provenance.cited, "stale": self.is_stale(summary)}
 
-    def latest(self, scope: str, *, kind: str | None = None) -> list[Summary]:
+    def latest(self, scope: str, *, kind: str | None = None,
+               account_id: str | None = None) -> list[Summary]:
         """The newest published revision per kind, when it still stands.
 
         An unsupported summary is absent rather than replaced by the last one that
@@ -251,7 +254,7 @@ class SummaryStore:
             if summary.kind in decided:
                 continue
             decided.add(summary.kind)
-            if self.ledger.resolve(summary.id).verdict != INVALID:
+            if self.ledger.resolve(summary.id, account_id=account_id).verdict != INVALID:
                 chosen.append(summary)
         return chosen
 

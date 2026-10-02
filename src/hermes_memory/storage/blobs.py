@@ -160,7 +160,7 @@ class BlobStore:
         _require_transaction(connection)
         # Read on the caller's connection: in a combined commit the record was
         # created inside this same transaction and is invisible from anywhere else.
-        if not connection.execute("SELECT 1 FROM records WHERE id=?",
+        if not connection.execute("SELECT 1 FROM records WHERE id=? AND deleted=0",
                                   (record_pk,)).fetchone():
             raise BlobError(f"cannot attach to unknown record {record_pk!r}")
         return self._write(connection, record_pk, list(staged))

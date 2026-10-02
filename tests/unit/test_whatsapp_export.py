@@ -199,7 +199,8 @@ def test_two_chats_page_independently_by_position(tmp_path):
 
     assert [item["metadata"]["chat"] for item in first.envelopes][:1] == ["ann/_chat.txt"]
     assert second.next_cursor is None or second.envelopes
-    assert {item["metadata"]["chat"] for item in first.envelopes + second.envelopes} == \
+    records, gaps = adapter.read_all()
+    assert {item["metadata"]["chat"] for item in records} == \
         {"ann/_chat.txt", "bob/_chat.txt"}
 
 
@@ -221,7 +222,9 @@ def test_a_page_is_bounded_and_the_next_cursor_continues_it(tmp_path):
     page = adapter.read_page(None)
 
     assert len(page.envelopes) == 5
-    assert page.next_cursor is None, "one file holds them all; the cursor names files"
+    assert page.next_cursor is not None
+    records, gaps = adapter.read_all()
+    assert len(records) == 12 and not gaps
 
 
 # -- the store's own view -----------------------------------------------------

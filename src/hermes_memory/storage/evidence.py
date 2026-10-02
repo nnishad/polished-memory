@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,7 +22,6 @@ __all__ = ["EvidenceStore", "ReadOnlyStore", "EvidenceError", "Evidence",
 
 _MAXIMUM_TEXT = 4_000_000
 _KNOWN_OCCURRED_PRECISION = {"second", "minute", "hour", "day", "week", "month", "year", "unknown"}
-_TOKEN = re.compile(r"[^\W]+", re.UNICODE)
 # An over-long query is a pasted document, not a question. Matching on the first terms of it
 # still answers; matching on all of them would match nothing.
 MAX_TERMS = 24
@@ -112,6 +112,19 @@ def prepare_envelope(envelope: dict[str, Any]) -> Prepared:
     metadata = envelope.get("metadata") or {}
     if not isinstance(metadata, dict):
         raise EvidenceError("metadata must be an object")
+    # Canonical ingress is shared by every adapter and SDK path. Receipts use
+    # the same sanitized values, never the pre-normalization secret-bearing text.
+    from ..sources.base import redact_secrets
+    text = redact_secrets(text)
+    def sanitize(value):
+        if isinstance(value, str):
+            return redact_secrets(value)
+        if isinstance(value, dict):
+            return {key: sanitize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+    metadata = sanitize(metadata)
 
     observed_at = timestamp(_required_text(envelope.get("observed_at"), "observed_at", 100))
     # An unknown event time stays unknown. Filling it from ingestion time
@@ -141,9 +154,10 @@ def prepare_envelope(envelope: dict[str, Any]) -> Prepared:
     # The attachments are part of what a revision *is*. Left out of the fingerprint,
     # replaying one revision with different bytes would be acknowledged as a duplicate
     # and the new file silently dropped.
-    fingerprint = digest([occurred_at, kind, text, metadata, references])
+    fingerprint = digest([occurred_at, precision, kind, text, metadata, references, sorted(set(parents))])
     primary_key = make_record_id(source, source_id, revision)
     receipt = {k: v for k, v in envelope.items() if k != "_contract"}
+    receipt["text"], receipt["metadata"] = text, metadata
     if "attachments" in receipt:
         # The receipt is a plain JSON row and is shown to people and models: it
         # carries what was attached, never the attachment.
@@ -227,7 +241,19 @@ def _apply_supersede(db: sqlite3.Connection, old_id: str, new_id: str, *,
 def fts_terms(query: str) -> list[str]:
     """The words a search should match, in the order they were said, without repeats."""
     seen: list[str] = []
-    for token in _TOKEN.findall(query or ""):
+    tokens = []
+    current = []
+    for character in query or "":
+        category = unicodedata.category(character)[0]
+        if category in {"L", "N"} or character == "_" or (
+                current and (category == "M" or character in {"\u200c", "\u200d"})):
+            current.append(character)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    for token in tokens:
         if token not in seen:
             seen.append(token)
     return seen
@@ -311,14 +337,14 @@ class EvidenceStore:
         return self._visible(record_pk)
 
     def watermark(self) -> tuple[int, int]:
-        """(epoch, journal sequence) — a cheap 'has anything changed' stamp.
+        """(epoch, context revision) — a transactional authority/state stamp.
 
         The epoch alone is not enough: hiding one record is reversible and does
         not revoke outstanding leases, yet a context packet built before it is
         already wrong.
         """
-        row = self.db.execute("SELECT MAX(seq) FROM change_journal").fetchone()
-        return self.epoch(), int(row[0] or 0)
+        row = self.db.execute("SELECT value FROM context_revision WHERE id=1").fetchone()
+        return self.epoch(), int(row[0])
 
     def search(self, query: str, *, limit: int = 20) -> list[Evidence]:
         """Lexical search over committed, visible evidence.
@@ -384,11 +410,37 @@ class EvidenceStore:
 
     def write_prepared(self, db: sqlite3.Connection, prepared: Prepared, *, generation: int = 0) -> tuple[str, bool]:
         """Write one prepared envelope. Requires an ambient transaction."""
+        # Independent of records/FKs: an older snapshot may never have held this ID.
+        if db.execute("SELECT 1 FROM erasure_fences WHERE record_id=?", (prepared.id,)).fetchone():
+            return prepared.id, True
         existing = db.execute(
-            "SELECT id, fingerprint FROM records WHERE source=? AND source_id=? AND revision=?",
+            "SELECT * FROM records WHERE source=? AND source_id=? AND revision=?",
             (prepared.source, prepared.source_id, prepared.revision),
         ).fetchone()
-        if existing and existing["fingerprint"] == prepared.fingerprint:
+        if existing and existing["deleted"]:
+            return existing["id"], True
+        # Pre-v15 fingerprints omitted precision/parents. Compare canonical semantics
+        # rather than rewriting history or accepting a changed legacy revision.
+        compatible = False
+        if existing:
+            parents = sorted(row[0] for row in db.execute(
+                "SELECT parent_id FROM record_dependencies WHERE child_id=?", (existing["id"],)))
+            receipt = db.execute("SELECT envelope FROM ingestion_receipts WHERE record_id=? LIMIT 1",
+                                 (existing["id"],)).fetchone()
+            references = json.loads(prepared.receipt).get("attachments", [])
+            old_references = json.loads(receipt[0]).get("attachments", []) if receipt else []
+            old_metadata, new_metadata = json.loads(existing["metadata"]), json.loads(prepared.metadata)
+            # File mtime was historically mixed into semantic metadata even though
+            # the revision is content-derived. Only this observation is non-semantic.
+            if existing["kind"] in ("file", "file_record") and "path" in old_metadata:
+                old_metadata.pop("mtime", None)
+                new_metadata.pop("mtime", None)
+            compatible = (existing["occurred_at"] == prepared.occurred_at
+                          and existing["occurred_precision"] == prepared.occurred_precision
+                          and existing["kind"] == prepared.kind and existing["text"] == prepared.text
+                          and old_metadata == new_metadata
+                          and parents == sorted(set(prepared.parents)) and old_references == references)
+        if existing and (existing["fingerprint"] == prepared.fingerprint or compatible):
             db.execute(
                 "INSERT OR IGNORE INTO ingestion_receipts(id, record_id, observed_at, envelope) "
                 "VALUES(?, ?, ?, ?)",
@@ -566,4 +618,3 @@ class ReadOnlyStore(EvidenceStore):
         self.db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10,
                                   isolation_level=None)
         self.db.row_factory = sqlite3.Row
-

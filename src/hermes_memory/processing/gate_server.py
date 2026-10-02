@@ -13,7 +13,9 @@ server process is needed to prove the contract.
 """
 from __future__ import annotations
 
+import errno
 import json
+from time import monotonic
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -21,6 +23,7 @@ from typing import Any, Callable
 
 from .resource_gate import GateBusy, GatePaused, ResourceGate
 from .routes import RouteTable
+from ..models.reranker import cohere_request, cohere_usage, validate_cohere_response
 
 __all__ = ["GateApp", "FORWARDED_PATHS", "UpstreamResult", "urllib_upstream",
            "upstream_url"]
@@ -30,6 +33,7 @@ __all__ = ["GateApp", "FORWARDED_PATHS", "UpstreamResult", "urllib_upstream",
 FORWARDED_PATHS = {
     "/v1/chat/completions": "chat",
     "/v1/embeddings": "embeddings",
+    "/v1/rerank": "rerank",
 }
 MAX_BODY_BYTES = 2_000_000
 
@@ -39,6 +43,7 @@ class UpstreamResult:
     status: int
     body: bytes = b""
     transport_error: str | None = None
+    connection_failed: bool = False
 
     @property
     def reached(self) -> bool:
@@ -56,7 +61,15 @@ def urllib_upstream(timeout: float = 600.0) -> Callable:
         except urllib.error.HTTPError as error:
             return UpstreamResult(error.code, error.read() or b"{}")
         except (urllib.error.URLError, TimeoutError, OSError) as error:
-            return UpstreamResult(0, transport_error=str(error)[:400])
+            # urllib wraps connect failures in URLError. These errno values prove
+            # no connection was established; read/write timeouts and disconnects
+            # do not prove that the server never started the request.
+            reason = error.reason if isinstance(error, urllib.error.URLError) else None
+            connection_failed = isinstance(reason, OSError) and reason.errno in {
+                errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH,
+            }
+            return UpstreamResult(0, transport_error=str(error)[:400],
+                                  connection_failed=connection_failed)
 
     return call
 
@@ -122,6 +135,10 @@ class GateApp:
             await _respond(send, 401, {"error": {"message": str(error)[:300]}})
             return
 
+        if route.operation != FORWARDED_PATHS[path]:
+            await _respond(send, 403, {"error": {"message": "credential does not authorize this operation"}})
+            return
+
         raw = await _body(receive)
         if raw is None:
             await _respond(send, 413, {"error": {"message": "request body exceeds the gate"}})
@@ -130,6 +147,8 @@ class GateApp:
             payload = json.loads(raw or b"{}")
             if not isinstance(payload, dict):
                 raise ValueError("body must be a JSON object")
+            if route.operation == "rerank":
+                cohere_request(payload)
         except (json.JSONDecodeError, ValueError) as error:
             await _respond(send, 400, {"error": {"message": f"unparseable body: {error}"[:300]}})
             return
@@ -162,6 +181,7 @@ class GateApp:
                            headers=[(b"retry-after", b"2")])
             return
 
+        dispatched_at = monotonic()
         try:
             result = self.upstream(upstream_url(route, path),
                                    json.dumps(payload).encode("utf-8"),
@@ -172,6 +192,13 @@ class GateApp:
             return
 
         if not result.reached:
+            if getattr(result, "connection_failed", False):
+                self.gate.release(reservation, outcome="failed", tokens=0,
+                                  seconds=max(0.0, monotonic() - dispatched_at))
+                await _respond(send, 502, {"error": {
+                    "message": "upstream connection failed; execution did not start",
+                    "type": "connection_failed"}})
+                return
             # Nothing proves the upstream is idle. Keep the slot blocked and say
             # so plainly rather than reporting a clean failure.
             self.gate.mark_uncertain(reservation, reason=result.transport_error[:400])
@@ -180,9 +207,21 @@ class GateApp:
                                                  "type": "uncertain"}})
             return
 
+        if route.operation == "rerank" and result.status < 400:
+            try:
+                validate_cohere_response(json.loads(result.body), len(payload["documents"]))
+            except (ValueError, TypeError, AttributeError, UnicodeError):
+                try:
+                    known_tokens = cohere_usage(json.loads(result.body), len(payload["documents"]))
+                except (ValueError, TypeError, AttributeError, UnicodeError):
+                    known_tokens = 0  # Unknown, not estimated. Mark the accounting result malformed.
+                self.gate.release(reservation, outcome="malformed", tokens=known_tokens,
+                                  seconds=max(0.0, monotonic() - dispatched_at))
+                await _respond(send, 502, {"error": {"message": "invalid rerank response or usage accounting"}})
+                return
         tokens = _usage_tokens(result.body)
         self.gate.release(reservation, outcome="succeeded" if result.status < 400 else "failed",
-                          tokens=tokens)
+                          tokens=tokens, seconds=max(0.0, monotonic() - dispatched_at))
         headers = [(b"content-type", b"application/json")]
         if capped:
             # Telling the caller we shrank its request is the difference between

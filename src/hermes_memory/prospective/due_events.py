@@ -13,6 +13,8 @@ intention.
 """
 from __future__ import annotations
 
+import json
+
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -151,8 +153,7 @@ class DueEventLog:
             connection.execute(
                 "INSERT INTO audit(action, object_id, created_at, metadata) "
                 "VALUES('due_event_cancelled', ?, ?, ?)",
-                (goal_id, now(), f'{{"count": {int(cursor.rowcount or 0)}, '
-                                 f'"reason": "{reason[:120]}"}}'))
+                (goal_id, now(), json.dumps({"count": int(cursor.rowcount or 0), "reason": reason[:120]})))
         return int(cursor.rowcount or 0)
 
     # -- claims --------------------------------------------------------------
