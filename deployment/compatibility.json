@@ -1,5 +1,5 @@
 {
-  "framework_digest": "c69dd80186e6877648327c6ccaf19e929a8e074cc50092bd7c0a1298dff96f39",
+  "framework_digest": "3b6f9b57d49ebc2ca1712d874eb0429a1ae3f6603f6e31ba1e18305f25a3cb0c",
   "hindsight": {
     "client_floor": "hindsight-client>=0.6.1",
     "engine_pinned": "0.10.1",
@@ -138,7 +138,7 @@
       "capture.py": "9abc8975fe8d643e47d78e69064d47e0d9aac3c0053537f12e977a6a59cc8c4d",
       "client.py": "b47eea43e38d8c02cb6c0af689e7cf828623213158ba6404de7e82015c50b03b",
       "delivery.py": "62fc2ab8f1d658cb77077ae0cd947038e9a9feb6a99e8cf17038965d0927e59d",
-      "provider.py": "6a2462eb6b268284e7fdf82804047d9422d68be298e20b398e0127bb759aa64c",
+      "provider.py": "89001bf98379c801f9d6cf880b742c8a173af6f05b68789a0a10eef6e1011f57",
       "runtime.py": "84ed13bb3a80680a41c931913a2cfad7daee1f81a8721c92b96ef4695d7a5ab2",
       "setup.py": "cff5daa30cc556beb239fd94230e54f47636d7920930faca10eee4017a098454",
       "spool.py": "6726df3f7581e2b51bb077595de17c0aba3b0038768bde75db5afcacbcd143ba"
