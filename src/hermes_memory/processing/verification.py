@@ -44,22 +44,27 @@ def verify_memory_claims(settings, store, claims, *, account_id=None, client=Non
         evidence.append({"record_id": record.id, "revision": record.revision,
                          "text": record.text, "source": record.source,
                          "role": record.metadata.get("role"), "occurred_at": record.occurred_at})
-    route = build_routes(settings, credentials=settings.route_credentials).by_name("foreground")
+    table = build_routes(settings, credentials=settings.route_credentials)
+    route = table.by_name("foreground")
+    verifier = table.by_name("verifier") if "verifier" in table.names() else None
     normalize_claims(claims, canonical_evidence(evidence))
     # Do not infer permission from availability of a model endpoint. Like
     # formation/summarization, respect the shared daily budget and operator hold
     # before any dispatch. The HTTP gate accounts the actual model hop.
+    judge_resource = (verifier.resource if verifier is not None else route.resource)
     estimate = len(json.dumps({"claims": claims, "evidence": evidence}, ensure_ascii=False).encode())
     with instance_gate(settings) as gate:
         if gate.paused:
             raise HindsightError("all inference is paused by the operator")
         try:
-            Budgets(gate.store, daily={route.resource: Budget(settings.background_budget_tokens)}).admit(
-                route.resource, estimated_tokens=estimate + 4096 + VERIFICATION_TOKENS)
+            Budgets(gate.store, daily={judge_resource: Budget(settings.background_budget_tokens)}).admit(
+                judge_resource, estimated_tokens=estimate + 4096 + VERIFICATION_TOKENS)
         except BudgetExhausted as error:
             raise HindsightError(str(error)) from error
     holder = client or ScopedSynthesizer(base_url=settings.admission_url,
         credential=route.credential, model=settings.text_route.model,
+        verifier_credential=verifier.credential if verifier is not None else None,
+        verifier_model=settings.verifier_route.model if verifier is not None else None,
         # Explicit tools do not run under Hermes's eight-second prefetch hook.
         # A transport timeout still withholds output; no model retry/fallback.
         timeout=180.0)

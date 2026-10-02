@@ -62,11 +62,18 @@ class SummarizeError(ValueError):
 
 
 def summary_fingerprint(settings, route) -> str:
-    """Which processor wrote a summary. See ``formation.processor_fingerprint``."""
+    """Which processor wrote a summary. See ``formation.processor_fingerprint``.
+
+    The verifier is part of the processor's identity: a summary checked by a
+    different judge is a different fact, and re-verification must be visible
+    rather than a silent reuse of an older verdict.
+    """
     return digest(["summary", PINNED_VERSION, settings.bank_id, route.resource,
                    route.operation, route.upstream, int(route.max_output_tokens),
                    PLAN_VERSION, MAX_INPUT_BYTES, SYNTHESIS_CONTRACT,
-                   settings.text_route.model if settings.text_route else None])[:24]
+                   settings.text_route.model if settings.text_route else None,
+                   settings.verifier_route.model if settings.verifier_route else None,
+                   settings.verifier_route.base_url if settings.verifier_route else None])[:24]
 
 
 def resolve_scope(scope: str) -> tuple[str, str]:
@@ -388,11 +395,18 @@ def summarize_apply(settings, *, scope: str, kind: str | None = None, review: st
 
 def client_for(settings) -> Any:
     """Explicit synthesis through the installation's owned admission endpoint."""
+    from .routes import build_routes
     from .synthesis import ScopedSynthesizer
 
+    verifier = None
+    if settings.verifier_route:
+        table = build_routes(settings, credentials=settings.route_credentials)
+        verifier = table.by_name("verifier") if "verifier" in table.names() else None
     return ScopedSynthesizer(base_url=settings.admission_url,
                              credential=settings.route_credentials.get(ROUTE_NAME),
                              model=settings.text_route.model if settings.text_route else None,
+                             verifier_credential=verifier.credential if verifier else None,
+                             verifier_model=settings.verifier_route.model if verifier else None,
                              timeout=REFLECT_TIMEOUT_S)
 
 

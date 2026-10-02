@@ -67,7 +67,8 @@ def claims_json(content):
 
 class ScopedSynthesizer:
     def __init__(self, *, base_url, credential, model, timeout=180.0, transport=None,
-                 output_format="json_object_schema"):
+                 output_format="json_object_schema", verifier_credential=None,
+                 verifier_model=None):
         parsed = urlsplit(base_url or "")
         if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
                 or parsed.username or parsed.password or parsed.query or parsed.fragment
@@ -75,9 +76,21 @@ class ScopedSynthesizer:
             raise HindsightError("scoped synthesis requires the owned loopback admission endpoint")
         if not credential or not isinstance(model, str) or not model.strip():
             raise HindsightError("scoped synthesis requires an explicit route credential and text model")
+        if verifier_credential is not None:
+            # Independence is a property of the route, and the route is selected by
+            # credential at the gate. A "verifier" that presents the generation
+            # credential is the generation model wearing a second name.
+            if verifier_credential == credential:
+                raise HindsightError(
+                    "the verifier route credential equals the generation route credential; "
+                    "an independent judge must be a distinct admitted route")
+            if not isinstance(verifier_model, str) or not verifier_model.strip():
+                raise HindsightError("a configured verifier route needs its own model name")
         self.base_url = base_url.rstrip("/")
         self.credential = credential
         self.model = model
+        self.verifier_credential = verifier_credential
+        self.verifier_model = verifier_model
         self.timeout = timeout
         if output_format not in {"json_object_schema", "json_schema"}:
             raise HindsightError("unsupported scoped synthesis output-format contract")
@@ -150,35 +163,46 @@ class ScopedSynthesizer:
                 "severity or general advice. Ambiguous identity or incompatible accounts require "
                 "insufficient_evidence; do not vote for a winner. Return raw JSON with exactly "
                 "one {claim_index,label} verdict per claim, no prose."),
-            schema=schema, max_tokens=max_tokens, name="memory_entailment_verdicts")
+            schema=schema, max_tokens=max_tokens, name="memory_entailment_verdicts",
+            verifier=True)
         labels = verdicts_json(value, len(claims))
         rejected = deterministic_rejections(claims, records)
         for item in rejected:
             labels[item["claim_index"]] = "insufficient_evidence"
-        outcome = verified_result(claims, labels, records, model=self.model)
+        judge = self.verifier_model or self.model
+        outcome = verified_result(claims, labels, records, model=judge)
         outcome["verification"]["deterministic_rejections"] = rejected
+        # Name the judge honestly: an independent route, or the generation route
+        # standing in for one. Nobody should have to guess which.
+        outcome["verification"]["verifier"] = ("independent" if self.verifier_credential
+                                               else "generation-route")
         outcome.update(input_tokens=usage["prompt_tokens"], output_tokens=usage["completion_tokens"],
                        admission_accounted=True)
         return outcome
 
-    def _request(self, content, *, system, schema, max_tokens, name):
+    def _request(self, content, *, system, schema, max_tokens, name, verifier=False):
         if (type(max_tokens) is not int or not 1 <= max_tokens <= 8192
                 or not isinstance(content, str) or len(content.encode()) > 48_000):
             raise HindsightError("bounded model request required")
+        # The gate selects the upstream by credential, so the verification hop
+        # reaches a different judge by presenting the verifier route's credential
+        # and naming its model — same owned loopback admission endpoint.
+        credential = self.verifier_credential if (verifier and self.verifier_credential) else self.credential
+        model = self.verifier_model if (verifier and self.verifier_model) else self.model
         root = self.base_url if self.base_url.endswith("/v1") else self.base_url + "/v1"
         output_format = ({"type": "json_object", "schema": schema}
                          if self.output_format == "json_object_schema" else
                          {"type": "json_schema", "json_schema": {
                              "name": name, "strict": True, "schema": schema}})
         response = self.transport("POST", root + "/chat/completions", {
-            "model": self.model, "max_tokens": max_tokens, "temperature": 0,
+            "model": model, "max_tokens": max_tokens, "temperature": 0,
             # Owned llama.cpp-compatible routes: do not spend the bounded JSON
             # verdict ceiling on hidden reasoning before producing any verdicts.
             "chat_template_kwargs": {"enable_thinking": False},
             "response_format": output_format,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": content}],
-        }, {"Content-Type": "application/json", "Authorization": "Bearer " + self.credential})
+        }, {"Content-Type": "application/json", "Authorization": "Bearer " + credential})
         if response.status != 200 or not isinstance(response.body, dict):
             raise HindsightUnavailable(f"scoped synthesis failed: HTTP {response.status}")
         try:

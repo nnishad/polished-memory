@@ -151,6 +151,12 @@ def build_routes(settings, *, credentials: dict[str, str] | None = None) -> Rout
         route("rerank", resource=settings.reranker_route.resource if settings.reranker_route else "local-gpu",
               operation="rerank", upstream=settings.reranker_route.base_url if settings.reranker_route else None,
               priority="interactive", cap=0),
+        # The independent entailment judge. Only present when the owner configured
+        # a distinct verifier upstream AND minted its credential; otherwise the
+        # verification hop stays on the generation route and says so.
+        route("verifier", resource=settings.verifier_route.resource if settings.verifier_route else "local-gpu",
+              operation="chat", upstream=settings.verifier_route.base_url if settings.verifier_route else None,
+              priority="interactive", cap=caps.foreground),
     ):
         if candidate is not None:
             routes[candidate.name] = candidate

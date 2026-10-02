@@ -228,6 +228,11 @@ class Settings:
     vision_route: ModelRoute | None = None
     embeddings_route: ModelRoute | None = None
     reranker_route: ModelRoute | None = None
+    # A distinct model for the entailment-verification hop. Absent, verification
+    # runs on the generation route (today's behavior, reported as such); present,
+    # verification on the generation route is refused, so the judge and the
+    # writer cannot be the same model sharing its errors.
+    verifier_route: ModelRoute | None = None
     max_output_tokens: OutputCaps = field(default_factory=OutputCaps)
     route_credentials: dict[str, str] = field(default_factory=dict)
     gate_token: str | None = None
@@ -401,6 +406,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = None) -> Settings:
         vision_route=_route(get, allowed, "VISION", default_resource="local-gpu"),
         embeddings_route=_route(get, allowed, "EMBEDDINGS", default_resource="local-gpu"),
         reranker_route=_route(get, allowed, "RERANKER", default_resource="local-gpu"),
+        verifier_route=_route(get, allowed, "VERIFIER", default_resource="remote-9b"),
         max_output_tokens=OutputCaps(
             retain=_cap(get, "RETAIN"), consolidate=_cap(get, "CONSOLIDATE"),
             reflect=_cap(get, "REFLECT"), foreground=_cap(get, "FOREGROUND")),
