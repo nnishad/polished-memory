@@ -43,6 +43,20 @@ _MAX_SUMMARIES = 3
 # The metadata fields that name a scope a summary can be written about, in the same
 # grammar `hermes-memory summarize --scope` accepts.
 _SCOPE_FIELDS = ("project", "thread", "account")
+# Near-duplicate folding: the same sighting re-ingested under another id, or a
+# forwarded copy of a message, would otherwise spend the packet's budget saying one
+# thing twice. Bounded so a wide candidate list cannot make recall quadratic.
+_DEDUP_SHINGLE = 8
+_DEDUP_SIMILARITY = 0.9
+_DEDUP_MAX_COMPARISONS = 200
+
+
+def _shingles(text: str) -> frozenset[str]:
+    tokens = (text or "").casefold().split()
+    if len(tokens) < _DEDUP_SHINGLE:
+        return frozenset(tokens)
+    return frozenset(" ".join(tokens[index:index + _DEDUP_SHINGLE])
+                     for index in range(len(tokens) - _DEDUP_SHINGLE + 1))
 
 
 def _item(evidence, *, text: str | None = None, span_truncated: bool = False) -> EvidenceItem:
@@ -97,6 +111,36 @@ class ContextBroker:
 
     # -- assembly ------------------------------------------------------------
 
+    def _dedupe(self, considered: list) -> tuple[list, list[str]]:
+        """Fold near-duplicate spans into their higher-ranked twin.
+
+        Rank order is preserved, so the first (best-ranked) sighting of a repeated
+        text wins and later copies are named on the packet rather than silently
+        vanished. Comparisons are capped: past the cap the remaining candidates are
+        kept as-is, because an incomplete dedup is a smaller lie than a late packet.
+        """
+        kept: list = []
+        kept_shingles: list[frozenset] = []
+        dropped: list[str] = []
+        comparisons = 0
+        for evidence in considered:
+            shingles = _shingles(evidence.text)
+            duplicate = False
+            for existing in kept_shingles:
+                comparisons += 1
+                if comparisons > _DEDUP_MAX_COMPARISONS:
+                    break
+                union = len(existing | shingles)
+                if union and len(existing & shingles) / union > _DEDUP_SIMILARITY:
+                    duplicate = True
+                    break
+            if duplicate:
+                dropped.append(evidence.id)
+            else:
+                kept.append(evidence)
+                kept_shingles.append(shingles)
+        return kept, dropped
+
     def assemble(self, query: str, *, limit: int = 8, include_derived: bool = True,
                  sources: Iterable[str] | None = None,
                  window: tuple[str | None, str | None] | None = None,
@@ -128,6 +172,7 @@ class ContextBroker:
         allowed, withheld = self._authorize(outcome.items, account_id=caller)
         considered = [evidence for evidence in allowed
                       if _usable(evidence, sources=sources, window=window)]
+        considered, dropped_dupes = self._dedupe(considered)
         conflicts = self._conflicts(considered)
 
         spent = 0
@@ -240,6 +285,7 @@ class ContextBroker:
             truncated=tuple(dict.fromkeys(truncated)),
             tokens_used=spent, took_ms=int((self.clock() - started) * 1000),
             conflicts=conflicts, epoch=epoch, revision=revision, withheld=withheld,
+            deduped=tuple(dropped_dupes),
         )
         packet = _with_id(packet)
         if self.cache is not None and not store_moved:

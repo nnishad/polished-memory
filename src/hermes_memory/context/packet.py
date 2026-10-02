@@ -103,6 +103,9 @@ class Packet:
     revision: int = 0
     packet_id: str = ""
     withheld: int = 0
+    # Record ids folded into a higher-ranked near-twin during assembly. Named so
+    # suppression is a fact in the packet, not a silent shrink of the result list.
+    deduped: tuple[str, ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -121,7 +124,8 @@ class Packet:
                 "coverage": self.coverage, "truncated": list(self.truncated),
                 "tokens_used": self.tokens_used, "took_ms": self.took_ms,
                 "conflicts": list(self.conflicts), "epoch": self.epoch,
-                "revision": self.revision, "withheld": self.withheld}
+                "revision": self.revision, "withheld": self.withheld,
+                "deduped": list(self.deduped)}
 
     def _caveats(self) -> list[str]:
         notes: list[str] = []
@@ -148,6 +152,9 @@ class Packet:
                          + "; ".join(self.conflicts[:3]))
         if self.withheld:
             notes.append(f"{self.withheld} item(s) were withheld as outside the caller's scope")
+        if self.deduped:
+            notes.append(f"{len(self.deduped)} near-duplicate record(s) were folded into their "
+                         "higher-ranked twin; the wording was repeated, not the fact")
         if self.summaries:
             notes.append("summaries are this archive's own readings of the evidence, not a "
                          "second sighting of it; quote the record, not the digest")
