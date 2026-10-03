@@ -11,13 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import envelope
 from hermes_memory.config import load_settings
 from hermes_memory.processing.boundary import SendBoundary, memory_sentences
 
 
 def packet(*pairs):
     items = [SimpleNamespace(id=rid, text=text) for rid, text in pairs]
-    return SimpleNamespace(items=items, packet_id="ctx_test")
+    return SimpleNamespace(items=items, facts=(), packet_id="ctx_test")
 
 
 def boundary(store, mode, monkeypatch=None, verify=None):
@@ -77,8 +78,10 @@ def test_a_supported_claim_passes_in_enforce(store, monkeypatch):
         return {"ok": True, "all_supported": True, "text": claims[0]["text"],
                 "verification": {"rejected": [], "deterministic_rejections": [],
                                  "claims_digest": "dig"}}
+    rid = store.commit(envelope(text="Nisha is allergic to peanuts.",
+                                source_id="ev-1"))["id"]
     verdict = boundary(store, "enforce", monkeypatch, verify).check(
-        "You are allergic to peanuts.", packet=packet(("r1", "Nisha is allergic to peanuts.")))
+        "You are allergic to peanuts.", packet=packet((rid, "Nisha is allergic to peanuts.")))
     assert verdict.disposition == "pass"
     assert verdict.action == {"mode": "none"}
     assert verdict.claims[0]["label"] == "supported"
@@ -89,21 +92,35 @@ def test_a_contradicted_claim_is_held_in_enforce(store, monkeypatch):
         return {"ok": True, "all_supported": False, "text": "",
                 "verification": {"rejected": [{"claim_index": 0, "label": "contradicted"}],
                                  "deterministic_rejections": [], "claims_digest": "dig"}}
+    rid = store.commit(envelope(text="Nisha is allergic to peanuts.",
+                                source_id="ev-2"))["id"]
     verdict = boundary(store, "enforce", monkeypatch, verify).check(
-        "You are not allergic to peanuts.", packet=packet(("r1", "allergic to peanuts")))
+        "You are not allergic to peanuts.", packet=packet((rid, "allergic to peanuts")))
     assert verdict.disposition == "block"
     assert verdict.action["mode"] == "hold"
 
 
+def test_an_agent_note_in_the_packet_is_not_admissible_backing(store, monkeypatch):
+    def verify(settings, store_, claims, account_id=None):
+        raise AssertionError("the verifier must not be asked to judge an agent note")
+    note = store.commit(envelope(text="the owner prefers oat milk", source_id="note-1",
+                                 metadata={"agent_authored": True}))["id"]
+    verdict = boundary(store, "enforce", monkeypatch, verify).check(
+        "You prefer oat milk with everything.", packet=packet((note, "the owner prefers oat milk")))
+    assert verdict.disposition == "revise"
+    assert verdict.claims[0]["label"] == "insufficient_evidence"
+
+
 def test_an_unreachable_verifier_holds_in_enforce_and_warns_in_warn(store):
-    # Inference is disabled in the test environment, so verification raises; the
-    # boundary must not pass silently in either mode.
-    held = boundary(store, "enforce").check(
-        "You are allergic to peanuts.", packet=packet(("r1", "allergic to peanuts")))
+    # Inference is disabled in the test environment, so a real verification attempt
+    # raises; with admissible evidence present the boundary must degrade honestly.
+    rid = store.commit(envelope(text="Nisha is allergic to peanuts.",
+                                source_id="ev-3"))["id"]
+    pkt = packet((rid, "Nisha is allergic to peanuts."))
+    held = boundary(store, "enforce").check("You are allergic to peanuts.", packet=pkt)
     assert held.disposition == "block" and held.action["mode"] == "hold"
     assert held.detector["degraded"] is True
-    warned = boundary(store, "warn").check(
-        "You are allergic to peanuts.", packet=packet(("r1", "allergic to peanuts")))
+    warned = boundary(store, "warn").check("You are allergic to peanuts.", packet=pkt)
     assert warned.disposition == "revise"
     assert warned.action["notes"][0].startswith("boundary degraded to warn")
 

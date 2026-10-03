@@ -100,8 +100,11 @@ def memory_sentences(draft: str, packet_texts: Iterable[str] = ()) -> list[str]:
         personal = bool(_PERSONAL.search(sentence) or _PERSONAL_HI.search(sentence))
         subject = bool(_SUBJECT.search(sentence))
         echoed = any(len(tokens & shared) >= _MIN_SHARED_TOKENS for shared in pool)
-        if (_REMEMBERED.search(sentence) or (personal and subject)
-                or (personal and echoed) or (subject and echoed)):
+        # A personal-subject assertion is a memory claim even in the third person and
+        # even with nothing injected to support it: asserting beyond the packet is
+        # exactly what the boundary exists to catch, so it proceeds as unverifiable
+        # rather than being skipped.
+        if _REMEMBERED.search(sentence) or subject or (personal and echoed):
             found.append(sentence)
         if len(found) >= _MAX_SENTENCES:
             break
@@ -157,10 +160,25 @@ class SendBoundary:
                                    detector={"memory_shaped": False,
                                              "skipped_reason": "no_memory_claims"})
 
-        record_ids = [item.id for item in (packet.items if packet else ())][
-            :_MAX_EVIDENCE_RECORDS]
-        evidence = [{"record_id": rid, "quote": text}
-                    for rid, text in zip(record_ids, packet_texts[:_MAX_EVIDENCE_RECORDS])]
+        # Evidence is what this turn injected: the lexical spans plus the canonical
+        # records each derived fact was locally resolved to (the broker stamps
+        # fact["record_ids"] only for provenance that crossed its own boundary).
+        record_ids = [item.id for item in (packet.items if packet else ())]
+        for fact in (getattr(packet, "facts", ()) if packet else ()) or ():
+            record_ids.extend(str(rid) for rid in (fact.get("record_ids") or ()))
+        record_ids = list(dict.fromkeys(record_ids))[:_MAX_EVIDENCE_RECORDS]
+        texts: dict[str, str] = {}
+        for rid in record_ids:
+            record = self.store.get(rid)
+            # An agent note is not admissible backing: drop it from the evidence set
+            # rather than letting it poison a claim the canonical records do support.
+            if record is None or record.metadata.get("agent_authored"):
+                continue
+            texts[rid] = record.text
+        # Cite only what is admissible: verification resolves the claim's record_ids
+        # itself, so an agent note left in the list would refuse the whole call.
+        record_ids = list(texts)
+        evidence = [{"record_id": rid, "quote": text} for rid, text in texts.items()]
         claims = [{"text": sentence, "record_ids": list(record_ids),
                    "evidence": list(evidence)} for sentence in sentences]
         if not evidence:
